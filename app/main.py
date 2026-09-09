@@ -15,6 +15,7 @@ from app.routers import (
     courses,
     dashboard,
     deployments,
+    lti,
     openstack_credentials,
     openstack_resources,
     quotas,
@@ -119,6 +120,7 @@ app.add_middleware(
 # ROUTERS
 # ----------------------------------------------------------------
 app.include_router(auth_keycloak.router, prefix="/auth", tags=["Authentication"])
+app.include_router(lti.router, tags=["LTI"])
 app.include_router(users.router, prefix="/users", tags=["Users"])
 app.include_router(courses.router, prefix="/courses", tags=["Courses"])
 app.include_router(apps.router, prefix="/apps", tags=["Apps"])

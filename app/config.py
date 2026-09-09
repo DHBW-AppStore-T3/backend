@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     # slash. Falls back to the first CORS origin in dev.
     APP_BASE_URL: str = "http://localhost:5173"
 
+    # LTI 1.1 — shared credentials between Moodle and this backend.
+    # Pick any string for the key; use a long random value for the secret.
+    LTI_CONSUMER_KEY: str = "appstore-lti-key"
+    LTI_CONSUMER_SECRET: str = "appstore-lti-secret"
+
     class Config:
         env_file = ".env"
         case_sensitive = True
