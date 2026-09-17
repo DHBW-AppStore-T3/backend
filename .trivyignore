@@ -13,8 +13,9 @@
 AVD-DS-0002
 
 # CVE-2025-47273: Path Traversal in setuptools PackageIndex (pre-78.1.1).
-# Production runtime does not invoke setuptools PackageIndex; setuptools
-# is pinned in pyproject.toml and upgraded in the Docker venv.
+# False positive from Trivy scanning internal pip vendored SBOM metadata.
+# Production dependencies use setuptools >= 83.0.0 (pinned in pyproject.toml)
+# and production runtime does not invoke setuptools PackageIndex.
 CVE-2025-47273
 
 # GHSA-6v7p-g79w-8964: MessagePack out-of-bounds read on unpacker reuse.

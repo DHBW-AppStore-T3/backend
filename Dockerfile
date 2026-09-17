@@ -84,9 +84,6 @@ WORKDIR $APP_HOME
 # Copy virtual environment from builder
 COPY --from=builder /build/.venv /app/.venv
 
-# Ensure copied venv has patched setuptools and wheel
-RUN /app/.venv/bin/pip install --no-cache-dir --upgrade pip "setuptools>=83.0.0" wheel
-
 # Copy application code
 COPY --chown=appuser:appuser . .
 
