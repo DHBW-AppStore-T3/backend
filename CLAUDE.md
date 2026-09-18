@@ -9,3 +9,11 @@ Details zu diesem Repo:
 - Architektur: `claude_docs/architecture/`
 - Entscheidungen: `claude_docs/decisions/`
 - Debugging: `claude_docs/debugging/`
+
+## Lokale Befehle
+- Einzeltest (TDD): `poetry run pytest tests/test_foo.py -v` (oder `-k "test_name"`)
+- Testsuite & Coverage: `poetry run pytest`
+- Linting: `poetry run ruff check .`
+- Formatting-Check: `poetry run ruff format --check .`
+- OpenAPI Schema Export: `poetry run python scripts/export_openapi.py`
+
