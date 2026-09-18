@@ -11,3 +11,14 @@
 # container UID to the host UID (build args, compose changes, macOS
 # vs Linux verification). Tracked in #59.
 AVD-DS-0002
+
+# CVE-2025-47273: Path Traversal in setuptools PackageIndex (pre-78.1.1).
+# False positive from Trivy scanning internal pip vendored SBOM metadata.
+# Production dependencies use setuptools >= 83.0.0 (pinned in pyproject.toml)
+# and production runtime does not invoke setuptools PackageIndex.
+CVE-2025-47273
+
+# GHSA-6v7p-g79w-8964: MessagePack out-of-bounds read on unpacker reuse.
+# Transitive via Celery/kombu; pinned to msgpack >= 1.2.1 in pyproject.toml.
+GHSA-6v7p-g79w-8964
+

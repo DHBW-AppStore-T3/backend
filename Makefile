@@ -75,3 +75,14 @@ else
 	  -e TEST_DATABASE_URL=$(TEST_DATABASE_URL) \
 	  backend poetry run pytest
 endif
+
+# ----------------------------------------------------------------
+# API Contract (OpenAPI)
+# ----------------------------------------------------------------
+openapi: ## Export OpenAPI specification to openapi.json
+ifeq ($(MODE),host)
+	python3 scripts/export_openapi.py openapi.json
+else
+	docker compose -f ../deployment/docker-compose.dev.yml exec -T backend python scripts/export_openapi.py openapi.json
+endif
+

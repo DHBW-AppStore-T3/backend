@@ -40,6 +40,16 @@ make migration-downgrade                      # eine Revision zurück
 
 Swagger-UI mit allen Endpoints: http://localhost:8000/docs (nach `make dev-up`).
 
+## API-Contract (OpenAPI)
+
+FastAPI ist die Single Source of Truth für den API-Contract aller konsumierenden Dienste (Frontend, Worker).
+Die OpenAPI-3.1-Spezifikation kann direkt exportiert werden:
+
+```bash
+make openapi
+# oder direkt: python3 scripts/export_openapi.py
+```
+
 ## Technologie-Stack
 
 - **FastAPI** + **Uvicorn** (ASGI, 4 Worker)
