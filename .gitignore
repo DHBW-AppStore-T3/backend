@@ -68,3 +68,7 @@ clouds.yaml
 graphify-out/cache/
 graphify-out/.graphify_python
 graphify-out/.graphify_root
+
+# Generated API schemas and local locks
+openapi.json
+uv.lock

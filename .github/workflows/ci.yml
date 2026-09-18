@@ -2,10 +2,10 @@ name: Backend CI/CD
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     tags: ['v*.*.*']
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 env:
   REGISTRY: ghcr.io
@@ -289,6 +289,18 @@ jobs:
           path: coverage-html
           retention-days: 14
 
+      - name: Test Coverage Gate (enforce on main)
+        if: github.ref == 'refs/heads/main' || github.base_ref == 'main'
+        run: |
+          MIN_COVERAGE=70.0
+          PCT=$(python -c "import json; print(round(json.load(open('coverage-html/coverage.json'))['totals']['percent_covered'], 1))")
+          echo "Current coverage: ${PCT}%, required minimum: ${MIN_COVERAGE}%"
+          if (( $(echo "$PCT < $MIN_COVERAGE" | bc -l) )); then
+            echo "❌ Coverage Gate Failed: ${PCT}% is below required ${MIN_COVERAGE}%"
+            exit 1
+          fi
+          echo "✅ Coverage Gate Passed: ${PCT}% >= ${MIN_COVERAGE}%"
+
       - name: Configure Pages
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         uses: actions/configure-pages@v5
@@ -489,13 +501,13 @@ jobs:
           category: trivy-image
 
   # ================================================================
-  # 📦 PUSH — only on main
+  # 📦 PUSH — on main and dev
   # ================================================================
   push:
     name: "📦 Push"
     runs-on: ubuntu-latest
     needs: [build, image-scan]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') && github.event_name == 'push'
     permissions:
       contents: read
       packages: write
@@ -524,6 +536,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
             type=sha,prefix=sha-
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -547,13 +560,13 @@ jobs:
     name: "🚀 Trigger Staging Deploy"
     runs-on: ubuntu-latest
     needs: [push]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/dev' && github.event_name == 'push'
 
     steps:
       - name: Trigger staging deployment
         run: |
           gh workflow run staging.yml \
-            --repo six7-click-n-deploy/deployment \
-            --ref main
+            --repo DHBW-AppStore-T3/deployment \
+            --ref dev
         env:
           GH_TOKEN: ${{ secrets.DEPLOYMENT_PAT }}
