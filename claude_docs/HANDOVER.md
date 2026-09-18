@@ -15,7 +15,7 @@ Jede Session liest dieses Dokument zu Beginn und aktualisiert es vor dem Abschlu
 
 ## 2. In Arbeit & Nächste Schritte
 
-- [ ] **OpenAPI-Export im CI:** `export_openapi.py` im CI-Workflow ausführen und als Schema-Artefakt bereitstellen.
+- [x] **OpenAPI-Export im CI:** `export_openapi.py` im CI-Workflow integriert und Schema-Artefakt bereitgestellt (`.github/workflows/ci.yml`).
 - [ ] **Frontend-Typengenerierung:** `frontend/` an das exportierte `openapi.json` anbinden (z. B. via `openapi-typescript`).
 
 ---
@@ -30,4 +30,5 @@ Jede Session liest dieses Dokument zu Beginn und aktualisiert es vor dem Abschlu
 
 ## 4. Letzte Übergaben (Historie)
 
+- **2026-09-18:** OpenAPI-Schema-Export-Validierung und Artefakt-Upload in `ci.yml` eingebunden.
 - **2026-09-17:** `scripts/export_openapi.py` und `make openapi` als automatisierter API-Contract eingeführt. `claude_docs/HANDOVER.md` und `CLAUDE.md` angelegt.

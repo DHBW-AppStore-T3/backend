@@ -40,6 +40,16 @@ jobs:
       - name: Run Ruff
         run: poetry run ruff check .
 
+      - name: Validate OpenAPI Schema Export
+        run: poetry run python scripts/export_openapi.py
+
+      - name: Upload OpenAPI Schema Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi-schema
+          path: openapi.json
+          retention-days: 7
+
   # ================================================================
   # 🧪 TEST (unit) — no external dependencies
   # ================================================================
