@@ -570,3 +570,21 @@ jobs:
             --ref dev
         env:
           GH_TOKEN: ${{ secrets.DEPLOYMENT_PAT }}
+
+  # ================================================================
+  # 🚀 TRIGGER PRODUCTION DEPLOY
+  # ================================================================
+  trigger-production:
+    name: "🚀 Trigger Production Deploy"
+    runs-on: ubuntu-latest
+    needs: [push]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Trigger production deployment
+        run: |
+          gh workflow run production.yml \
+            --repo DHBW-AppStore-T3/deployment \
+            --ref main
+        env:
+          GH_TOKEN: ${{ secrets.DEPLOYMENT_PAT }}
