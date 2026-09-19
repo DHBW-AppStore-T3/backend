@@ -220,15 +220,17 @@ jobs:
           retention-days: 7
 
   # ================================================================
-  # 📊 COVERAGE — aggregate + publish to GitHub Pages
+  # 📊 COVERAGE — aggregate + gate
   # ================================================================
   # Combines the .coverage data from the unit and integration jobs,
-  # renders an HTML report, emits a Shields.io endpoint badge.json,
-  # and (only on main) deploys everything to GitHub Pages.
+  # renders an HTML report, emits a Shields.io endpoint badge.json, and
+  # keeps both as a workflow artifact.
   #
-  # The Pages source for this repo must be set to "GitHub Actions"
-  # under Settings → Pages once. Until then, the deploy step fails
-  # but the artifact is still uploaded.
+  # Used to also publish to GitHub Pages; removed - Pages was never
+  # actually enabled for this repo, the README badge pointed at the
+  # pre-rename org and had never resolved either, and nothing else
+  # depended on the published site. The HTML report is still available,
+  # just as the coverage-html workflow artifact below.
   coverage:
     name: "📊 Coverage"
     runs-on: ubuntu-latest
@@ -236,11 +238,6 @@ jobs:
     if: ${{ !cancelled() }}
     permissions:
       contents: read
-      pages: write
-      id-token: write
-    concurrency:
-      group: pages
-      cancel-in-progress: false
 
     steps:
       - name: Checkout code
@@ -300,20 +297,6 @@ jobs:
             exit 1
           fi
           echo "✅ Coverage Gate Passed: ${PCT}% >= ${MIN_COVERAGE}%"
-
-      - name: Configure Pages
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        uses: actions/configure-pages@v5
-
-      - name: Upload Pages artifact
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: coverage-html
-
-      - name: Deploy to GitHub Pages
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        uses: actions/deploy-pages@v4
 
   # ================================================================
   # 🔒 SECURITY (deps + filesystem) — blocks on HIGH/CRITICAL
