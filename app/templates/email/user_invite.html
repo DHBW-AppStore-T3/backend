@@ -21,7 +21,20 @@
     <td><a href="{{ access.url }}">{{ access.url }}</a></td>
   </tr>
   {% endif %}
-  {% if access.ip %}
+  {#
+    Windows apps set ``authtype = "rdp"`` and get a ready-to-paste connect
+    string instead of a bare IP/port pair — an IPv6 literal must be
+    bracketed for mstsc, and "2001:db8::a:3389" is unreadable otherwise.
+  #}
+  {% if access.authtype == "rdp" and access.ip %}
+  <tr>
+    <td>Remote Desktop</td>
+    <td>
+      <code>{% if ":" in access.ip %}[{{ access.ip }}]{% else %}{{ access.ip }}{% endif %}:{{ access.port or 3389 }}</code>
+      <br><span class="muted">Open "Remote Desktop Connection" (mstsc) and paste the address above.</span>
+    </td>
+  </tr>
+  {% elif access.ip %}
   <tr>
     <td>IP</td>
     <td><code>{{ access.ip }}</code>{% if access.port %}:<code>{{ access.port }}</code>{% endif %}</td>
