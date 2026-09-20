@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
 from app.models import Course, User, UserRole
+from app.services import lti13_service
 from app.services.lti_membership import fetch_members
 
 logger = logging.getLogger(__name__)
@@ -87,8 +88,8 @@ def _sync_roster(db: Session, course: Course, memberships_url: str) -> int:
             )
             db.add(user)
         else:
-            # Existing user (possibly Keycloak-backed): only (re)attach
-            # to this course, don't clobber their role.
+            # Moodle roster is authoritative for role and course assignment.
+            user.role = role
             user.courseId = course.courseId
         count += 1
 
@@ -146,6 +147,46 @@ async def lti_launch(request: Request, db: Session = Depends(get_db)):
             except Exception:
                 logger.exception("LTI roster sync failed for course %s", course_title)
 
+    # JIT-provision the launching user so the session token resolves to a DB record.
+    # Moodle is authoritative: always sync role, name, and courseId from the launch params.
+    if user_email:
+        user_record = db.query(User).filter(User.email == user_email).first()
+        lti_role = _map_role([params.get("roles", "")])
+        name_parts = user_name.split(" ", 1)
+        if user_record is None:
+            user_record = User(
+                email=user_email,
+                username=user_email,
+                firstName=name_parts[0] if name_parts else None,
+                lastName=name_parts[1] if len(name_parts) > 1 else None,
+                role=lti_role,
+                courseId=course_id or None,
+            )
+            db.add(user_record)
+            db.commit()
+        else:
+            updated = False
+            if user_record.role != lti_role:
+                user_record.role = lti_role
+                updated = True
+            if course_id and not user_record.courseId:
+                user_record.courseId = course_id
+                updated = True
+            first = name_parts[0] if name_parts else None
+            last = name_parts[1] if len(name_parts) > 1 else None
+            if first and not user_record.firstName:
+                user_record.firstName = first
+                updated = True
+            if last and not user_record.lastName:
+                user_record.lastName = last
+                updated = True
+            if updated:
+                db.commit()
+
+    session_token = lti13_service.issue_session_token(
+        user_email or "anonymous", settings.LTI13_SESSION_SECRET
+    )
+
     query = urllib.parse.urlencode({
         "lti": "1",
         "name": user_name,
@@ -154,6 +195,7 @@ async def lti_launch(request: Request, db: Session = Depends(get_db)):
         "courseId": course_id,
         "role": role,
         "synced": synced,
+        "session_token": session_token,
     })
     target = f"{settings.APP_BASE_URL}?{query}"
 

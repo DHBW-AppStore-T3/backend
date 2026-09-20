@@ -1,11 +1,8 @@
-"""
-Keycloak Authentication & Authorization
-Handles token validation and user management with Keycloak.
-"""
 import logging
 import threading
+from typing import Optional
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from keycloak import KeycloakAdmin, KeycloakAuthenticationError, KeycloakOpenID
@@ -14,10 +11,12 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
 from app.models import User, UserRole
+from app.services import lti13_service
 
 logger = logging.getLogger(__name__)
 
 security = HTTPBearer()
+optional_security = HTTPBearer(auto_error=False)
 
 
 # ----------------------------------------------------------------
@@ -166,18 +165,28 @@ def sync_user_from_keycloak(db: Session, keycloak_user_data: dict) -> User:
 
     user = db.query(User).filter(User.keycloak_id == keycloak_id).first()
     if not user:
-        user = User(
-            keycloak_id=keycloak_id,
-            email=email,
-            username=username,
-            role=app_role,
-            firstName=first_name,
-            lastName=last_name,
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-        return user
+        # Fall back to email lookup — handles the case where the account was
+        # provisioned via LTI/DEV_MODE first (keycloak_id was a fake dev-* id).
+        # Link the existing record to the real Keycloak UUID instead of
+        # creating a duplicate that would violate the unique-email constraint.
+        user = db.query(User).filter(User.email == email).first()
+        if user:
+            user.keycloak_id = keycloak_id
+            db.commit()
+            db.refresh(user)
+        else:
+            user = User(
+                keycloak_id=keycloak_id,
+                email=email,
+                username=username,
+                role=app_role,
+                firstName=first_name,
+                lastName=last_name,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            return user
 
     updated = False
     # Email is the identifier used for display, search, and
@@ -209,13 +218,51 @@ def sync_user_from_keycloak(db: Session, keycloak_user_data: dict) -> User:
 # AUTH DEPENDENCY
 # ----------------------------------------------------------------
 def get_current_user_keycloak(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
     db: Session = Depends(get_db),
 ) -> User:
     """
     Validate the bearer token and return the local User record.
     JIT-provisions the user from Keycloak claims on first sight.
+    In DEV_MODE, accepts X-Dev-User header instead of a real token.
     """
+    if settings.DEV_MODE:
+        dev_email = request.headers.get("X-Dev-User")
+        if dev_email:
+            user = db.query(User).filter(User.email == dev_email).first()
+            if not user:
+                user = User(
+                    keycloak_id=f"dev-{dev_email}",
+                    email=dev_email,
+                    username=dev_email,
+                    role=UserRole.STUDENT,  # overridden by LTI JIT on first LTI launch
+                )
+                db.add(user)
+                db.commit()
+                db.refresh(user)
+            return user
+
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # LTI 1.3 session token (HS256, issued by /lti13/launch).
+    # Try this before Keycloak so production LTI launches work without DEV_MODE.
+    if settings.LTI13_SESSION_SECRET and settings.LTI13_SESSION_SECRET != "change-me-in-production":
+        try:
+            email = lti13_service.verify_session_token(
+                credentials.credentials, settings.LTI13_SESSION_SECRET
+            )
+            user = db.query(User).filter(User.email == email).first()
+            if user:
+                return user
+        except ValueError:
+            pass  # not an LTI session token — fall through to Keycloak
+
     token_info = verify_keycloak_token_offline(credentials.credentials)
 
     keycloak_id = token_info.get("sub")
