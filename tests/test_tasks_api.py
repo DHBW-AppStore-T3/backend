@@ -5,6 +5,7 @@ Covered cases:
 
   * Owner darf die Task-Liste einer eigenen Deployment lesen.
   * Nicht-Mitglied (STUDENT, kein Team, kein UserToDeployment) bekommt 403.
+  * Fremder Lehrender ohne Kursbezug zum Owner bekommt 403.
   * Owner darf eine einzelne Task per ID lesen.
   * Unbekannte Task-ID → 404.
   * Ohne Bearer-Token → 401 (oder 403 von HTTPBearer).
@@ -109,6 +110,28 @@ def test_get_deployment_tasks_non_member_403(
     response = student_client.get(f"/tasks/deployment/{deployment.deploymentId}")
 
     assert response.status_code == 403
+
+
+@pytest.mark.integration
+def test_get_deployment_tasks_unrelated_teacher_403(client, db, mock_admin):
+    """Ein Lehrender ohne Kursbezug zum Owner bekommt 403.
+
+    Der Router benutzte früher ``permissions.ensure_deployment_owner_view``,
+    das jede TEACHER-Rolle pauschal durchliess — damit konnte ein
+    beliebiger Lehrender die Task-Logs jeder Deployment lesen, inklusive
+    Terraform-Outputs, IPs und Worker-Stacktraces. Jetzt gilt
+    ``capabilities.ensure_view_deployment_owner``: Owner, Admin, oder der
+    Kurs-Lehrende des Deployment-Owners. ``mock_user`` (TEACHER) ist hier
+    keins davon, und ``mock_admin`` hat keinen Kurs.
+    """
+    app = _make_app(db, mock_admin.userId)
+    deployment = _make_deployment(db, mock_admin.userId, app.appId)
+    _make_task(db, deployment.deploymentId)
+
+    response = client.get(f"/tasks/deployment/{deployment.deploymentId}")
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "deployment_owner_view_forbidden"
 
 
 # ---------------------------------------------------------------------------
