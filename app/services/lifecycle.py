@@ -37,6 +37,12 @@ class DeploymentAction(str, Enum):
     # Resume reverses pause. Only valid in the synthetic ``paused``
     # state so the matrix stays unambiguous.
     RESUME = "resume"
+    # Cancel stops a deploy that is still in flight. It is the only
+    # action permitted while a worker task is running, and it is not a
+    # plain "forget about it": the worker task is revoked and a destroy
+    # follows that also reaps the Packer build instance, which lives
+    # outside Terraform state and would otherwise be left running.
+    CANCEL = "cancel"
 
 
 # Synthetic statuses where a worker task is currently in flight. Every
@@ -55,6 +61,12 @@ IN_FLIGHT_STATUSES: frozenset[str] = frozenset({
 # Status → set of allowed actions. Anything not listed gets the empty
 # set (safe default: an unrecognised status allows no destructive action).
 _ALLOWED: dict[str, set[DeploymentAction]] = {
+    # Still in flight. Cancel is deliberately the ONLY action here: a
+    # parallel destroy/pause against a running deploy is what the
+    # in-flight guard exists to prevent, whereas cancel revokes that
+    # very task before doing anything else.
+    "pending": {DeploymentAction.CANCEL},
+    "running": {DeploymentAction.CANCEL},
     # Deployed and running — tear down or pause compute to free quota.
     "success": {DeploymentAction.DESTROY, DeploymentAction.PAUSE},
     # A failed deploy may have created some resources, so Destroy is
@@ -94,6 +106,7 @@ _REQUIRED_STATES: dict[DeploymentAction, str] = {
     DeploymentAction.DELETE: "failed or cancelled",
     DeploymentAction.PAUSE: "success, pause_failed or resume_failed",
     DeploymentAction.RESUME: "paused, pause_failed or resume_failed",
+    DeploymentAction.CANCEL: "pending or running",
 }
 
 
