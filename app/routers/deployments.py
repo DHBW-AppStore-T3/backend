@@ -6,6 +6,7 @@ import logging
 import re
 from collections.abc import AsyncIterator
 from dataclasses import asdict
+from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -13,6 +14,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
+from app.celery_app import celery_app
 from app.crud import apps as crud_apps
 from app.crud import deployments as crud_deployments
 from app.crud import locks as crud_locks
@@ -1606,6 +1608,85 @@ def _view_asdict(view) -> dict:
 # Allowed only on ``status='success'`` — the lifecycle service is the
 # single source of truth, the partial-unique index on active tasks is
 # the DB-level backstop.
+# ----------------------------------------------------------------
+# CANCEL DEPLOYMENT
+# ----------------------------------------------------------------
+#
+# The only action permitted while a worker task is still in flight.
+# Cancel is not "forget about it" - it is stop-and-clean, in this order:
+#
+#   1. Revoke the Celery task with ``terminate=True``. The worker's
+#      subprocess runner kills its entire process group on the way out,
+#      so packer/terraform cannot survive as an orphan still talking to
+#      the tenant.
+#   2. Mark the in-flight task row CANCELLED in this same transaction.
+#      The revoke event that would otherwise do it arrives
+#      asynchronously, and until it lands the partial unique index would
+#      reject the destroy task we are about to insert.
+#   3. Dispatch a destroy with ``sweep_build_artifacts=True``. Terraform
+#      destroy alone is not enough: the Packer build instance belongs to
+#      Packer, not to Terraform, so it appears in no state file and
+#      would keep running and keep burning quota.
+@router.post("/{deployment_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
+def cancel_deployment(
+    deployment_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_keycloak),
+):
+    """Stop an in-flight deployment and clean up everything it created.
+
+    Owner-only, same gate as Destroy. Returns ``202 + {task_id,
+    status: "destroying"}`` so the frontend can stay on the live SSE
+    view and watch the cleanup run.
+    """
+    deployment = crud_deployments.get_deployment_with_details(db, deployment_id)
+    if not deployment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Deployment not found",
+        )
+
+    ensure_operate_deployment(current_user, deployment, db)
+    # Same locking discipline as pause/resume: hold the advisory lock
+    # across the status check AND the task insert.
+    crud_locks.acquire_deployment_xact_lock(db, deployment_id)
+    lifecycle_service.ensure_action_allowed(
+        db, deployment, lifecycle_service.DeploymentAction.CANCEL,
+    )
+
+    in_flight = crud_deployments.get_latest_task(db, deployment_id)
+    if in_flight is not None and in_flight.celeryTaskId:
+        try:
+            celery_app.control.revoke(
+                in_flight.celeryTaskId, terminate=True, signal="SIGTERM",
+            )
+        except Exception as exc:  # noqa: BLE001 - a broker hiccup must not strand the user
+            # Worst case the task keeps running and the sweep below
+            # races it; surfacing a 5xx here would leave the user with
+            # no way to clean up at all.
+            logger.warning(
+                "Could not revoke celery task %s for deployment %s: %s",
+                in_flight.celeryTaskId,
+                deployment_id,
+                exc,
+            )
+    if in_flight is not None and in_flight.status in (TaskStatus.PENDING, TaskStatus.RUNNING):
+        in_flight.status = TaskStatus.CANCELLED
+        in_flight.finished_at = datetime.now(UTC)
+        db.flush()
+
+    return _dispatch_lifecycle_task(
+        db,
+        deployment,
+        current_user,
+        task_type=TaskType.DESTROY,
+        celery_task_name="tasks.destroy_deployment",
+        response_status="destroying",
+        # Positional tail of the worker signature: sweep_build_artifacts.
+        extra_args=[True],
+    )
+
+
 @router.post("/{deployment_id}/pause", status_code=status.HTTP_202_ACCEPTED)
 def pause_deployment(
     deployment_id: UUID,
