@@ -21,6 +21,7 @@ from app.config import settings
 from app.database import get_db
 from app.models import Course, User, UserRole
 from app.services import lti13_service
+from app.utils.keycloak_auth import higher_role
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +171,9 @@ async def lti13_launch(request: Request, db: Session = Depends(get_db)) -> HTMLR
             db.refresh(course)
         course_id = str(course.courseId)
 
-    # JIT-provision user
+    # JIT-provision user. Moodle is the authoritative role source (real users
+    # carry no role in Keycloak). Role is monotonic — only promote an existing
+    # user, never demote, so a later self-service login can't reset it.
     role = UserRole.TEACHER if info["role"] == "instructor" else UserRole.STUDENT
     user = db.query(User).filter(User.email == email).first()
     if user is None:
@@ -186,8 +189,15 @@ async def lti13_launch(request: Request, db: Session = Depends(get_db)) -> HTMLR
         db.commit()
         db.refresh(user)
     else:
+        updated = False
+        promoted = higher_role(user.role, role)
+        if user.role != promoted:
+            user.role = promoted
+            updated = True
         if course_id:
             user.courseId = course_id
+            updated = True
+        if updated:
             db.commit()
 
     # Issue an app-internal session token — lets the frontend call the API

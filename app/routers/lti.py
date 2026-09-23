@@ -13,6 +13,7 @@ from app.database import get_db
 from app.models import Course, User, UserRole
 from app.services import lti13_service
 from app.services.lti_membership import fetch_members
+from app.utils.keycloak_auth import higher_role
 
 logger = logging.getLogger(__name__)
 
@@ -88,8 +89,10 @@ def _sync_roster(db: Session, course: Course, memberships_url: str) -> int:
             )
             db.add(user)
         else:
-            # Moodle roster is authoritative for role and course assignment.
-            user.role = role
+            # Role is monotonic: only promote, never demote (a learner in this
+            # course may already be a teacher elsewhere). Course assignment
+            # stays authoritative.
+            user.role = higher_role(user.role, role)
             user.courseId = course.courseId
         count += 1
 
@@ -166,8 +169,9 @@ async def lti_launch(request: Request, db: Session = Depends(get_db)):
             db.commit()
         else:
             updated = False
-            if user_record.role != lti_role:
-                user_record.role = lti_role
+            promoted = higher_role(user_record.role, lti_role)
+            if user_record.role != promoted:
+                user_record.role = promoted
                 updated = True
             if course_id and not user_record.courseId:
                 user_record.courseId = course_id

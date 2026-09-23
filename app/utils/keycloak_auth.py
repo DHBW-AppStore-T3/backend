@@ -136,6 +136,21 @@ def map_keycloak_roles_to_app_role(keycloak_roles: list) -> UserRole:
     return UserRole.STUDENT
 
 
+# Role privilege order. The app role is monotonic: a user's role is the
+# highest any source has ever asserted for them, and no login path lowers
+# it. Rationale: real (non-demo) users only ever carry a role in Moodle —
+# Keycloak federates them from bwIDM without a realm role, so a Keycloak /
+# self-service login would otherwise downgrade a Moodle-assigned TEACHER
+# back to STUDENT on every visit. Moodle is the authoritative role source;
+# every other path may only promote.
+_ROLE_RANK = {UserRole.STUDENT: 0, UserRole.TEACHER: 1, UserRole.ADMIN: 2}
+
+
+def higher_role(a: UserRole, b: UserRole) -> UserRole:
+    """Return whichever of the two roles carries more privilege."""
+    return a if _ROLE_RANK[a] >= _ROLE_RANK[b] else b
+
+
 # ----------------------------------------------------------------
 # USER SYNC (Just-in-Time Provisioning)
 # ----------------------------------------------------------------
@@ -199,8 +214,13 @@ def sync_user_from_keycloak(db: Session, keycloak_user_data: dict) -> User:
     if username and user.username != username:
         user.username = username
         updated = True
-    if user.role != app_role:
-        user.role = app_role
+    # Role is monotonic: only promote, never demote. Federated (real) users
+    # arrive from Keycloak without a realm role, so app_role is STUDENT for
+    # them — without this guard a self-service login would undo the TEACHER
+    # role Moodle assigned via LTI. See higher_role().
+    promoted = higher_role(user.role, app_role)
+    if user.role != promoted:
+        user.role = promoted
         updated = True
     if first_name and user.firstName != first_name:
         user.firstName = first_name
@@ -236,7 +256,7 @@ def get_current_user_keycloak(
                     keycloak_id=f"dev-{dev_email}",
                     email=dev_email,
                     username=dev_email,
-                    role=UserRole.STUDENT,  # overridden by LTI JIT on first LTI launch
+                    role=UserRole.STUDENT,  # promoted by Moodle LTI on first launch
                 )
                 db.add(user)
                 db.commit()

@@ -107,3 +107,61 @@ def test_lti_launch_rejects_bad_signature(unauth_client, lti_form_data):
     with patch("app.config.settings.LTI_CONSUMER_KEY", "appstore-lti-key"):
         response = unauth_client.post("/lti/launch", data=lti_form_data)
     assert response.status_code == 403
+
+
+def test_lti_launch_promotes_existing_student_to_teacher(unauth_client, db, lti_form_data):
+    """An instructor launch must raise an already-provisioned student's role.
+
+    Dennis first appears as a self-service STUDENT, then launches via Moodle
+    as a Trainer — the launch must promote him to TEACHER.
+    """
+    import uuid
+    from app.models import User, UserRole
+
+    db.add(User(
+        userId=uuid.uuid4(),
+        email="dennis.pfisterer@dhbw.de",
+        username="dennis.pfisterer",
+        role=UserRole.STUDENT,
+    ))
+    db.commit()
+
+    lti_form_data["lis_person_contact_email_primary"] = "dennis.pfisterer@dhbw.de"
+    lti_form_data["roles"] = "Instructor"
+
+    with (
+        patch("app.routers.lti._verify_oauth_signature", return_value=True),
+        patch("app.config.settings.LTI_CONSUMER_KEY", "appstore-lti-key"),
+    ):
+        response = unauth_client.post("/lti/launch", data=lti_form_data)
+
+    assert response.status_code == 200
+    user = db.query(User).filter(User.email == "dennis.pfisterer@dhbw.de").first()
+    assert user.role == UserRole.TEACHER
+
+
+def test_lti_launch_does_not_demote_teacher(unauth_client, db, lti_form_data):
+    """A learner launch must not lower an existing TEACHER's role."""
+    import uuid
+    from app.models import User, UserRole
+
+    db.add(User(
+        userId=uuid.uuid4(),
+        email="dennis.pfisterer@dhbw.de",
+        username="dennis.pfisterer",
+        role=UserRole.TEACHER,
+    ))
+    db.commit()
+
+    lti_form_data["lis_person_contact_email_primary"] = "dennis.pfisterer@dhbw.de"
+    lti_form_data["roles"] = "Learner"
+
+    with (
+        patch("app.routers.lti._verify_oauth_signature", return_value=True),
+        patch("app.config.settings.LTI_CONSUMER_KEY", "appstore-lti-key"),
+    ):
+        response = unauth_client.post("/lti/launch", data=lti_form_data)
+
+    assert response.status_code == 200
+    user = db.query(User).filter(User.email == "dennis.pfisterer@dhbw.de").first()
+    assert user.role == UserRole.TEACHER
