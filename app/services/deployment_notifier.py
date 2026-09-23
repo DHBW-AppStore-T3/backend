@@ -107,6 +107,13 @@ def _display_name(user: User) -> str:
 #   safety (the mail still shows whatever ``auth`` value the app
 #   produced rather than silently dropping it).
 #
+#   Optional ``authtype`` is a PRESENTATION hint, orthogonal to
+#   ``type``: it selects how the endpoint is shown, not how the
+#   credential is. ``"rdp"`` renders a bracketed host:port connect
+#   string for mstsc (Windows apps, which still use ``type =
+#   "password"``); ``"ssh"`` forces SSH rendering. Omitted on every
+#   pre-existing app, which keeps their URL/SSH rendering unchanged.
+#
 #   teams_summary.value: {"Team-1": 1, ...}  — member counts; not used
 #                                              directly but useful as a
 #                                              sanity check.
@@ -282,6 +289,10 @@ def _access_for_user(
         # templates use it together with ``auth_type`` to decide WHERE to
         # show it (password field, SSH-key block, OAuth login link, ...).
         "auth_value": auth_value,
+        # Presentation hint, orthogonal to ``auth_type``. Windows apps set
+        # ``authtype = "rdp"`` so the mail renders an RDP connect string
+        # instead of an IP/port pair; apps that omit it are unaffected.
+        "authtype": raw.get("authtype"),
         # Convenience fallback so the user-mail can show a URL even when
         # the per-user output doesn't carry one — use the team VM's URL.
         "url": (_vm_for_team(outputs, team_name) or {}).get("url"),
