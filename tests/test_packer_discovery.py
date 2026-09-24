@@ -1,4 +1,4 @@
-"""Unit tests for ``_discover_packer_templates``.
+"""Unit tests for ``discover_packer_templates``.
 
 The discovery helper picks one of two layouts under ``<repo>/packer``
 and rejects ambiguous or unsafe states. These tests pin the rules so
@@ -11,10 +11,10 @@ import os
 
 import pytest
 
-from app.routers.apps import (
+from app.services.packer_discovery import (
+    PackerTemplate,
     PackerTemplateDiscoveryError,
-    _discover_packer_templates,
-    _PackerTemplate,
+    discover_packer_templates,
 )
 
 
@@ -30,11 +30,11 @@ def _touch(path: str, content: str = "") -> None:
 def test_no_packer_directory_returns_empty(tmp_path):
     # No packer/ at all — this is a Terraform-only app and discovery
     # must say so without raising.
-    result = _discover_packer_templates(str(tmp_path))
+    result = discover_packer_templates(str(tmp_path))
     assert result == []
 
 
-# 2. Legacy: packer/template.pkr.hcl → [_PackerTemplate(key="default", ...)]
+# 2. Legacy: packer/template.pkr.hcl → [PackerTemplate(key="default", ...)]
 def test_legacy_single_template_returns_default(tmp_path):
     packer_dir = tmp_path / "packer"
     packer_dir.mkdir()
@@ -44,7 +44,7 @@ def test_legacy_single_template_returns_default(tmp_path):
     # ``variables_path`` field too.
     (packer_dir / "variables.pkr.hcl").write_text("")
 
-    result = _discover_packer_templates(str(tmp_path))
+    result = discover_packer_templates(str(tmp_path))
     assert len(result) == 1
     assert result[0].key == "default"
     assert result[0].template_path == str(legacy)
@@ -60,14 +60,14 @@ def test_multi_template_returns_sorted_list(tmp_path):
     _touch(str(packer_dir / "database" / "template.pkr.hcl"))
     _touch(str(packer_dir / "database" / "variables.pkr.hcl"))
 
-    result = _discover_packer_templates(str(tmp_path))
+    result = discover_packer_templates(str(tmp_path))
     keys = [t.key for t in result]
     # ``database`` < ``webserver`` alphabetically — sorted order is
     # part of the contract because downstream phase tracking expects
     # deterministic ordering.
     assert keys == ["database", "webserver"]
     for t in result:
-        assert isinstance(t, _PackerTemplate)
+        assert isinstance(t, PackerTemplate)
         assert t.template_path.endswith(f"{t.key}/template.pkr.hcl")
         assert t.variables_path.endswith(f"{t.key}/variables.pkr.hcl")
 
@@ -85,7 +85,7 @@ def test_multi_template_ignores_non_template_subdirs(tmp_path):
     # also skipped silently.
     _touch(str(packer_dir / "http" / "preseed.cfg"))
 
-    result = _discover_packer_templates(str(tmp_path))
+    result = discover_packer_templates(str(tmp_path))
     assert [t.key for t in result] == ["webserver"]
 
 
@@ -98,7 +98,7 @@ def test_legacy_and_multi_layout_coexist_raises(tmp_path):
     _touch(str(packer_dir / "webserver" / "template.pkr.hcl"))
 
     with pytest.raises(PackerTemplateDiscoveryError) as excinfo:
-        _discover_packer_templates(str(tmp_path))
+        discover_packer_templates(str(tmp_path))
     # Message must call out both layouts so the app author can
     # diagnose without re-reading the discovery code.
     assert "BOTH" in str(excinfo.value) or "both" in str(excinfo.value).lower()
@@ -114,7 +114,7 @@ def test_invalid_key_raises(tmp_path):
     _touch(str(packer_dir / "Web-Server" / "template.pkr.hcl"))
 
     with pytest.raises(PackerTemplateDiscoveryError) as excinfo:
-        _discover_packer_templates(str(tmp_path))
+        discover_packer_templates(str(tmp_path))
     assert "Web-Server" in str(excinfo.value)
 
 
@@ -128,7 +128,7 @@ def test_multi_template_without_variables_file(tmp_path):
     # doesn't exist on disk. Callers gate the read with
     # ``os.path.isfile``.
 
-    result = _discover_packer_templates(str(tmp_path))
+    result = discover_packer_templates(str(tmp_path))
     assert len(result) == 1
     assert result[0].key == "webserver"
     assert not os.path.isfile(result[0].variables_path)
