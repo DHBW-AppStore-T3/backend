@@ -1,5 +1,9 @@
+import pytest
+
 from app.models import UserRole
 from app.utils.keycloak_auth import higher_role
+
+pytestmark = pytest.mark.unit
 
 
 def test_higher_role_never_demotes():

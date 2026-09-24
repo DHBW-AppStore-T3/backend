@@ -1,4 +1,5 @@
 import time
+from unittest.mock import MagicMock, patch
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -6,6 +7,8 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from jose import jwt
 
 from app.services import lti13_service
+
+pytestmark = pytest.mark.unit
 
 
 @pytest.fixture
@@ -106,3 +109,131 @@ def test_verify_session_token_rejects_wrong_secret():
     token = lti13_service.issue_session_token("student@example.com", "test-secret")
     with pytest.raises(ValueError):
         lti13_service.verify_session_token(token, "wrong-secret")
+
+
+def test_verify_session_token_rejects_garbage():
+    with pytest.raises(ValueError):
+        lti13_service.verify_session_token("not-a-jwt-at-all", "test-secret")
+
+
+def test_fetch_platform_jwks_fetches_over_http(monkeypatch):
+    lti13_service._jwks_cache.clear()
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"keys": [{"kid": "abc"}]}
+    with patch.object(lti13_service.http_requests, "get", return_value=mock_response) as mock_get:
+        keys = lti13_service.fetch_platform_jwks("https://moodle.example.com/certs.php")
+
+    mock_get.assert_called_once_with("https://moodle.example.com/certs.php", timeout=10)
+    mock_response.raise_for_status.assert_called_once()
+    assert keys == [{"kid": "abc"}]
+
+
+def test_fetch_platform_jwks_reuses_cache_within_ttl(monkeypatch):
+    lti13_service._jwks_cache.clear()
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"keys": [{"kid": "abc"}]}
+    with patch.object(lti13_service.http_requests, "get", return_value=mock_response) as mock_get:
+        lti13_service.fetch_platform_jwks("https://moodle.example.com/certs.php")
+        lti13_service.fetch_platform_jwks("https://moodle.example.com/certs.php")
+
+    mock_get.assert_called_once()
+
+
+def test_validate_id_token_rejects_unparseable_header(monkeypatch, rsa_key):
+    monkeypatch.setattr(
+        lti13_service, "fetch_platform_jwks", lambda _jwks_url: [_jwk_dict(rsa_key)]
+    )
+    with pytest.raises(ValueError, match="header"):
+        lti13_service.validate_id_token(
+            id_token="not-a-jwt",
+            client_id="client-123",
+            expected_nonce="expected-nonce",
+            platform_issuer="https://moodle.example.com",
+            jwks_url="https://moodle.example.com/mod/lti/certs.php",
+        )
+
+
+def test_validate_id_token_retries_jwks_on_unknown_kid_then_fails(monkeypatch, rsa_key):
+    calls = {"count": 0}
+
+    def _fetch(_jwks_url):
+        calls["count"] += 1
+        return [_jwk_dict(rsa_key, kid="a-different-kid")]
+
+    monkeypatch.setattr(lti13_service, "fetch_platform_jwks", _fetch)
+    token = _sign(rsa_key, _base_claims(), kid="test-kid")
+
+    with pytest.raises(ValueError, match="No matching JWK"):
+        lti13_service.validate_id_token(
+            id_token=token,
+            client_id="client-123",
+            expected_nonce="expected-nonce",
+            platform_issuer="https://moodle.example.com",
+            jwks_url="https://moodle.example.com/mod/lti/certs.php",
+        )
+
+    assert calls["count"] == 2  # first attempt + one retry after cache invalidation
+
+
+def test_validate_id_token_rejects_wrong_message_type(monkeypatch, rsa_key):
+    monkeypatch.setattr(
+        lti13_service, "fetch_platform_jwks", lambda _jwks_url: [_jwk_dict(rsa_key)]
+    )
+    claims = _base_claims()
+    claims["https://purl.imsglobal.org/spec/lti/claim/message_type"] = "LtiDeepLinkingRequest"
+    token = _sign(rsa_key, claims)
+
+    with pytest.raises(ValueError, match="message type"):
+        lti13_service.validate_id_token(
+            id_token=token,
+            client_id="client-123",
+            expected_nonce="expected-nonce",
+            platform_issuer="https://moodle.example.com",
+            jwks_url="https://moodle.example.com/mod/lti/certs.php",
+        )
+
+
+def test_validate_id_token_accepts_valid_token(monkeypatch, rsa_key):
+    monkeypatch.setattr(
+        lti13_service, "fetch_platform_jwks", lambda _jwks_url: [_jwk_dict(rsa_key)]
+    )
+    token = _sign(rsa_key, _base_claims())
+
+    claims = lti13_service.validate_id_token(
+        id_token=token,
+        client_id="client-123",
+        expected_nonce="expected-nonce",
+        platform_issuer="https://moodle.example.com",
+        jwks_url="https://moodle.example.com/mod/lti/certs.php",
+    )
+
+    assert claims["email"] == "student@example.com"
+
+
+def test_extract_role_maps_instructor_variants():
+    assert (
+        lti13_service._extract_role(
+            {
+                "https://purl.imsglobal.org/spec/lti/claim/roles": [
+                    "http://purl.imsglobal.org/vocab/lis/v2/membership#Instructor"
+                ]
+            }
+        )
+        == "instructor"
+    )
+
+
+def test_extract_role_defaults_to_student():
+    assert lti13_service._extract_role({}) == "student"
+
+
+def test_extract_user_info_falls_back_email_for_missing_name():
+    info = lti13_service.extract_user_info(
+        {
+            "email": "no-name@example.com",
+            "https://purl.imsglobal.org/spec/lti/claim/roles": [],
+        }
+    )
+    assert info["name"] == "no-name@example.com"
+    assert info["role"] == "student"
+    assert info["course"] == ""
