@@ -2,6 +2,7 @@
 Keycloak Authentication & Authorization
 Handles token validation and user management with Keycloak.
 """
+
 import logging
 import threading
 
@@ -14,10 +15,12 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
 from app.models import User, UserRole
+from app.services import lti13_service
 
 logger = logging.getLogger(__name__)
 
 security = HTTPBearer()
+optional_security = HTTPBearer(auto_error=False)
 
 
 # ----------------------------------------------------------------
@@ -64,9 +67,7 @@ def _get_realm_public_key_pem() -> str:
         if _public_key_pem is not None:
             return _public_key_pem
         raw = get_keycloak_client().public_key()
-        _public_key_pem = (
-            "-----BEGIN PUBLIC KEY-----\n" + raw + "\n-----END PUBLIC KEY-----"
-        )
+        _public_key_pem = "-----BEGIN PUBLIC KEY-----\n" + raw + "\n-----END PUBLIC KEY-----"
         return _public_key_pem
 
 
@@ -137,6 +138,21 @@ def map_keycloak_roles_to_app_role(keycloak_roles: list) -> UserRole:
     return UserRole.STUDENT
 
 
+# Role privilege order. The app role is monotonic: a user's role is the
+# highest any source has ever asserted for them, and no login path lowers
+# it. Rationale: real (non-demo) users only ever carry a role in Moodle —
+# Keycloak federates them from bwIDM without a realm role, so a Keycloak /
+# self-service login would otherwise downgrade a Moodle-assigned TEACHER
+# back to STUDENT on every visit. Moodle is the authoritative role source;
+# every other path may only promote.
+_ROLE_RANK = {UserRole.STUDENT: 0, UserRole.TEACHER: 1, UserRole.ADMIN: 2}
+
+
+def higher_role(a: UserRole, b: UserRole) -> UserRole:
+    """Return whichever of the two roles carries more privilege."""
+    return a if _ROLE_RANK[a] >= _ROLE_RANK[b] else b
+
+
 # ----------------------------------------------------------------
 # USER SYNC (Just-in-Time Provisioning)
 # ----------------------------------------------------------------
@@ -150,10 +166,9 @@ def sync_user_from_keycloak(db: Session, keycloak_user_data: dict) -> User:
     keycloak_id = keycloak_user_data.get("id") or keycloak_user_data.get("sub")
     email = keycloak_user_data.get("email")
     username = keycloak_user_data.get("username") or keycloak_id
-    keycloak_roles = (
-        keycloak_user_data.get("roles")
-        or keycloak_user_data.get("realm_access", {}).get("roles", [])
-    )
+    keycloak_roles = keycloak_user_data.get("roles") or keycloak_user_data.get(
+        "realm_access", {}
+    ).get("roles", [])
     app_role = map_keycloak_roles_to_app_role(keycloak_roles)
     first_name = keycloak_user_data.get("firstName") or keycloak_user_data.get("given_name")
     last_name = keycloak_user_data.get("lastName") or keycloak_user_data.get("family_name")
@@ -190,8 +205,9 @@ def sync_user_from_keycloak(db: Session, keycloak_user_data: dict) -> User:
     if username and user.username != username:
         user.username = username
         updated = True
-    if user.role != app_role:
-        user.role = app_role
+    promoted = higher_role(user.role, app_role)
+    if user.role != promoted:
+        user.role = promoted
         updated = True
     if first_name and user.firstName != first_name:
         user.firstName = first_name
@@ -209,13 +225,36 @@ def sync_user_from_keycloak(db: Session, keycloak_user_data: dict) -> User:
 # AUTH DEPENDENCY
 # ----------------------------------------------------------------
 def get_current_user_keycloak(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials: HTTPAuthorizationCredentials | None = Depends(optional_security),
     db: Session = Depends(get_db),
 ) -> User:
     """
     Validate the bearer token and return the local User record.
     JIT-provisions the user from Keycloak claims on first sight.
+
+    Tries the LTI 1.3 session token first (HS256, issued by
+    ``/lti13/launch``) so Moodle launches authenticate without a Keycloak
+    round-trip; falls through to Keycloak on any other token.
     """
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if settings.LTI13_SESSION_SECRET and settings.LTI13_SESSION_SECRET != "change-me-in-production":
+        try:
+            email = lti13_service.verify_session_token(
+                credentials.credentials, settings.LTI13_SESSION_SECRET
+            )
+        except ValueError:
+            pass  # not an LTI session token — fall through to Keycloak
+        else:
+            user = db.query(User).filter(User.email == email).first()
+            if user:
+                return user
+
     token_info = verify_keycloak_token_offline(credentials.credentials)
 
     keycloak_id = token_info.get("sub")
@@ -264,10 +303,7 @@ def search_keycloak_users(search_query: str, max_results: int = 10) -> list[dict
     try:
         keycloak_admin = get_keycloak_admin()
         users = keycloak_admin.get_users({"search": search_query, "max": max_results})
-        return [
-            _project_keycloak_user(u, include_enabled=True)
-            for u in users
-        ]
+        return [_project_keycloak_user(u, include_enabled=True) for u in users]
     except Exception:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -334,7 +370,9 @@ def refresh_user_from_keycloak(db: Session, user: User) -> User:
         logger.warning(
             "refresh_user_from_keycloak: get_user(%s) failed (%s); "
             "falling back to DB record for %s",
-            user.keycloak_id, e, user.email,
+            user.keycloak_id,
+            e,
+            user.email,
         )
         return user
 
@@ -342,7 +380,8 @@ def refresh_user_from_keycloak(db: Session, user: User) -> User:
         logger.warning(
             "refresh_user_from_keycloak: keycloak returned no user for id=%s; "
             "user may have been deleted upstream — keeping DB record for %s",
-            user.keycloak_id, user.email,
+            user.keycloak_id,
+            user.email,
         )
         return user
 
@@ -374,6 +413,7 @@ def refresh_user_from_keycloak(db: Session, user: User) -> User:
         # block the notifier.
         logger.warning(
             "refresh_user_from_keycloak: sync rejected KC payload for %s: %s",
-            user.keycloak_id, e.detail,
+            user.keycloak_id,
+            e.detail,
         )
         return user
