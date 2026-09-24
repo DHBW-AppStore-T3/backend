@@ -15,6 +15,8 @@ from app.routers import (
     courses,
     dashboard,
     deployments,
+    handoff,
+    lti13,
     openstack_credentials,
     openstack_resources,
     quotas,
@@ -50,8 +52,7 @@ async def lifespan(app: FastAPI):
         # Test path: keep ``app`` fully functional but skip the Celery
         # listener + reconciler.
         logger.info(
-            "DISABLE_BACKGROUND_TASKS set — skipping Celery listener "
-            "and reconciler (test mode)"
+            "DISABLE_BACKGROUND_TASKS set — skipping Celery listener and reconciler (test mode)"
         )
         try:
             yield
@@ -101,7 +102,7 @@ app = FastAPI(
     title="Backend API",
     description="FastAPI Backend with Auth, Git & Celery Integration",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
 # ----------------------------------------------------------------
@@ -128,6 +129,8 @@ app.include_router(tasks.router, prefix="/tasks", tags=["Tasks"])
 app.include_router(teams.router, prefix="/teams", tags=["Teams"])
 app.include_router(quotas.router, prefix="/quotas", tags=["Quotas"])
 app.include_router(dashboard.router, prefix="/dashboard", tags=["Dashboard"])
+app.include_router(lti13.router)
+app.include_router(handoff.router, prefix="/handoff", tags=["Handoff"])
 app.include_router(openstack_credentials.router, tags=["OpenStack Credentials"])
 # Read API for OpenStack resources (Networks, Flavors, Images, ...),
 # used by the wizard's value-help dropdowns so users don't have to type
@@ -144,8 +147,4 @@ app.include_router(
 # ----------------------------------------------------------------
 @app.get("/health")
 def health_check():
-    return {
-        "status": "healthy",
-        "service": "backend-api",
-        "version": "1.0.0"
-    }
+    return {"status": "healthy", "service": "backend-api", "version": "1.0.0"}
