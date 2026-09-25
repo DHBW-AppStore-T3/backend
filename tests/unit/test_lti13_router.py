@@ -10,11 +10,20 @@ from app.routers import lti13
 pytestmark = pytest.mark.unit
 
 
-def _mock_request(cookies=None, form=None):
+def _mock_request(cookies=None, form=None, query_params=None, method="POST"):
     request = MagicMock()
     request.cookies = cookies or {}
     request.form = AsyncMock(return_value=form or {})
+    request.query_params = query_params or {}
+    request.method = method
     return request
+
+
+def _mock_login_request(**params):
+    """A GET request carrying `params` in the query string — matches how
+    lti13_login reads request.query_params for a GET, vs. request.form()
+    for a POST."""
+    return _mock_request(query_params=params, method="GET")
 
 
 async def test_lti13_jwks_returns_empty_keyset():
@@ -30,18 +39,36 @@ async def test_lti13_login_redirects_with_state_cookie():
         patch.object(settings, "LTI13_CLIENT_ID", "client-123"),
     ):
         redirect = await lti13.lti13_login(
-            request=_mock_request(),
-            response=MagicMock(),
-            iss="https://moodle.example.com",
-            login_hint="hint",
-            target_link_uri="https://app.example.com",
-            client_id="client-123",
-            lti_message_hint="msg-hint",
+            request=_mock_login_request(
+                iss="https://moodle.example.com",
+                login_hint="hint",
+                target_link_uri="https://app.example.com",
+                client_id="client-123",
+                lti_message_hint="msg-hint",
+            ),
         )
 
     assert redirect.status_code == 302
     assert "auth.php" in redirect.headers["location"]
     assert "lti13_state" in redirect.headers.get("set-cookie", "")
+
+
+async def test_lti13_login_accepts_post_from_moodle():
+    """Moodle sends this as a POST with form-encoded params, not a GET —
+    verified against a real Moodle 5.x instance, 2026-09-25."""
+    lti13._nonce_store.clear()
+    with (
+        patch.object(settings, "LTI13_PLATFORM_ISSUER", "https://moodle.example.com"),
+        patch.object(settings, "LTI13_CLIENT_ID", "client-123"),
+    ):
+        redirect = await lti13.lti13_login(
+            request=_mock_request(
+                method="POST",
+                form={"iss": "https://moodle.example.com", "client_id": "client-123"},
+            ),
+        )
+    assert redirect.status_code == 302
+    assert "auth.php" in redirect.headers["location"]
 
 
 async def test_lti13_login_warns_on_client_id_mismatch_but_still_redirects():
@@ -51,17 +78,17 @@ async def test_lti13_login_warns_on_client_id_mismatch_but_still_redirects():
         patch.object(settings, "LTI13_CLIENT_ID", "configured-client"),
     ):
         redirect = await lti13.lti13_login(
-            request=_mock_request(),
-            response=MagicMock(),
-            iss="https://moodle.example.com",
-            client_id="different-client",
+            request=_mock_login_request(
+                iss="https://moodle.example.com",
+                client_id="different-client",
+            ),
         )
     assert redirect.status_code == 302
 
 
 async def test_lti13_login_requires_iss():
     with pytest.raises(HTTPException) as exc_info:
-        await lti13.lti13_login(request=_mock_request(), response=MagicMock(), iss=None)
+        await lti13.lti13_login(request=_mock_login_request(iss=None))
     assert exc_info.value.status_code == 400
 
 

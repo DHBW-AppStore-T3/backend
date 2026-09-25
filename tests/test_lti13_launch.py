@@ -33,6 +33,47 @@ def test_login_redirects_to_platform_auth():
     assert "lti13_state" in response.cookies
 
 
+def test_login_accepts_post_from_moodle():
+    """Moodle sends the 3rd-party login initiation as a POST (form-encoded),
+    not a GET — verified against a real Moodle 5.x instance, 2026-09-25.
+    The IMS spec allows either; only supporting GET meant a real Moodle
+    launch always failed with 405 before this was fixed."""
+    client = TestClient(app)
+    with patch.object(settings, "LTI13_PLATFORM_ISSUER", "https://moodle.example.com"):
+        response = client.post(
+            "/lti13/login",
+            data={
+                "iss": "https://moodle.example.com",
+                "login_hint": "student-1",
+                "target_link_uri": "https://app.example.com/",
+                "client_id": "client-123",
+            },
+            follow_redirects=False,
+        )
+    assert response.status_code == 302
+    assert response.headers["location"].startswith("https://moodle.example.com/mod/lti/auth.php?")
+    assert "lti13_state" in response.cookies
+
+
+def test_login_state_cookie_is_secure_by_default():
+    """SameSite=None requires Secure in every modern browser — without it
+    the cookie is silently dropped and /launch always fails with 'State
+    mismatch', not just in production. Only DEV_MODE opts out (plain-HTTP
+    localhost development)."""
+    client = TestClient(app)
+    with (
+        patch.object(settings, "LTI13_PLATFORM_ISSUER", "https://moodle.example.com"),
+        patch.object(settings, "DEV_MODE", False),
+    ):
+        response = client.get(
+            "/lti13/login",
+            params={"iss": "https://moodle.example.com"},
+            follow_redirects=False,
+        )
+    set_cookie = response.headers["set-cookie"]
+    assert "Secure" in set_cookie
+
+
 def test_login_rejects_unknown_issuer():
     client = TestClient(app)
     with patch.object(settings, "LTI13_PLATFORM_ISSUER", "https://moodle.example.com"):

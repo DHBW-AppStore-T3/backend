@@ -1,7 +1,7 @@
 """LTI 1.3 (IMS LTI Advantage) launch endpoints.
 
 Flow:
-  1.  Moodle → GET /lti13/login   (3rd-party OIDC initiation)
+  1.  Moodle → GET or POST /lti13/login   (3rd-party OIDC initiation)
   2.  Backend → 302 to Moodle auth.php with state + nonce
   3.  Moodle → POST /lti13/launch  (id_token + state)
   4.  Backend validates JWT → JIT-provisions user → issues session token
@@ -13,7 +13,7 @@ import secrets
 import time
 import urllib.parse
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
@@ -58,18 +58,25 @@ def _purge_expired_nonces() -> None:
 # ── 1. OIDC 3rd-party login initiation ───────────────────────────────────────
 
 
-@router.get("/login")
-async def lti13_login(
-    request: Request,
-    response: Response,
-    iss: str | None = None,
-    login_hint: str | None = None,
-    target_link_uri: str | None = None,
-    client_id: str | None = None,
-    lti_message_hint: str | None = None,
-) -> RedirectResponse:
+@router.api_route("/login", methods=["GET", "POST"])
+async def lti13_login(request: Request) -> RedirectResponse:
     """Step 1: receive the OIDC initiation request from Moodle and redirect
-    back to Moodle's auth endpoint with a fresh state/nonce pair."""
+    back to Moodle's auth endpoint with a fresh state/nonce pair.
+
+    Moodle sends this as a POST (observed against a real Moodle 5.x
+    instance, 2026-09-25) even though the IMS spec allows either GET or
+    POST for the 3rd-party-initiated login — so both are accepted here,
+    reading params from the query string or form body as appropriate.
+    """
+    if request.method == "POST":
+        params = await request.form()
+    else:
+        params = request.query_params
+
+    iss = params.get("iss")
+    login_hint = params.get("login_hint")
+    client_id = params.get("client_id")
+    lti_message_hint = params.get("lti_message_hint")
 
     if not iss:
         raise HTTPException(status_code=400, detail="Missing iss parameter")
@@ -108,13 +115,17 @@ async def lti13_login(
     redirect = RedirectResponse(url=auth_url, status_code=302)
     # Store state in a SameSite=None cookie so the browser sends it back on
     # the POST (the POST comes from Moodle's domain via form_post).
+    # SameSite=None requires Secure in every modern browser — without it the
+    # cookie is silently dropped and /launch always fails with "State
+    # mismatch", not just in production. DEV_MODE is the one carve-out, for
+    # plain-HTTP localhost development.
     redirect.set_cookie(
         key="lti13_state",
         value=state,
         max_age=NONCE_TTL,
         httponly=True,
         samesite="none",
-        secure=False,  # localhost — set True in production
+        secure=not settings.DEV_MODE,
     )
     return redirect
 
