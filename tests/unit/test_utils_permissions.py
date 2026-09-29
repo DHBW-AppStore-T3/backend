@@ -10,9 +10,7 @@ from app.models import UserRole
 from app.utils.permissions import (
     ADMIN_ROLES,
     STAFF_ROLES,
-    ensure_deployment_owner_view,
     get_current_active_user,
-    is_deployment_owner_view,
     require_roles,
 )
 
@@ -111,57 +109,3 @@ def test_require_roles_staff_denies_student():
         UserRole.TEACHER.value,
         UserRole.ADMIN.value,
     }
-
-
-# ----------------------------------------------------------------
-# is_deployment_owner_view / ensure_deployment_owner_view
-# ----------------------------------------------------------------
-@pytest.mark.unit
-def test_is_deployment_owner_view_owner_returns_true():
-    user = _make_user(UserRole.STUDENT, user_id="owner-1")
-    deployment = _make_deployment(user_id="owner-1")
-    assert is_deployment_owner_view(deployment, user) is True
-
-
-@pytest.mark.unit
-def test_is_deployment_owner_view_non_owner_student_returns_false():
-    user = _make_user(UserRole.STUDENT, user_id="someone-else")
-    deployment = _make_deployment(user_id="owner-1")
-    assert is_deployment_owner_view(deployment, user) is False
-
-
-@pytest.mark.unit
-def test_is_deployment_owner_view_teacher_bypass_returns_true():
-    teacher = _make_user(UserRole.TEACHER, user_id="teacher-1")
-    deployment = _make_deployment(user_id="owner-1")
-    assert is_deployment_owner_view(deployment, teacher) is True
-
-
-@pytest.mark.unit
-def test_is_deployment_owner_view_admin_bypass_returns_true():
-    admin = _make_user(UserRole.ADMIN, user_id="admin-1")
-    deployment = _make_deployment(user_id="owner-1")
-    assert is_deployment_owner_view(deployment, admin) is True
-
-
-@pytest.mark.unit
-def test_ensure_deployment_owner_view_passes_for_owner():
-    user = _make_user(UserRole.STUDENT, user_id="owner-1")
-    deployment = _make_deployment(user_id="owner-1")
-    ensure_deployment_owner_view(deployment, user)
-
-
-@pytest.mark.unit
-def test_ensure_deployment_owner_view_passes_for_staff():
-    teacher = _make_user(UserRole.TEACHER, user_id="teacher-1")
-    deployment = _make_deployment(user_id="owner-1")
-    ensure_deployment_owner_view(deployment, teacher)
-
-
-@pytest.mark.unit
-def test_ensure_deployment_owner_view_raises_for_non_owner_student():
-    student = _make_user(UserRole.STUDENT, user_id="member-1")
-    deployment = _make_deployment(user_id="owner-1")
-    with pytest.raises(HTTPException) as exc:
-        ensure_deployment_owner_view(deployment, student)
-    assert exc.value.status_code == 403

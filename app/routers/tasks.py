@@ -6,9 +6,10 @@ deployment flow itself; this router exposes status and details so the frontend
 can render progress.
 
 Every endpoint enforces ``ensure_deployment_access`` (to prevent IDOR) plus
-``ensure_deployment_owner_view``, so only the deployment creator, teachers, and
-admins can read task logs — which contain Terraform outputs, IPs, and worker
-stack traces. Members get a 403 even though they can read deployment metadata.
+``ensure_view_deployment_owner``, so only the deployment creator, admins, and
+the course-teacher of the deployment owner's course can read task logs — which
+contain Terraform outputs, IPs, and worker stack traces. Members get a 403 even
+though they can read deployment metadata.
 """
 
 from uuid import UUID
@@ -21,8 +22,9 @@ from app.crud import tasks as crud_tasks
 from app.database import get_db
 from app.models import User
 from app.schemas import TaskResponse
+from app.utils.capabilities import ensure_view_deployment_owner
 from app.utils.keycloak_auth import get_current_user_keycloak
-from app.utils.permissions import ensure_deployment_access, ensure_deployment_owner_view
+from app.utils.permissions import ensure_deployment_access
 
 router = APIRouter()
 
@@ -41,7 +43,7 @@ def get_deployment_tasks(
             detail="Deployment not found",
         )
     ensure_deployment_access(deployment, current_user, db)
-    ensure_deployment_owner_view(deployment, current_user)
+    ensure_view_deployment_owner(current_user, deployment, db)
     return crud_tasks.get_tasks(db, deployment_id=deployment_id)
 
 
@@ -65,5 +67,5 @@ def get_task(
             detail="Deployment for task not found",
         )
     ensure_deployment_access(deployment, current_user, db)
-    ensure_deployment_owner_view(deployment, current_user)
+    ensure_view_deployment_owner(current_user, deployment, db)
     return task

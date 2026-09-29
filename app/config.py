@@ -1,4 +1,3 @@
-
 from pydantic_settings import BaseSettings
 
 
@@ -50,6 +49,27 @@ class Settings(BaseSettings):
     # the owner-summary mail to deep-link back into the UI. No trailing
     # slash. Falls back to the first CORS origin in dev.
     APP_BASE_URL: str = "http://localhost:5173"
+
+    # LTI 1.3 — OIDC-based launch (IMS LTI Advantage).
+    # LTI13_CLIENT_ID and LTI13_DEPLOYMENT_ID are assigned by Moodle after
+    # the External Tool is registered; copy them from the Moodle admin UI.
+    # Generate LTI13_SESSION_SECRET with:
+    #   python -c 'import secrets; print(secrets.token_hex(32))'
+    LTI13_PLATFORM_ISSUER: str = "http://localhost:8081"
+    LTI13_CLIENT_ID: str = ""
+    LTI13_DEPLOYMENT_ID: str = ""
+    LTI13_PLATFORM_JWKS_URL: str = "http://localhost:8081/mod/lti/certs.php"
+    LTI13_REDIRECT_URI: str = "http://localhost:8000/lti13/launch"
+    LTI13_SESSION_SECRET: str = "change-me-in-production"
+
+    # Dev mode: accept X-Dev-User header in place of a Keycloak token.
+    # Never enable in production.
+    DEV_MODE: bool = False
+
+    # Self-service-ui handoff (POST /handoff/mint). Own secret, independent
+    # of LTI13_SESSION_SECRET — a compromised LTI secret must not also open
+    # the self-service handoff path.
+    HANDOFF_SESSION_SECRET: str = "change-me-in-production"
 
     class Config:
         env_file = ".env"

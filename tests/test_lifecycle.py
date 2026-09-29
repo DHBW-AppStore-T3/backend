@@ -124,11 +124,15 @@ def test_in_flight_statuses_set_is_complete():
     """
     expected = {"pending", "running", "destroying", "pausing", "resuming"}
     assert expected == lifecycle_service.IN_FLIGHT_STATUSES
-    # Every in-flight status must NOT appear as an _ALLOWED key —
-    # otherwise an action would be permitted while a task is running.
+    # An in-flight status may offer CANCEL and nothing else. The point of
+    # the guard is that no action runs *in parallel* with a live task;
+    # cancel is the one action that revokes that very task rather than
+    # racing it, which is why ``_ALLOWED`` lists it for pending/running.
+    # Anything else appearing here would be a real bug.
     for s in expected:
-        assert s not in lifecycle_service._ALLOWED, (
-            f"In-flight status {s!r} must not have allowed actions"
+        allowed = lifecycle_service._ALLOWED.get(s, set())
+        assert allowed <= {DeploymentAction.CANCEL}, (
+            f"In-flight status {s!r} must allow at most CANCEL, got {allowed}"
         )
 
 
