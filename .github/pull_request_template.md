@@ -13,6 +13,10 @@ Closes #
 ## Checkliste
 
 <!--
+Checkliste für Änderungs-PRs (Feature-/Fix-Branch → `dev`, Hotfix → `main`).
+Release-PRs (`dev` oder `promote/*` → `main`) verwenden stattdessen
+`.github/pull_request_template/release.md`.
+
 Jeder Punkt wird abgehakt, bevor der PR gemergt werden kann. Der CI-Check
 "PR Checklist" blockiert den Merge, solange hier noch ein offenes "- [ ]" steht.
 
@@ -20,9 +24,9 @@ Trifft ein Punkt nicht zu: mit "n/a" markieren UND abhaken, z. B.
 - [x] n/a — Datenbank: keine Schemaänderung
 
 Die reviewende Person prüft, dass die Häkchen stimmen, und bestätigt das mit
-ihrem Approval. Lint, Tests (unit/integration) inkl. Coverage-Gate, Security,
-Build und Image Scan werden separat als Pflicht-CI-Checks erzwungen und hier
-nicht wiederholt.
+ihrem Approval. Lint, Tests (unit/integration), Security, Build und Image Scan
+laufen als CI-Checks (das Coverage-Gate nur bei PRs nach `main`) und werden
+hier nicht wiederholt.
 -->
 
 **Funktionale Eignung**
