@@ -1,0 +1,18 @@
+name: PR Checklist
+
+# QS-Maßnahme "PR-Checkliste": blockiert den Merge, solange in der
+# PR-Beschreibung Checkboxen offen sind. Logik zentral in
+# DHBW-AppStore-T3/.github, Checklisten-Punkte in
+# .github/pull_request_template.md dieses Repos.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  checklist:
+    name: PR Checklist
+    uses: DHBW-AppStore-T3/.github/.github/workflows/pr-checklist.yml@main
