@@ -154,13 +154,15 @@ def test_get_tasks_filters_by_deployment_celery_and_status(db):
     dep_a = _make_deployment(db, user_id=user.userId, app_id=app_row.appId)
     dep_b = _make_deployment(db, user_id=user.userId, app_id=app_row.appId)
 
+    # A deployment has at most one active task (uq_tasks_active_per_deployment),
+    # so dep_a's first task is a finished one.
     t1 = tasks_crud.create_task(
         db,
         {
             "deploymentId": dep_a.deploymentId,
             "celeryTaskId": "cel-1",
             "type": TaskType.DEPLOY,
-            "status": TaskStatus.PENDING,
+            "status": TaskStatus.FAILED,
         },
     )
     t2 = tasks_crud.create_task(
