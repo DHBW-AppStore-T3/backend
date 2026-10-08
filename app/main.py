@@ -1,13 +1,14 @@
 import asyncio
 import logging
 import os
-import threading
 from contextlib import asynccontextmanager
+from uuid import UUID
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.database import SessionLocal
 from app.routers import (
     admin_apps,
     apps,
@@ -24,17 +25,17 @@ from app.routers import (
     teams,
     users,
 )
-from app.services.celery_event_listener import start_event_listener
-from app.services.deployment_pubsub import pubsub
+from app.services import task_service
 from app.services.reconciler import run_reconciler
+from app.services.task_events import hub
 
 logger = logging.getLogger(__name__)
 
 
 # ``DISABLE_BACKGROUND_TASKS`` short-circuits the lifespan body so the
-# app is fully wired but the Celery listener and reconciler are not
+# app is fully wired but the event hub and the reconciler are not
 # started. Used by the test suite, where per-TestClient lifespans would
-# otherwise stack daemon threads and exhaust the DB connection pool.
+# otherwise stack background loops and exhaust the DB connection pool.
 def _background_tasks_disabled() -> bool:
     return os.getenv("DISABLE_BACKGROUND_TASKS", "").lower() in ("1", "true", "yes")
 
@@ -49,10 +50,10 @@ async def lifespan(app: FastAPI):
     logger.info("ℹ️  Use 'alembic upgrade head' to apply database migrations")
 
     if _background_tasks_disabled():
-        # Test path: keep ``app`` fully functional but skip the Celery
-        # listener + reconciler.
+        # Test path: keep ``app`` fully functional but skip the event hub
+        # and the reconciler.
         logger.info(
-            "DISABLE_BACKGROUND_TASKS set — skipping Celery listener and reconciler (test mode)"
+            "DISABLE_BACKGROUND_TASKS set — skipping event hub and reconciler (test mode)"
         )
         try:
             yield
@@ -60,22 +61,27 @@ async def lifespan(app: FastAPI):
             logger.info("=== Application Shutting Down (test mode) ===")
         return
 
-    # Bind the FastAPI event loop to the deployment pubsub *before*
-    # spawning the Celery listener. The listener thread pushes into
-    # the pubsub from a non-asyncio thread; without a loop reference
-    # those pushes would be silently dropped.
-    pubsub.set_loop(asyncio.get_running_loop())
-    logger.info("Deployment pubsub bound to event loop")
+    # One LISTEN connection per process (.github#5): wakes the live
+    # streams of this process, and the reconciler when a task ends.
+    reconcile_now = asyncio.Event()
 
-    # Start Celery event listener in background thread
-    listener_thread = threading.Thread(target=start_event_listener, daemon=True)
-    listener_thread.start()
-    logger.info("Celery event listener started in background")
+    releases: set[asyncio.Task] = set()
 
-    # Reconciler is the safety net for events the listener missed (lost
-    # event, backend restart during dispatch, broker hiccups). It runs
-    # as an asyncio task so we can cancel it cleanly on shutdown.
-    reconciler_task = asyncio.create_task(run_reconciler())
+    def _released(task_id: str) -> None:
+        # A worker let go of a task: a destroy parked behind it may run.
+        task = asyncio.get_running_loop().create_task(asyncio.to_thread(_release_parked, task_id))
+        releases.add(task)
+        task.add_done_callback(_release_done(releases))
+
+    hub.on_terminal = lambda _task_id: reconcile_now.set()
+    hub.on_released = _released
+    hub.start()
+    logger.info("Task event hub started")
+
+    # Reconciler: dead workers, lost dispatches, parked messages and the
+    # exactly-once follow-up of finished tasks (task_finalizer). Runs as
+    # an asyncio task so we can cancel it cleanly on shutdown.
+    reconciler_task = asyncio.create_task(run_reconciler(reconcile_now))
     logger.info("Reconciler loop scheduled")
 
     logger.info("Application started")
@@ -92,7 +98,23 @@ async def lifespan(app: FastAPI):
             pass
         except Exception:
             logger.exception("Reconciler task raised on shutdown")
+        await hub.stop()
         logger.info("Shutdown complete")
+
+
+def _release_parked(task_id: str) -> None:
+    """Release the messages parked behind ``task_id`` (runs in a thread)."""
+    with SessionLocal() as db:
+        task_service.release_parked(db, UUID(task_id))
+
+
+def _release_done(releases: set):
+    def done(task: asyncio.Task) -> None:
+        releases.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("Releasing parked tasks failed", exc_info=task.exception())
+
+    return done
 
 
 # ----------------------------------------------------------------

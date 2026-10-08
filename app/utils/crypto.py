@@ -1,9 +1,10 @@
-"""Symmetric encryption for at-rest credentials and Celery-envelope payloads.
+"""Symmetric encryption for at-rest credentials, Celery-envelope payloads and task results.
 
 The Fernet key (`CREDENTIAL_ENCRYPTION_KEY`) is shared between the backend
 and the worker. The backend encrypts when storing in Postgres and forwards
 the ciphertext (base64) through Celery; the worker decrypts in-process.
-Plaintext never leaves either container's memory.
+The worker seals a task's Terraform outputs and state with the same key
+(``tasks.outputs_enc``). Plaintext never leaves either container's memory.
 """
 from __future__ import annotations
 
@@ -31,6 +32,10 @@ def _build_cipher() -> Fernet:
 
 _cipher = _build_cipher()
 
+#: The shared Fernet instance, for sealing/opening task results
+#: (``app.task_contract``).
+cipher = _cipher
+
 
 def encrypt(plaintext: str) -> bytes:
     """Encrypt a string. Returns Fernet ciphertext as bytes (store as BYTEA)."""
@@ -52,4 +57,4 @@ def decrypt_b64(token_b64: str) -> str:
     return decrypt(base64.b64decode(token_b64.encode("ascii")))
 
 
-__all__ = ["encrypt", "decrypt", "encrypt_b64", "decrypt_b64", "InvalidToken"]
+__all__ = ["cipher", "encrypt", "decrypt", "encrypt_b64", "decrypt_b64", "InvalidToken"]

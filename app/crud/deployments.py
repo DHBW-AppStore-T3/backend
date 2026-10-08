@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, asc, desc, exists, func
+from sqlalchemy import and_, asc, desc, exists, func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.models import (
@@ -17,6 +17,7 @@ from app.models import (
     UserToTeam,
 )
 from app.schemas import DeploymentCreate
+from app.services import task_results
 from app.utils.time import utcnow
 
 
@@ -288,20 +289,21 @@ def get_deployment_teams_with_members(db: Session, deployment_id: UUID) -> list[
 
 
 def get_deployment_outputs(db: Session, deployment_id: UUID) -> dict[str, Any] | None:
-    """Get parsed Terraform outputs from the latest successful task"""
-    task = (
+    """Parsed Terraform outputs of the newest task that reported any.
+
+    Tasks without outputs (or with an empty set, e.g. a destroy) are
+    skipped, so the outputs of the deploy behind them stay visible.
+    """
+    candidates = (
         db.query(Task)
         .filter(Task.deploymentId == deployment_id)
-        .filter(Task.outputs.isnot(None))
+        .filter(or_(Task.outputs.isnot(None), Task.outputs_enc.isnot(None)))
         .order_by(desc(Task.created_at))
-        .first()
     )
-
-    if task and task.outputs:
-        try:
-            return json.loads(task.outputs)
-        except json.JSONDecodeError:
-            return None
+    for task in candidates:
+        outputs = task_results.outputs(task)
+        if outputs:
+            return outputs
     return None
 
 
@@ -331,12 +333,7 @@ def get_latest_successful_deploy_outputs(
         .first()
     )
 
-    if task and task.outputs:
-        try:
-            return json.loads(task.outputs) if isinstance(task.outputs, str) else task.outputs
-        except json.JSONDecodeError:
-            return None
-    return None
+    return task_results.outputs(task) if task else None
 
 
 def get_deployments(

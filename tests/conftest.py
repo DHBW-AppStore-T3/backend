@@ -52,6 +52,10 @@ import warnings
 # is exhausted and the next legit query deadlocks. See ``app/main.py``
 # for the full rationale.
 os.environ.setdefault("DISABLE_BACKGROUND_TASKS", "1")
+# The broker is a table of the application database (pgq, .github#5);
+# tests that send for real must write into the test database.
+if os.getenv("TEST_DATABASE_URL"):
+    os.environ.setdefault("CELERY_BROKER_URL", "pgq+" + os.environ["TEST_DATABASE_URL"])
 
 import pytest
 from fastapi.testclient import TestClient

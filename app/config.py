@@ -5,9 +5,14 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str
 
-    # Celery (optional - only needed for API runtime, not for migrations)
-    CELERY_BROKER_URL: str = "amqp://admin:admin@rabbitmq:5672/"
-    CELERY_RESULT_BACKEND: str = "redis://redis:6379/0"
+    # Celery broker (.github#5): the ``pgq`` transport on our own Postgres.
+    # Empty means "the application database", i.e. ``pgq+`` + DATABASE_URL.
+    CELERY_BROKER_URL: str = ""
+
+    # Password of the worker's database role ``appstore_worker``, set by
+    # ``python -m app.worker_db_role`` after the migrations. Only the
+    # deployment step that runs that command needs it.
+    WORKER_DB_PASSWORD: str = ""
 
     # Git
     TEMP_REPO_BASE_PATH: str = "/tmp/worker_repos"
@@ -70,6 +75,14 @@ class Settings(BaseSettings):
     # of LTI13_SESSION_SECRET — a compromised LTI secret must not also open
     # the self-service handoff path.
     HANDOFF_SESSION_SECRET: str = "change-me-in-production"
+
+    @property
+    def celery_broker_url(self) -> str:
+        """Broker URL for Celery; defaults to the application database."""
+        if self.CELERY_BROKER_URL:
+            return self.CELERY_BROKER_URL
+        scheme, _, rest = self.DATABASE_URL.partition("://")
+        return f"pgq+{scheme.split('+', 1)[0]}://{rest}"
 
     class Config:
         env_file = ".env"

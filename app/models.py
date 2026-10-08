@@ -2,11 +2,13 @@ import enum
 import uuid
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     DateTime,
     Enum,
     ForeignKey,
+    Identity,
     Index,
     Integer,
     LargeBinary,
@@ -15,7 +17,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -224,12 +226,29 @@ class Task(Base):
     logs = Column(Text, nullable=True)  # JSON or text
     tf_state = Column(Text, nullable=True)  # Terraform state as JSON/text
     outputs = Column(Text, nullable=True)  # Terraform outputs as JSON/text
-    # Live-progress columns, updated by the celery event listener on
-    # each ``task-progress`` event. Advisory only — the SSE stream is
+    # Live-progress columns, updated by the worker with each
+    # ``task-progress`` event. Advisory only — the event stream is
     # canonical; these let a page reload show the last known phase/pct.
     current_phase = Column(String(50), nullable=True)
     progress_pct = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=utcnow)
+
+    # Queue columns (.github#5). Unlike the columns above these are
+    # timezone-aware and are compared with ``now()`` in SQL.
+    # The worker process running the task and how long its lease lasts;
+    # the worker renews it while the job runs. A RUNNING task with an
+    # expired lease belongs to a worker that died (reconciler: worker_lost).
+    claimed_by = Column(Text, nullable=True)
+    lease_until = Column(DateTime(timezone=True), nullable=True)
+    # Set by POST /deployments/{id}/cancel; the worker stops the job.
+    cancel_requested_at = Column(DateTime(timezone=True), nullable=True)
+    # Follow-up work of a finished task (soft-delete after destroy, access
+    # mails after deploy) ran; claimed once, by one API process.
+    finalized_at = Column(DateTime(timezone=True), nullable=True)
+    # Fernet token of {"terraform_outputs": ..., "tf_state": ...} as the
+    # worker reported them (``app.services.task_results``). Replaces the
+    # plaintext ``outputs``/``tf_state`` for tasks run since .github#5.
+    outputs_enc = Column(LargeBinary, nullable=True)
 
     __table_args__ = (
         # At most one PENDING/RUNNING task per deployment: the database
@@ -245,6 +264,52 @@ class Task(Base):
 
     # Relationships
     deployment = relationship("Deployment", back_populates="tasks")
+
+
+# ----------------------------------------------------------------
+# QUEUE MODELS (.github#5)
+# ----------------------------------------------------------------
+# Celery's broker table, written and read by the ``pgq`` transport
+# (``app/pgq.py``). Declared here so migrations and ``alembic check``
+# cover it; application code goes through Celery, not this model.
+class CeleryQueueMessage(Base):
+    __tablename__ = "celery_queue"
+
+    id = Column(BigInteger, Identity(always=False), primary_key=True)
+    queue = Column(Text, nullable=False)
+    payload = Column(JSONB, nullable=False)  # Kombu message (Celery protocol 2)
+    task_id = Column(UUID(as_uuid=True), nullable=True)  # = tasks.taskId
+    # Parked until this task's worker let go of it (destroy after cancel).
+    after_task = Column(UUID(as_uuid=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+    visible_after = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+    claimed_by = Column(Text, nullable=True)
+    delivery_count = Column(Integer, nullable=False, server_default=text("0"))
+
+    __table_args__ = (
+        Index("ix_celery_queue_ready", "queue", "visible_after", "id"),
+        Index("uq_celery_queue_task_id", "task_id", unique=True, postgresql_where=text("task_id IS NOT NULL")),
+        Index("ix_celery_queue_after_task", "after_task", postgresql_where=text("after_task IS NOT NULL")),
+    )
+
+
+# Progress, log and terminal events of a task, appended by the worker
+# (and by the API for cancel / worker_lost). The row id is the SSE event
+# id. A trigger (migration 5e1f0c2a9b7d) sends ``NOTIFY task_events``.
+class TaskEvent(Base):
+    __tablename__ = "task_events"
+
+    id = Column(BigInteger, Identity(always=False), primary_key=True)
+    task_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("tasks.taskId", ondelete="CASCADE"),
+        nullable=False,
+    )
+    type = Column(Text, nullable=False)
+    payload = Column(JSONB, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+
+    __table_args__ = (Index("ix_task_events_task", "task_id", "id"),)
 
 
 # ----------------------------------------------------------------
