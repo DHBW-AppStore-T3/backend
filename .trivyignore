@@ -18,6 +18,14 @@ AVD-DS-0002
 # and production runtime does not invoke setuptools PackageIndex.
 CVE-2025-47273
 
+# CVE-2026-97687 / CVE-2026-97689: urllib3 2.7.0 vendored in pip
+# (pip/_vendor/bom.cdx.json, which Trivy reads). pip 26.2.1 is the
+# newest release and still vendors 2.7.0; pip only runs while the image
+# is built. The urllib3 the API imports is 2.8.0 (poetry.lock). Remove
+# once pip ships urllib3 >= 2.8.0.
+CVE-2026-97687
+CVE-2026-97689
+
 # GHSA-6v7p-g79w-8964: MessagePack out-of-bounds read on unpacker reuse.
 # Transitive via Celery/kombu; pinned to msgpack >= 1.2.1 in pyproject.toml.
 GHSA-6v7p-g79w-8964
