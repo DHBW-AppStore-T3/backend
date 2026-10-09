@@ -2,7 +2,10 @@ name: Backend CI/CD
 
 on:
   push:
-    branches: [main, dev]
+    # spike/**: migration work (.github#4-#7); tested and, for spike/dev,
+    # published as ghcr.io/...:spike-dev, never as dev/latest and never
+    # deployed by this workflow.
+    branches: [main, dev, 'spike/**']
     tags: ['v*.*.*']
   pull_request:
     branches: [main, dev]
@@ -490,7 +493,7 @@ jobs:
     name: "📦 Push"
     runs-on: ubuntu-latest
     needs: [build, image-scan]
-    if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') && github.event_name == 'push'
+    if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/spike/dev') && github.event_name == 'push'
     permissions:
       contents: read
       packages: write
@@ -520,6 +523,7 @@ jobs:
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=raw,value=spike-dev,enable=${{ github.ref == 'refs/heads/spike/dev' }}
             type=sha,prefix=sha-
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
