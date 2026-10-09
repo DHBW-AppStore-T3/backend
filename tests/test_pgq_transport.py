@@ -83,14 +83,18 @@ def test_two_consumers_never_get_the_same_message():
                     return
                 with lock:
                     seen.append(message.payload["n"])
+                # Unacked messages go back to the queue when a channel
+                # closes (as in AMQP); a consumer that is still looping
+                # would then get them a second time.
+                message.ack()
 
     threads = [threading.Thread(target=consume) for _ in range(4)]
     for t in threads:
         t.start()
     for t in threads:
         t.join(timeout=30)
-    assert sorted(seen) == list(range(40))
-    assert all(row[5] == 1 for row in _rows())  # each delivered exactly once
+    assert sorted(seen) == list(range(40))  # each delivered exactly once
+    assert _rows() == []
 
 
 def test_reject_with_requeue_makes_the_row_visible_again():
