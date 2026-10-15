@@ -454,8 +454,26 @@ class TaskUpdate(BaseModel):
     current_phase: str | None = None
     progress_pct: int | None = None
 
-class TaskResponse(TaskBase):
+class TaskResponse(BaseModel):
+    """A task as the task API shows it to the owner view.
+
+    Deliberately without ``tf_state`` and ``outputs`` (.github#7 E): the
+    state holds every attribute of every resource, generated passwords
+    included, and the outputs hold every member's credentials. Members get
+    their own entry through ``my-access``; the owner view's outputs are
+    redacted (``task_results.redact_sensitive_outputs``).
+    """
+
     taskId: UUID
+    deploymentId: UUID
+    celeryTaskId: str | None = None
+    type: TaskType
+    status: TaskStatus
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    logs: str | None = None
+    current_phase: str | None = None
+    progress_pct: int | None = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

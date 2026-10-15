@@ -53,15 +53,6 @@ def outputs(task: Task) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def outputs_json(task: Task) -> str | None:
-    """Outputs as the JSON text the task API returns (``TaskResponse.outputs``)."""
-    sealed = _sealed(task)
-    if sealed is not None:
-        value = sealed.get("terraform_outputs")
-        return json.dumps(value) if value else None
-    return task.outputs
-
-
 def tf_state(task: Task) -> str | None:
     """The Terraform state JSON text of the task, or None."""
     sealed = _sealed(task)
@@ -71,3 +62,30 @@ def tf_state(task: Task) -> str | None:
             return value
         return json.dumps(value)
     return task.tf_state
+
+
+# Outputs that hold credentials whatever an app declares: the owner view
+# never shows another person's account (.github#7 E).
+ALWAYS_REDACTED_OUTPUTS = frozenset({"user_accounts"})
+
+
+def redact_sensitive_outputs(outputs: dict[str, Any] | None) -> dict[str, Any] | None:
+    """``outputs`` with the value of every sensitive output removed.
+
+    For views that show a deployment's outputs to people other than the one
+    each secret belongs to (the owner view). An output counts as sensitive
+    if the app marks it so or it is ``user_accounts``; its entry keeps its
+    other fields, gets ``value: None`` and ``redacted: True``. Members get
+    their own entry through ``my-access`` instead.
+    """
+    if outputs is None:
+        return None
+    redacted: dict[str, Any] = {}
+    for name, out in outputs.items():
+        if isinstance(out, dict) and (out.get("sensitive") or name in ALWAYS_REDACTED_OUTPUTS):
+            redacted[name] = {**{k: v for k, v in out.items() if k != "value"}, "value": None, "redacted": True}
+        elif name in ALWAYS_REDACTED_OUTPUTS:
+            redacted[name] = {"value": None, "redacted": True}
+        else:
+            redacted[name] = out
+    return redacted

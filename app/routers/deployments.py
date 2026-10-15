@@ -253,7 +253,11 @@ def get_deployment(
     # browse the credentials of teammates or the raw infrastructure
     # state. They fetch their own credentials through ``my-access``.
     if is_owner_view:
-        outputs_data = crud_deployments.get_deployment_outputs(db, deployment_id)
+        # Sensitive outputs (and every member's account) are blanked out;
+        # each member fetches their own through ``my-access`` (.github#7 E).
+        outputs_data = task_results.redact_sensitive_outputs(
+            crud_deployments.get_deployment_outputs(db, deployment_id)
+        )
         outputs = DeploymentOutputs(raw=outputs_data) if outputs_data else None
     else:
         outputs = None

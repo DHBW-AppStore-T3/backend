@@ -392,14 +392,15 @@ def test_reconciler_releases_a_destroy_parked_behind_a_dead_worker(db, mock_user
 # ----------------------------------------------------------------
 # Sealed results
 # ----------------------------------------------------------------
-def test_task_api_returns_sealed_outputs_and_state(client, db, mock_user):
+def test_task_api_never_returns_outputs_or_state(client, db, mock_user):
+    """Sealed in the row, and not in the task API either (.github#7 E)."""
     state = json.dumps({"version": 4, "resources": []})
     _, task = _seed(db, mock_user, task_status=TaskStatus.SUCCESS,
                     outputs_enc=seal_results(crypto.cipher, terraform_outputs={"ip": {"value": "::1"}},
                                              tf_state=state))
     body = client.get(f"/tasks/{task.taskId}").json()
-    assert json.loads(body["outputs"]) == {"ip": {"value": "::1"}}
-    assert body["tf_state"] == state
+    assert "outputs" not in body and "tf_state" not in body
+    assert body["status"] == "success"
     # Nothing in plaintext in the row.
     db.expire_all()
     row = db.get(Task, task.taskId)

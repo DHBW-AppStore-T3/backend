@@ -8,8 +8,9 @@ can render progress.
 Every endpoint enforces ``ensure_deployment_access`` (to prevent IDOR) plus
 ``ensure_view_deployment_owner``, so only the deployment creator, admins, and
 the course-teacher of the deployment owner's course can read task logs — which
-contain Terraform outputs, IPs, and worker stack traces. Members get a 403 even
-though they can read deployment metadata.
+contain IPs and worker stack traces. Members get a 403 even though they can
+read deployment metadata. No endpoint returns a task's Terraform state or
+outputs (.github#7 E).
 """
 
 from uuid import UUID
@@ -22,7 +23,6 @@ from app.crud import tasks as crud_tasks
 from app.database import get_db
 from app.models import Task, User
 from app.schemas import TaskResponse
-from app.services import task_results
 from app.utils.capabilities import ensure_view_deployment_owner
 from app.utils.keycloak_auth import get_current_user_keycloak
 from app.utils.permissions import ensure_deployment_access
@@ -31,15 +31,8 @@ router = APIRouter()
 
 
 def _task_response(task: Task) -> TaskResponse:
-    """The task with its outputs/state read through ``task_results``.
-
-    Tasks run since .github#5 keep them sealed in ``outputs_enc``; the
-    response shape stays the same for both kinds of rows.
-    """
-    response = TaskResponse.model_validate(task)
-    return response.model_copy(
-        update={"outputs": task_results.outputs_json(task), "tf_state": task_results.tf_state(task)}
-    )
+    """The task without its state and outputs (.github#7 E)."""
+    return TaskResponse.model_validate(task)
 
 
 @router.get("/deployment/{deployment_id}", response_model=list[TaskResponse])
