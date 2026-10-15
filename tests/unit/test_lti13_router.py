@@ -1,3 +1,5 @@
+import re
+import urllib.parse
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -211,7 +213,17 @@ async def test_lti13_launch_creates_new_user_and_course_jit():
         response = await lti13.lti13_launch(request=request, db=db)
 
     assert response.status_code == 200
-    assert "session_token=" in response.body.decode()
+    target = re.search(r'window\.location\.href = "([^"]+)"', response.body.decode()).group(1)
+    url = urllib.parse.urlsplit(target)
+    # The session travels in the fragment, which no browser sends to a
+    # server: nothing in the query, so nothing in access logs or Referer.
+    assert f"{url.scheme}://{url.netloc}" == "https://app.example.com"
+    assert url.query == ""
+    handoff = urllib.parse.parse_qs(url.fragment)
+    # Only what the frontend reads; name and course come from /users/me.
+    assert set(handoff) == {"lti", "email", "role", "session_token"}
+    assert handoff["email"] == ["new@example.com"]
+    assert lti13.lti13_service.verify_session_token(handoff["session_token"][0], "test-secret") == "new@example.com"
     assert db.add.call_count == 2  # course + user
 
 

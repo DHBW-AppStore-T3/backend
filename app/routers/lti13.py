@@ -5,7 +5,7 @@ Flow:
   2.  Backend → 302 to Moodle auth.php with state + nonce
   3.  Moodle → POST /lti13/launch  (id_token + state)
   4.  Backend validates JWT → JIT-provisions user → issues session token
-  5.  Backend → 302 to frontend with ?lti=1&email=…&session_token=…
+  5.  Backend → frontend with #lti=1&email=…&role=…&session_token=… (fragment)
 """
 
 import logging
@@ -231,18 +231,19 @@ async def lti13_launch(request: Request, db: Session = Depends(get_db)) -> HTMLR
     # without a Keycloak PKCE flow.
     session_token = lti13_service.issue_session_token(email, settings.LTI13_SESSION_SECRET)
 
-    query = urllib.parse.urlencode(
+    # The session goes in the URL fragment: a browser never sends a fragment
+    # to a server, so the token stays out of the frontend's access logs and
+    # out of Referer headers (in the query it landed in both). Only what the
+    # frontend reads travels; name and course come from ``/users/me``.
+    fragment = urllib.parse.urlencode(
         {
             "lti": "1",
             "email": email,
-            "name": info["name"],
             "role": info["role"],
-            "course": info["course"],
-            "courseId": course_id,
             "session_token": session_token,
         }
     )
-    target = f"{settings.APP_BASE_URL}?{query}"
+    target = f"{settings.APP_BASE_URL}#{fragment}"
 
     # Use a JS redirect so the browser also clears the state cookie (a Set-Cookie
     # on a 302 to a cross-origin URL is unreliable in practice).

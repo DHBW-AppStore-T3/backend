@@ -1,3 +1,5 @@
+import re
+import urllib.parse
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -123,7 +125,12 @@ def test_launch_creates_new_user_and_course(db):
             )
 
     assert response.status_code == 200
-    assert "session_token=" in response.text
+    target = re.search(r'window\.location\.href = "([^"]+)"', response.text).group(1)
+    url = urllib.parse.urlsplit(target)
+    # Session token in the fragment only (never sent to a server).
+    assert url.query == ""
+    assert "session_token" in urllib.parse.parse_qs(url.fragment)
+    assert "New Student" not in urllib.parse.unquote_plus(target)
 
     user = db.query(User).filter(User.email == "new-student@example.com").first()
     assert user is not None
