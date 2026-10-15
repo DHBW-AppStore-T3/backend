@@ -225,7 +225,7 @@ def test_ensure_approve_app_version_raises(teacher):
 
 
 # ================================================================
-# DEPLOYMENTS — view_member / view_owner / operate / resend
+# DEPLOYMENTS — view_member / view_owner / operate
 # ================================================================
 class TestCanViewDeploymentMember:
     """Mirrors ``has_deployment_access`` — owner, staff, team, direct."""
@@ -335,30 +335,6 @@ class TestCanOperateDeployment:
     def test_unrelated_student_cannot_operate(self, student, db_mock):
         dep = _deployment(uuid.uuid4())
         assert caps.can_operate_deployment(student, dep, db_mock) is False
-
-
-class TestCanResendAccess:
-    def test_self_resend_when_member(self, student, db_mock):
-        dep = _deployment(student.userId)
-        assert caps.can_resend_access(student, dep, student.userId, db_mock) is True
-
-    def test_admin_can_resend_for_anyone(self, admin, db_mock):
-        dep = _deployment(uuid.uuid4())
-        other = uuid.uuid4()
-        assert caps.can_resend_access(admin, dep, other, db_mock) is True
-
-    def test_student_cannot_resend_for_other(self, student, db_mock):
-        # Student is owner of dep (member-view), but cannot dispatch
-        # credentials to someone else — that's the owner-view gate.
-        dep = _deployment(student.userId)
-        other = uuid.uuid4()
-        # Owner of the deployment counts as owner-view → True.
-        assert caps.can_resend_access(student, dep, other, db_mock) is True
-
-    def test_unrelated_student_cannot_resend_for_other(self, student, db_mock):
-        dep = _deployment(uuid.uuid4())  # student is not owner
-        other = uuid.uuid4()
-        assert caps.can_resend_access(student, dep, other, db_mock) is False
 
 
 # ================================================================

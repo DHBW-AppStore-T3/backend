@@ -285,19 +285,23 @@ def test_stream_closes_a_task_that_ended_without_terminal_event(client, db, mock
 # Follow-up exactly once
 # ----------------------------------------------------------------
 def test_follow_up_runs_once_with_parallel_finalizers(db, mock_user):
-    deployment, task = _seed(db, mock_user, task_type=TaskType.DEPLOY, task_status=TaskStatus.SUCCESS,
-                             outputs_enc=seal_results(crypto.cipher, terraform_outputs={"x": {"value": 1}},
-                                                      tf_state=None))
+    """Four API processes finalize at once: the destroy's soft-delete runs once."""
+    deployment, task = _seed(db, mock_user, task_type=TaskType.DESTROY, task_status=TaskStatus.SUCCESS)
     calls = []
     barrier = threading.Barrier(4)
+    real_soft_delete = task_finalizer.crud_deployments.soft_delete_deployment
+
+    def counting_soft_delete(session, deployment_id):
+        calls.append(deployment_id)
+        return real_soft_delete(session, deployment_id)
 
     def run(fn):
         barrier.wait()
         with TestingSessionLocal() as s:
             fn(s)
 
-    with patch("app.services.task_finalizer.deployment_notifier.notify_deployment_succeeded",
-               side_effect=lambda _db, _dep, terraform_outputs: calls.append(terraform_outputs)):
+    with patch("app.services.task_finalizer.crud_deployments.soft_delete_deployment",
+               side_effect=counting_soft_delete):
         threads = [threading.Thread(target=run, args=(task_finalizer.finalize_pending,)) for _ in range(3)]
         threads.append(threading.Thread(target=run, args=(lambda s: task_finalizer.finalize_task(s, task.taskId),)))
         for t in threads:
@@ -305,9 +309,21 @@ def test_follow_up_runs_once_with_parallel_finalizers(db, mock_user):
         for t in threads:
             t.join(timeout=30)
 
-    assert calls == [{"x": {"value": 1}}]
+    assert calls == [deployment.deploymentId]
     db.expire_all()
     assert db.get(Task, task.taskId).finalized_at is not None
+
+
+def test_a_successful_deploy_is_finalized_without_side_effects(db, mock_user):
+    """No access mails any more (.github#7 I): finalizing a deploy only marks it."""
+    deployment, task = _seed(db, mock_user, task_type=TaskType.DEPLOY, task_status=TaskStatus.SUCCESS,
+                             outputs_enc=seal_results(crypto.cipher, terraform_outputs={"x": {"value": 1}},
+                                                      tf_state=None))
+    with TestingSessionLocal() as s:
+        assert task_finalizer.finalize_task(s, task.taskId) is True
+    db.expire_all()
+    assert db.get(Task, task.taskId).finalized_at is not None
+    assert db.get(Deployment, deployment.deploymentId).deleted_at is None
 
 
 def test_follow_up_of_a_destroy_soft_deletes(db, mock_user):

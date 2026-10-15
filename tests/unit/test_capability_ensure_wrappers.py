@@ -204,23 +204,6 @@ def test_ensure_operate_deployment_passes_for_owner(student, db_mock):
 
 
 # ================================================================
-# DEPLOYMENTS — ensure_resend_access
-# ================================================================
-def test_ensure_resend_access_raises_for_unrelated_user(student):
-    """Resending credentials to someone else requires owner-view access.
-    A student who is not the owner and not in the team is rejected.
-    """
-    dep = _deployment(uuid.uuid4())
-    target = uuid.uuid4()
-    db = MagicMock()
-    db.query.return_value.filter.return_value.first.return_value = None
-    with pytest.raises(HTTPException) as exc:
-        caps.ensure_resend_access(student, dep, target, db)
-    assert exc.value.status_code == 403
-    assert exc.value.detail["code"] == "deployment_resend_forbidden"
-
-
-# ================================================================
 # COURSES — ensure_edit_course
 # ================================================================
 def test_ensure_edit_course_raises_for_non_assigned_teacher(teacher):

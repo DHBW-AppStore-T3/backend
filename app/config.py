@@ -34,27 +34,8 @@ class Settings(BaseSettings):
     # Generate: python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
     CREDENTIAL_ENCRYPTION_KEY: str
 
-    # SMTP (Gmail). Required for the post-deploy notification mails.
-    # Use a Google "App password" (the regular password won't work with
-    # 2FA enabled).
-    #
-    # SMTP_ENABLED is the explicit kill-switch — set it to False to turn
-    # mail delivery into a no-op even when credentials are populated. It
-    # lives separately from the credentials so operators can keep the
-    # app-password in .env while disabling mail in dev/CI, and so the
-    # resend-access endpoint can distinguish "we chose not to send"
-    # (HTTP 503) from "SMTP refused" (HTTP 502).
-    SMTP_ENABLED: bool = False
-    SMTP_HOST: str = "smtp.gmail.com"
-    SMTP_PORT: int = 587
-    SMTP_USER: str = ""
-    SMTP_PASSWORD: str = ""
-    SMTP_FROM_EMAIL: str = ""
-    SMTP_FROM_NAME: str = "Click-n-Deploy"
-
-    # Public URL the deployment detail page is reachable under, used in
-    # the owner-summary mail to deep-link back into the UI. No trailing
-    # slash. Falls back to the first CORS origin in dev.
+    # Public URL of the frontend; the LTI launch redirects there. No
+    # trailing slash.
     APP_BASE_URL: str = "http://localhost:5173"
 
     # LTI 1.3 — OIDC-based launch (IMS LTI Advantage).

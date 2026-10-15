@@ -38,8 +38,7 @@ from app.schemas import (
     TaskSummary,
 )
 from app.services import (
-    deployment_notifier,
-    email_service,
+    access,
     task_events,
     task_finalizer,
     task_results,
@@ -68,8 +67,8 @@ from app.task_contract import (
 from app.utils.capabilities import (
     can_view_deployment_owner,
     ensure_operate_deployment,
-    ensure_resend_access,
     ensure_view_app,
+    ensure_view_deployment_member,
     ensure_view_deployment_owner,
 )
 from app.utils.keycloak_auth import get_current_user_keycloak
@@ -252,8 +251,7 @@ def get_deployment(
 
     # Outputs / state / logs are owner-only — members don't get to
     # browse the credentials of teammates or the raw infrastructure
-    # state. They have their own resend-access action for their own
-    # credentials.
+    # state. They fetch their own credentials through ``my-access``.
     if is_owner_view:
         outputs_data = crud_deployments.get_deployment_outputs(db, deployment_id)
         outputs = DeploymentOutputs(raw=outputs_data) if outputs_data else None
@@ -1369,21 +1367,18 @@ def get_my_access(
 ):
     """Return the calling member's OWN access credentials for a deployment.
 
-    The full terraform ``outputs`` are owner-view-only (they carry every
-    teammate's credentials in one object). This endpoint is the member
-    counterpart: a team member — typically a student — retrieves only
-    THEIR OWN account, extracted server-side from the latest successful
-    deploy. Teammates' credentials are never included in the response.
+    The only way to the credentials (no mails, .github#7 I). The full
+    outputs carry every teammate's credentials and are owner-view only;
+    a team member — typically a student — gets exactly their own account
+    entry, matched exactly by ``services.access`` (.github#7 H), plus their
+    team's VM block. Never a teammate's.
 
-    Authorisation reuses :func:`ensure_resend_access` with the target set
-    to the caller themself, which collapses to the member-view gate
-    (owner, staff, team-member, or direct mapping). A caller with no
-    access to the deployment gets 403; the resend endpoint uses the same
-    gate for the self-resend button, so the two stay consistent.
+    Member-view gate: owner, team member or direct mapping; anyone else
+    gets 403.
 
     Returns 200 with empty maps when there's no successful deploy yet or
-    the app issued no per-user credential for this user — the UI renders
-    a "no credentials yet" state rather than treating it as an error.
+    no entry belongs to the caller exactly — the UI renders a "no
+    credentials yet" state rather than treating it as an error.
     """
     deployment = crud_deployments.get_deployment(db, deployment_id)
     if not deployment:
@@ -1391,150 +1386,15 @@ def get_my_access(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Deployment not found",
         )
-    # Self-target → member-view gate. Non-members get 403 here.
-    ensure_resend_access(current_user, deployment, current_user.userId, db)
+    ensure_view_deployment_member(current_user, deployment, db)
 
-    access = deployment_notifier.get_user_access(
-        db, deployment_id, current_user.userId
-    )
-    if access is None:
-        # No successful deploy yet, user not in any team, or no per-user
-        # credential in the outputs — surface an empty (but valid) payload.
+    result = access.get_user_access(db, deployment_id, current_user.userId)
+    if result is None:
         return MyAccessResponse()
     return MyAccessResponse(
-        user_accounts=access.get("user_accounts", {}),
-        team_vms=access.get("team_vms", {}),
+        user_accounts=result.get("user_accounts", {}),
+        team_vms=result.get("team_vms", {}),
     )
-
-
-# ----------------------------------------------------------------
-# RESEND ACCESS MAIL FOR ONE TEAM MEMBER
-# ----------------------------------------------------------------
-@router.post(
-    "/{deployment_id}/teams/{team_id}/users/{user_id}/resend-access",
-    status_code=status.HTTP_202_ACCEPTED,
-)
-def resend_access_credentials(
-    deployment_id: UUID,
-    team_id: UUID,
-    user_id: UUID,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user_keycloak),
-):
-    """Re-send the per-user access mail for one team member.
-
-    Reuses the original notify pipeline — same template, same
-    credential extraction from the latest successful DEPLOY task's
-    ``terraform_outputs``. Useful when the user lost their first mail
-    or the deploy ran before the user's email got fixed.
-
-    Access control: caller must have access to the deployment (owner
-    or teacher/admin). The endpoint is intentionally idempotent —
-    each call sends one mail to the targeted user. There's no rate
-    limit at the API level; SMTP and Gmail's per-account quota are
-    the natural backstops.
-
-    Mapping ResendError to HTTP:
-      * ``deployment_not_found`` → 404
-      * ``team_not_in_deployment`` / ``user_not_in_team`` → 404
-      * ``no_successful_deploy`` → 409 (nothing to resend yet)
-      * ``no_credentials_for_user`` → 409 (template didn't issue
-        per-user creds, or matcher missed despite the fuzzy logic)
-    """
-    deployment = crud_deployments.get_deployment(db, deployment_id)
-    if not deployment:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Deployment not found",
-        )
-    ensure_deployment_access(deployment, current_user, db)
-
-    # Members may only re-send their own access mail. Owner-view
-    # callers (creator, teacher, admin) can resend for anyone in
-    # any team. Without this check a student in team A could trigger
-    # a mail to anyone else's address, which is both privacy-leaky
-    # and a tiny SMTP-amplification vector.
-    #
-    # This 403 is decided BEFORE the SMTP-disabled 503 below: a
-    # not-authorised caller must not learn the SMTP-state of the
-    # platform — that would be a (small) information disclosure.
-    if not can_view_deployment_owner(current_user, deployment, db) and str(user_id) != str(current_user.userId):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Members may only resend their own access mail",
-        )
-
-    # SMTP kill-switch check: refuse cleanly with 503 BEFORE running the
-    # notifier so the response carries the correct semantic ("we chose
-    # not to send" — operator configuration) rather than the existing
-    # 502 ("we tried and SMTP rejected" — infrastructure failure).
-    # Frontend distinguishes the two reasons in the toast text so the
-    # user understands whether to ask an admin to enable mail or to
-    # simply retry. The 503 + Retry-After header signals "service
-    # temporarily unavailable; come back later" semantics.
-    #
-    # Order vs. 409 in-flight: a 503 here is non-recoverable until an
-    # operator flips the env-flag, whereas 409 is a transient state
-    # the caller can simply wait out. Returning the 503 first matches
-    # the "service-level concern beats per-request concern" pattern
-    # used by every other 5xx vs 4xx ordering in this router.
-    if not email_service.is_smtp_enabled():
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"reason": "smtp_disabled"},
-            headers={"Retry-After": "3600"},
-        )
-
-    # Refuse while another lifecycle action is in flight. Resending
-    # the access mail relies on the latest successful DEPLOY task's
-    # ``terraform_outputs``; during pending/running/destroying/
-    # pausing/resuming the deployment is in transition and the
-    # credentials might no longer be reachable on the VM (paused →
-    # SHUTOFF, destroying → tearing down). Returning 409 here keeps
-    # the user's mental model consistent with the rest of the
-    # lifecycle gates.
-    #
-    # Per-deployment advisory lock is acquired BEFORE the status
-    # read so a concurrent /pause / /resume / DELETE can't slip a
-    # transition past us between the check and the mail send. The
-    # lock is the same one those endpoints take, so the four
-    # mutators serialise against each other on the same deployment.
-    crud_locks.acquire_deployment_xact_lock(db, deployment_id)
-    current_status = crud_deployments.get_deployment_status(db, deployment_id)
-    if current_status in lifecycle_service.IN_FLIGHT_STATUSES:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"Cannot resend access mail while deployment is '{current_status}'. "
-                "Wait for the active task to finish."
-            ),
-        )
-
-    try:
-        sent = deployment_notifier.resend_user_access(
-            db, deployment_id, team_id, user_id,
-        )
-    except deployment_notifier.ResendError as e:
-        reason = str(e)
-        # 404 for "this user/team isn't in this deployment", 409 for
-        # "the deployment hasn't reached the state where it could
-        # have emitted credentials yet".
-        if reason in ("deployment_not_found", "team_not_in_deployment", "user_not_in_team"):
-            http_status = status.HTTP_404_NOT_FOUND
-        else:
-            http_status = status.HTTP_409_CONFLICT
-        raise HTTPException(status_code=http_status, detail={"reason": reason})
-
-    if not sent:
-        # Template render + payload were fine, only SMTP rejected.
-        # 502 makes the "upstream service failed" semantics clear so
-        # the frontend can surface a retry rather than a 4xx that
-        # implies the request itself was wrong.
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail={"reason": "smtp_send_failed"},
-        )
-    return {"status": "sent"}
 
 
 # ----------------------------------------------------------------
@@ -1600,7 +1460,7 @@ async def stream_deployment_events(
     task_id = latest_task.taskId if latest_task else None
     # A successful destroy soft-deletes the deployment; the client reloads
     # when the stream ends and must find it gone. Other follow-up work
-    # (access mails) does not need to hold up the terminal event.
+    # does not need to hold up the terminal event.
     finalize_first = latest_task is not None and latest_task.type == TaskType.DESTROY
     try:
         last_event_id = int(request.headers.get("last-event-id") or 0) or None

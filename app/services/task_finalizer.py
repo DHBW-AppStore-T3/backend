@@ -6,10 +6,10 @@ is claimed through ``tasks.finalized_at``; whichever API process sets it
 does the work, every other process skips the task:
 
 - **destroy succeeded** → soft-delete the deployment, in the same
-  transaction as the claim (a crash repeats it, which is harmless);
-- **deploy succeeded** → the access mails. The claim is committed first: a
-  crash in between loses the mails (members can resend them) instead of
-  sending them twice.
+  transaction as the claim (a crash repeats it, which is harmless).
+
+There are no access mails any more (.github#7 I): members fetch their own
+credentials through ``my-access``.
 
 Two ways in: the background pass (``finalize_pending``, rows claimed with
 ``SKIP LOCKED``) and the live stream, which finalizes a task before it sends
@@ -29,7 +29,6 @@ from sqlalchemy.orm import Session
 
 from app.crud import deployments as crud_deployments
 from app.models import Task, TaskStatus, TaskType
-from app.services import deployment_notifier, task_results
 
 logger = logging.getLogger(__name__)
 
@@ -50,15 +49,6 @@ def _follow_up(db: Session, task: Task) -> None:
         logger.info("Soft-deleted deployment %s after its destroy", task.deploymentId)
         return
     db.commit()
-    if task.status == TaskStatus.SUCCESS and task.type == TaskType.DEPLOY:
-        try:
-            deployment_notifier.notify_deployment_succeeded(
-                db, task.deploymentId, terraform_outputs=task_results.outputs(task)
-            )
-        except Exception:
-            # Already finalized: retrying would resend the mails that did
-            # go out. The notifier handles SMTP errors itself.
-            logger.exception("Deploy notification for deployment %s failed", task.deploymentId)
 
 
 def finalize_task(db: Session, task_id: uuid.UUID) -> bool:

@@ -137,8 +137,8 @@ def test_resume_allowed_only_from_paused(db, mock_user):
 
 def test_in_flight_statuses_set_is_complete():
     """The IN_FLIGHT_STATUSES constant must list every synthetic
-    in-flight state so the gating helpers (DELETE branch, resend-
-    access guard) stay in sync with ``_ALLOWED``.
+    in-flight state so the gating helpers (DELETE branch) stay in sync
+    with ``_ALLOWED``.
     """
     expected = {"pending", "running", "destroying", "pausing", "resuming", "redeploying"}
     assert expected == lifecycle_service.IN_FLIGHT_STATUSES

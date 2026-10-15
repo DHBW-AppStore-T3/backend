@@ -12,7 +12,6 @@ from unittest.mock import patch
 
 import pytest
 
-from app.config import settings
 from app.models import (
     App,
     Deployment,
@@ -22,23 +21,6 @@ from app.models import (
     TaskType,
     UserOpenStackCredential,
 )
-
-
-@pytest.fixture(autouse=True)
-def _smtp_enabled_default(monkeypatch):
-    """Most tests in this file don't care about SMTP, but the
-    ``test_resend_access_rejected_while_action_in_flight`` cases
-    do — they hit the resend-access endpoint and expect a 409 from
-    the in-flight gate. With ``SMTP_ENABLED`` defaulting to ``False``,
-    the kill-switch gate (which sits before the in-flight check)
-    would short-circuit with 503 first. Enabling SMTP by default
-    here keeps every test in this file exercising the lifecycle
-    semantics it was written for, without each one needing its own
-    monkeypatch.
-    """
-    monkeypatch.setattr(settings, "SMTP_ENABLED", True, raising=False)
-    monkeypatch.setattr(settings, "SMTP_USER", "test@example.com", raising=False)
-    monkeypatch.setattr(settings, "SMTP_PASSWORD", "test-password", raising=False)
 
 
 def _make_deployment_with_creds(
@@ -249,7 +231,7 @@ def test_pause_404_for_unknown_deployment(client):
 # ----------------------------------------------------------------
 #
 # These tests pin down the user-facing rule that NO action — pause,
-# resume, delete, resend-access — may proceed while another lifecycle
+# resume, delete — may proceed while another lifecycle
 # task is in flight. Every in-flight status must produce a 409 with
 # a structured detail; the partial-unique index on the tasks table
 # is the DB backstop, but we want the friendly 409 to fire first.
@@ -263,6 +245,8 @@ IN_FLIGHT_TASK_FIXTURES = [
     (TaskType.PAUSE, TaskStatus.RUNNING, "pausing"),
     (TaskType.RESUME, TaskStatus.PENDING, "resuming"),
     (TaskType.RESUME, TaskStatus.RUNNING, "resuming"),
+    (TaskType.REDEPLOY, TaskStatus.PENDING, "redeploying"),
+    (TaskType.REDEPLOY, TaskStatus.RUNNING, "redeploying"),
 ]
 
 
@@ -308,46 +292,6 @@ def test_resume_rejected_while_action_in_flight(
     response = client.post(f"/deployments/{deployment.deploymentId}/resume")
     assert response.status_code == 409
     patched_celery.assert_not_called()
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize(
-    "task_type, task_status, expected_status_text", IN_FLIGHT_TASK_FIXTURES
-)
-def test_resend_access_rejected_while_action_in_flight(
-    client, db, mock_user, patched_celery, task_type, task_status, expected_status_text,
-):
-    """The resend-access endpoint must mirror the lifecycle gate —
-    sending a fresh credentials mail in the middle of a destroy or
-    pause is misleading at best (instances may be SHUTOFF or gone)
-    and a tiny SMTP-amplification vector at worst.
-    """
-    from app.models import Team
-
-    deployment = _make_deployment_with_creds(
-        db, mock_user,
-        latest_task_type=task_type,
-        latest_task_status=task_status,
-    )
-    # Resend needs an existing team + member entry to even reach
-    # the in-flight gate. We don't actually expect the mail to be
-    # rendered (the 409 must fire first), but the URL still needs
-    # valid path components.
-    team = Team(teamId=uuid.uuid4(), name="Team-1", deploymentId=deployment.deploymentId)
-    db.add(team)
-    db.commit()
-
-    response = client.post(
-        f"/deployments/{deployment.deploymentId}"
-        f"/teams/{team.teamId}"
-        f"/users/{mock_user.userId}"
-        f"/resend-access"
-    )
-    # 409 (in-flight gate fires) is the win. 404 (team-or-user
-    # not in deployment, depending on test seed quirks) would also
-    # be acceptable but is NOT what we're asserting here. We pin
-    # 409 so a regression where the gate is skipped fails loudly.
-    assert response.status_code == 409
 
 
 @pytest.mark.integration

@@ -199,33 +199,6 @@ def ensure_operate_deployment(user: User, dep: Deployment, db: Session) -> None:
         raise _forbidden("deployment_operate_forbidden")
 
 
-def can_resend_access(
-    user: User,
-    dep: Deployment,
-    target_user_id: UUID | str,
-    db: Session,
-) -> bool:
-    """Resend access credentials for ``target_user_id`` on ``dep``.
-
-    A user may resend credentials to themself on any deployment they
-    can member-view; staff may resend credentials to anyone on a
-    deployment they can owner-view.
-    """
-    if str(target_user_id) == str(user.userId):
-        return can_view_deployment_member(user, dep, db)
-    return can_view_deployment_owner(user, dep, db)
-
-
-def ensure_resend_access(
-    user: User,
-    dep: Deployment,
-    target_user_id: UUID | str,
-    db: Session,
-) -> None:
-    if not can_resend_access(user, dep, target_user_id, db):
-        raise _forbidden("deployment_resend_forbidden")
-
-
 # ================================================================
 # COURSES
 # ================================================================
@@ -352,8 +325,6 @@ __all__ = [
     "ensure_view_deployment_owner",
     "can_operate_deployment",
     "ensure_operate_deployment",
-    "can_resend_access",
-    "ensure_resend_access",
     # Courses
     "is_course_teacher",
     "is_course_teacher_id",
