@@ -151,12 +151,15 @@ def deactivate_app(
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
-    """Emergency deactivation: set app to private so it disappears from
-    the store immediately. Does not delete the app or its deployments."""
-    from app.schemas import AppUpdate
+    """Emergency deactivation: set the app to private so it disappears from
+    the store immediately. Does not delete the app or its deployments.
 
+    Marks it ``hidden_by_admin``: the owner can no longer make it public
+    again, only an admin can (``PUT /apps/{id}`` with ``is_private: false``,
+    .github#7 R).
+    """
     _require_app(db, app_id)
-    updated = crud_apps.update_app(db, app_id, AppUpdate(is_private=True))
+    updated = crud_apps.set_hidden_by_admin(db, app_id, True)
     return _serialize_app(updated)
 
 

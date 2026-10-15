@@ -135,6 +135,12 @@ def test_worker_role_has_only_its_rights(scratch_db):
             (task_id,),
         ).fetchone()
         worker.execute("SELECT pg_try_advisory_lock(1), pg_advisory_unlock(1)").fetchone()
+        # Claim and lease columns of the queue, as the transport and the
+        # destroy-after-cancel release use them.
+        worker.execute(
+            "UPDATE celery_queue SET visible_after = now(), claimed_by = NULL,"
+            " delivery_count = delivery_count, after_task = NULL WHERE false"
+        )
         # App and project of live deployments, for the image cleanup on destroy.
         assert worker.execute('SELECT "appId", os_project_id FROM worker_live_deployments').fetchall()
 
@@ -149,6 +155,10 @@ def test_worker_role_has_only_its_rights(scratch_db):
             "UPDATE tasks SET tf_state = 'x'",
             "UPDATE tasks SET outputs = 'x'",
             "INSERT INTO celery_queue (queue, payload) VALUES ('q', '{}')",
+            # A queued job's content is the API's: no rewriting it.
+            "UPDATE celery_queue SET payload = '{}'",
+            "UPDATE celery_queue SET queue = 'pods'",
+            "SELECT * FROM lti_nonces",
             "DELETE FROM task_events",
         ]
         for statement in denied:

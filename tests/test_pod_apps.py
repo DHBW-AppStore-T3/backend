@@ -571,3 +571,115 @@ def test_namespaces_without_a_live_deployment_are_reported(db, mock_user):
 
     assert set(orphans) == {rows["hidden"].k8s_namespace, rows["destroyed"].k8s_namespace, "dep-ffffffff"}
     assert orphans["dep-ffffffff"] == ""
+
+
+# ----------------------------------------------------------------
+# registration with ``submit_all_versions``
+# ----------------------------------------------------------------
+def test_auto_submitted_pod_versions_carry_their_spec_and_can_be_approved(
+    db, mock_user, mock_admin, pod_repo, fake_git
+):
+    """Registering with ``submit_all_versions`` records what each review covers,
+    as a manual submission does; before, a pod version was stored as a VM
+    version and its approval failed with 409 ``spec_changed`` for good."""
+    fake_git.tags = {"v1.0": fake_git.sha_for("v1.0"), "v2.0": fake_git.sha_for("v2.0")}
+    response = _make_client(mock_user).post(
+        "/apps/",
+        json={"name": "ide", "git_link": "https://github.com/example/ide", "submit_all_versions": True},
+    )
+    assert response.status_code == 201, response.text
+    app_id = response.json()["appId"]
+    rows = db.query(AppVersionApproval).filter_by(appId=uuid.UUID(app_id)).all()
+    assert {(r.version_tag, r.runtime) for r in rows} == {("v1.0", "kubernetes"), ("v2.0", "kubernetes")}
+    assert all(len(r.spec_sha256) == 64 and json.loads(r.image_digests) == [DIGEST] for r in rows)
+
+    assert _make_client(mock_admin).post(f"/admin/apps/{app_id}/versions/v1.0/approve").status_code == 200
+
+
+def test_auto_submit_skips_versions_with_an_invalid_spec(client, db, mock_user, pod_repo, fake_git):
+    bad = copy.deepcopy(SPEC)
+    bad["workload"]["containers"][0]["image"] = "docker.io/evil/x@" + DIGEST
+    pod_repo(bad)
+    fake_git.tags = {"v1.0": fake_git.sha_for("v1.0")}
+
+    response = client.post(
+        "/apps/",
+        json={"name": "ide", "git_link": "https://github.com/example/ide", "submit_all_versions": True},
+    )
+
+    assert response.status_code == 201, response.text
+    assert db.query(AppVersionApproval).count() == 0
+
+
+# ----------------------------------------------------------------
+# uploaded files
+# ----------------------------------------------------------------
+def _file(content: bytes, name="a.zip"):
+    import base64
+
+    return {"name": name, "content_b64": base64.b64encode(content).decode(), "size": len(content)}
+
+
+def test_team_files_of_a_pod_app_are_refused_beyond_the_secret_limit(client, db, mock_user, pod_repo, sent):
+    spec = {**SPEC, "scope": "team", "variables": [
+        {"name": "assignment", "type": "file", "scope": "team", "ext": ["zip"], "maxSize": "1Mi",
+         "mountPath": "/data/a.zip"},
+        {"name": "readme", "type": "file", "ext": ["md"], "mountPath": "/data/README.md"},
+    ]}
+    pod_repo(spec)
+    app = _app(db, mock_user, is_private=True)
+    alice = _student(db, "alice")
+    body = {
+        "name": "d", "appId": str(app.appId), "releaseTag": "v1.0", "teams": [_team("T", alice)],
+        "files": {
+            "assignment": {"T": _file(b"x" * (900 * 1024))},
+            "readme": {"all": _file(b"y" * (200 * 1024), "README.md")},
+        },
+    }
+
+    response = client.post("/deployments/", json=body)
+
+    assert response.status_code == 413
+    assert response.json()["detail"]["reason"] == "deployment_files_too_large"
+    sent.assert_not_called()
+
+
+def test_team_files_of_a_pod_app_reach_the_job(client, db, mock_user, pod_repo, sent):
+    spec = {**SPEC, "scope": "team", "variables": [
+        {"name": "assignment", "type": "file", "scope": "team", "ext": ["zip"], "mountPath": "/data/a.zip"},
+    ]}
+    pod_repo(spec)
+    app = _app(db, mock_user, is_private=True)
+    alice = _student(db, "alice")
+    body = {
+        "name": "d", "appId": str(app.appId), "releaseTag": "v1.0", "teams": [_team("T", alice)],
+        "files": {"assignment": {"T": _file(b"PK\x03\x04", "../../etc/a.zip")}},
+    }
+
+    response = client.post("/deployments/", json=body)
+
+    assert response.status_code == 201, response.text
+    stored = _job(sent)[1]["user_vars"]["terraform"]["assignment"]["T"]
+    entry = stored.get("uploaded", stored)
+    assert entry["name"] == "a.zip"  # no directories in a stored name
+
+
+# ----------------------------------------------------------------
+# what the detail tells the UI
+# ----------------------------------------------------------------
+def test_the_detail_carries_permissions_and_allowed_actions(client, db, mock_user, pod_repo, sent):
+    alice = _student(db, "alice")
+    app = _app(db, mock_user, is_private=True)
+    deployment_id = _deploy(client, app, teams=[_team("T", alice)]).json()["deploymentId"]
+    task = db.query(Task).filter(Task.deploymentId == uuid.UUID(deployment_id)).one()
+    task.status = TaskStatus.SUCCESS
+    db.commit()
+
+    owner_view = client.get(f"/deployments/{deployment_id}").json()
+    as_alice = _make_client(alice)
+    member_view = as_alice.get(f"/deployments/{deployment_id}").json()
+
+    assert owner_view["permissions"] == {"owner_view": True, "operate": True, "member": False}
+    assert set(owner_view["actions"]) == {"destroy", "pause", "redeploy"}
+    assert member_view["permissions"] == {"owner_view": False, "operate": False, "member": True}
+    assert member_view["actions"] == []

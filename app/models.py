@@ -142,6 +142,10 @@ class App(Base):
     image_mime = Column(String(64), nullable=True)  # e.g. "image/png" — needed to build a data-URL on read
     git_link = Column(String, nullable=True)
     is_private = Column(Boolean, nullable=False, default=False)
+    # Set by an admin's emergency deactivation: the app is private and only
+    # an admin may make it public again, so the owner cannot undo the
+    # deactivation (.github#7 R, dhbw-appstore).
+    hidden_by_admin = Column(Boolean, nullable=False, default=False, server_default=text("false"))
     userId = Column(UUID(as_uuid=True), ForeignKey("users.userId"), nullable=False, index=True)
     created_at = Column(DateTime, default=utcnow)
     # Soft-delete marker. When set, the app is hidden from default
@@ -561,6 +565,23 @@ class AppVersionApproval(Base):
     # Relationships
     app = relationship("App", back_populates="version_approvals")
     reviewer = relationship("User", foreign_keys=[reviewed_by])
+
+
+# ----------------------------------------------------------------
+# LTI 1.3 LAUNCH STATE
+# ----------------------------------------------------------------
+# The state/nonce pair of an LTI login in flight (``routers/lti13``):
+# written by ``/lti13/login``, consumed exactly once by ``/lti13/launch``.
+# In the database rather than in process memory, because the two requests
+# of one launch can reach different API processes or replicas.
+class LtiNonce(Base):
+    __tablename__ = "lti_nonces"
+
+    state = Column(String(128), primary_key=True)
+    nonce = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+
+    __table_args__ = (Index("ix_lti_nonces_created_at", "created_at"),)
 
 
 # ----------------------------------------------------------------

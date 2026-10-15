@@ -39,6 +39,7 @@ from app.utils.app_image import build_image_data_url, parse_image_data_url
 from app.utils.capabilities import (
     ensure_delete_app,
     ensure_edit_app,
+    ensure_publish_app,
     ensure_register_app,
     ensure_submit_app_version,
     ensure_view_app,
@@ -531,6 +532,36 @@ def get_app_runtime(
     )
 
 
+# Registering an app with ``submit_all_versions`` reads every submitted
+# version (one sparse clone each); the newest ones are enough to start with,
+# older tags can still be submitted one by one.
+AUTO_SUBMIT_MAX_VERSIONS = 20
+
+
+def _submit_at(db: Session, app, version_tag: str, commit_sha: str, diff_url=None, notes=None):
+    """Submit ``version_tag`` at ``commit_sha`` with the runtime, spec hash and digests the review covers.
+
+    422 for invalid ``@openstack`` markers or an invalid appstore.yaml, 502
+    when the repository cannot be read (nothing is submitted then).
+    """
+    ensure_no_marker_errors(load_variable_definitions(app, version_tag, commit_sha), "eingereicht")
+    # The review covers the runtime and, for pods, exactly this spec and
+    # these images (.github#4); served from the scan above.
+    loaded = load_version_spec(app, version_tag, commit_sha)
+    is_pods = loaded is not None and loaded.runtime == RUNTIME_K8S
+    return crud_approvals.submit_version(
+        db,
+        app_id=app.appId,
+        version_tag=version_tag,
+        commit_sha=commit_sha,
+        diff_url=diff_url,
+        notes=notes,
+        runtime=RUNTIME_K8S if is_pods else RUNTIME_VM,
+        spec_sha256=loaded.sha256 if is_pods else None,
+        image_digests=app_spec.digests_json(loaded) if is_pods else None,
+    )
+
+
 # ----------------------------------------------------------------
 # CREATE APP
 # ----------------------------------------------------------------
@@ -566,22 +597,24 @@ def create_app(
     if image_bytes is not None:
         db_app = crud_apps.set_app_image(db, db_app.appId, image_bytes, image_mime)
 
-    # Auto-submit all tags for review if requested (public apps only),
-    # each at the commit it points to now.
+    # Auto-submit the newest tags for review if requested (public apps
+    # only), each at the commit it points to now and with what the review
+    # covers, exactly as a manual submission would.
     if app.submit_all_versions and not app.is_private and app.git_link:
         try:
             versions = git_service.get_versions(app.git_link)
         except Exception as e:
             versions = []
             logger.warning("Could not auto-submit versions for app %s: %s", db_app.appId, e)
-        for v in versions:
+        for v in versions[:AUTO_SUBMIT_MAX_VERSIONS]:
             tag, sha = _version_tag(v), v.get("sha")
             if not tag or not sha:
                 continue
             try:
-                crud_approvals.submit_version(db, app_id=db_app.appId, version_tag=tag, commit_sha=sha)
-            except HTTPException:
+                _submit_at(db, db_app, tag, sha)
+            except HTTPException as e:
                 db.rollback()
+                logger.info("Not auto-submitting %s of app %s: %s", tag, db_app.appId, e.detail)
 
     return _serialize_app(db_app)
 
@@ -601,7 +634,9 @@ def update_app(
     ``git_link`` is immutable after creation — sending it in the body
     returns HTTP 400. Use ``is_private`` to toggle visibility.
 
-    Owner OR admin only.
+    Owner OR admin only. An app an admin deactivated (``hidden_by_admin``)
+    can be made public again only by an admin (403 ``app_hidden_by_admin``
+    for the owner); an admin doing so lifts the deactivation (.github#7 R).
     """
     app = crud_apps.get_app(db, app_id)
     if not app:
@@ -612,6 +647,9 @@ def update_app(
 
     # Check access permission — owner-or-admin only.
     ensure_edit_app(current_user, app)
+    publishing = app_update.is_private is False and app.is_private
+    if publishing:
+        ensure_publish_app(current_user, app)
 
     image_was_provided = "image" in app_update.model_fields_set
     image_bytes, image_mime = (None, None)
@@ -619,6 +657,8 @@ def update_app(
         image_bytes, image_mime = parse_image_data_url(app_update.image)
 
     updated_app = crud_apps.update_app(db, app_id, app_update)
+    if publishing and app.hidden_by_admin:
+        updated_app = crud_apps.set_hidden_by_admin(db, app_id, False)
     if image_was_provided:
         updated_app = crud_apps.set_app_image(db, app_id, image_bytes, image_mime)
     return _serialize_app(updated_app)
@@ -653,23 +693,7 @@ def submit_version(
     ensure_submit_app_version(current_user, app)
 
     commit_sha = resolve_version_commit(app, version_tag)
-    ensure_no_marker_errors(load_variable_definitions(app, version_tag, commit_sha), "eingereicht")
-    # The review covers the runtime and, for pods, exactly this spec and
-    # these images (.github#4); served from the scan above.
-    loaded = load_version_spec(app, version_tag, commit_sha)
-    is_pods = loaded is not None and loaded.runtime == RUNTIME_K8S
-
-    return crud_approvals.submit_version(
-        db,
-        app_id=app_id,
-        version_tag=version_tag,
-        commit_sha=commit_sha,
-        diff_url=body.diff_url,
-        notes=body.notes,
-        runtime=RUNTIME_K8S if is_pods else RUNTIME_VM,
-        spec_sha256=loaded.sha256 if is_pods else None,
-        image_digests=app_spec.digests_json(loaded) if is_pods else None,
-    )
+    return _submit_at(db, app, version_tag, commit_sha, diff_url=body.diff_url, notes=body.notes)
 
 
 # ----------------------------------------------------------------

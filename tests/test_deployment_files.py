@@ -249,8 +249,46 @@ def test_download_endpoint_returns_owner_bytes(
     response = client.get(f"/deployments/{deployment_id}/files/task_pdf/all")
     assert response.status_code == 200
     assert response.content == payload_bytes
-    assert response.headers["content-type"].startswith("text/plain")
+    # Served for saving, never rendered: not the uploader's type (.github#7 R).
+    assert response.headers["content-type"] == "application/octet-stream"
+    assert response.headers["x-content-type-options"] == "nosniff"
     assert "hello.txt" in response.headers["content-disposition"]
+
+
+@pytest.mark.integration
+def test_upload_names_are_stored_without_paths_or_header_breakers(client, db, mock_user, patched_celery):
+    cred = _ensure_user_credentials(db, mock_user)
+    app = _ensure_app(db, mock_user)
+    payload_bytes = b"x"
+    create = client.post(
+        "/deployments/",
+        json={
+            "name": "names",
+            "appId": str(app.appId),
+            "releaseTag": "v1",
+            "credentialId": str(cred.credentialId),
+            "files": {
+                "task_pdf": {
+                    "all": {
+                        "name": '../../etc/cron.d/a"\r\nSet-Cookie: x=1.pdf',
+                        "content_b64": _b64(payload_bytes),
+                        "size": 1,
+                        "content_type": "text/html",
+                    }
+                }
+            },
+        },
+    )
+    assert create.status_code == 201, create.text
+    deployment_id = create.json()["deploymentId"]
+
+    response = client.get(f"/deployments/{deployment_id}/files/task_pdf/all")
+
+    disposition = response.headers["content-disposition"]
+    assert "/" not in disposition.split("filename*=")[0]
+    assert chr(13) not in disposition and chr(10) not in disposition
+    assert disposition.startswith('attachment; filename="')
+    assert "set-cookie" not in {k.lower() for k in response.headers}
 
 
 @pytest.mark.integration

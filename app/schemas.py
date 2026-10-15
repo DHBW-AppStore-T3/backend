@@ -127,6 +127,8 @@ class AppResponse(AppBase):
     userId: UUID
     created_at: datetime
     is_private: bool
+    # An admin deactivated the app; only an admin can make it public again.
+    hidden_by_admin: bool = False
     # Data-URL or null. Populated from ``app.image`` + ``app.image_mime``
     # by ``serialize_app_image``; the raw bytes never leave the backend.
     image: str | None = None
@@ -329,6 +331,19 @@ class MyAccessResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class DeploymentPermissions(BaseModel):
+    """What the caller may do with a deployment, decided by the API.
+
+    ``owner_view``: tasks, logs, the live stream, infrastructure and the
+    (redacted) outputs. ``operate``: pause, resume, destroy, redeploy,
+    cancel and team changes. ``member``: the caller is in one of its teams
+    and gets their own access through ``my-access``.
+    """
+    owner_view: bool = False
+    operate: bool = False
+    member: bool = False
+
+
 # Full deployment detail response
 class DeploymentDetail(DeploymentWithRelations):
     """Full deployment details with teams, task info, and outputs"""
@@ -336,6 +351,11 @@ class DeploymentDetail(DeploymentWithRelations):
     latest_task: TaskSummary | None = None
     outputs: DeploymentOutputs | None = None
     logs: str | None = None  # Optional: can be excluded for large logs
+    permissions: DeploymentPermissions = DeploymentPermissions()
+    # Lifecycle actions allowed right now (``services.lifecycle``), for a
+    # caller with ``operate``: destroy, delete, pause, resume, cancel,
+    # redeploy. Empty for everyone else.
+    actions: list[str] = []
 
     model_config = ConfigDict(from_attributes=True)
 

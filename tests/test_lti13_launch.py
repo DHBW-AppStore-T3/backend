@@ -179,3 +179,52 @@ def test_launch_rejects_state_mismatch():
             data={"id_token": "fake-token", "state": "not-the-real-state"},
         )
     assert response.status_code == 400
+
+
+def test_login_and_launch_work_across_api_processes(db):
+    """The state/nonce pair is in the database: a launch reaching another API
+    process or replica than its login (``uvicorn --workers``, k8s replicas)
+    finds it, and it serves exactly one launch."""
+    from app.models import LtiNonce
+
+    login_client = TestClient(app)
+    with patch.object(settings, "LTI13_CLIENT_ID", "client-123"):
+        state = _do_login(login_client)
+    assert db.query(LtiNonce).filter(LtiNonce.state == state).count() == 1
+
+    launch_client = TestClient(app)  # stands in for another process: no shared memory needed
+    launch_client.cookies.set("lti13_state", state)
+    user_info = {"email": "elsewhere@example.com", "name": "Else Where", "role": "student", "course": ""}
+    with (
+        patch.object(settings, "LTI13_CLIENT_ID", "client-123"),
+        patch("app.routers.lti13.lti13_service.validate_id_token", return_value={}),
+        patch("app.routers.lti13.lti13_service.extract_user_info", return_value=user_info),
+    ):
+        first = launch_client.post("/lti13/launch", data={"id_token": "fake-token", "state": state})
+        replay = launch_client.post("/lti13/launch", data={"id_token": "fake-token", "state": state})
+
+    assert first.status_code == 200
+    assert replay.status_code == 400
+    assert db.query(LtiNonce).count() == 0
+
+
+def test_expired_state_is_refused(db):
+    from datetime import UTC, datetime, timedelta
+
+    from app.models import LtiNonce
+
+    db.add(LtiNonce(state="old-state", nonce="old-nonce", created_at=datetime.now(UTC) - timedelta(minutes=10)))
+    db.commit()
+    client = TestClient(app)
+    client.cookies.set("lti13_state", "old-state")
+    with patch.object(settings, "LTI13_CLIENT_ID", "client-123"):
+        response = client.post("/lti13/launch", data={"id_token": "fake-token", "state": "old-state"})
+    assert response.status_code == 400
+    assert db.query(LtiNonce).count() == 0
+
+
+def test_login_operations_have_their_own_ids():
+    """One route for GET and POST gave both the same operationId, which broke
+    the generated frontend types."""
+    ops = app.openapi()["paths"]["/lti13/login"]
+    assert ops["get"]["operationId"] != ops["post"]["operationId"]

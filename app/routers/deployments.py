@@ -26,12 +26,14 @@ from app.crud import users as crud_users
 from app.database import SessionLocal, get_db
 from app.k8s.render import Member, workload_refs
 from app.k8s.render import Team as RenderTeam
+from app.k8s.spec import MAX_FILE_VARIABLE_BYTES, parse_size_bytes
 from app.models import RUNTIME_K8S, RUNTIME_VM, TaskStatus, TaskType, User, UserRole
 from app.models import Task as TaskModel  # for ad-hoc state queries
 from app.schemas import (
     DeploymentCreate,
     DeploymentDetail,
     DeploymentOutputs,
+    DeploymentPermissions,
     DeploymentResourceListResponse,
     DeploymentResourceSchema,
     DeploymentResponse,
@@ -74,6 +76,7 @@ from app.task_contract import (
 )
 from app.utils import crypto
 from app.utils.capabilities import (
+    can_operate_deployment,
     can_view_deployment_owner,
     ensure_deploy,
     ensure_operate_deployment,
@@ -82,6 +85,7 @@ from app.utils.capabilities import (
     ensure_view_deployment_member,
     ensure_view_deployment_owner,
 )
+from app.utils.filenames import content_disposition
 from app.utils.keycloak_auth import get_current_user_keycloak
 from app.utils.time import utcnow
 
@@ -246,6 +250,9 @@ def get_deployment(
     # + outputs alongside owners and admins.
     is_owner_view = can_view_deployment_owner(current_user, deployment, db)
     teams_data = crud_deployments.get_deployment_teams_with_members(db, deployment_id)
+    is_member = any(
+        str(m["userId"]) == str(current_user.userId) for t in teams_data for m in t["members"]
+    )
     if not is_owner_view:
         teams_data = [
             t for t in teams_data
@@ -301,6 +308,13 @@ def get_deployment(
     from app.routers.apps import _serialize_app  # local: avoid import cycle
     serialised_app = _serialize_app(deployment.app)
 
+    # The UI renders buttons from these instead of guessing from the role.
+    may_operate = can_operate_deployment(current_user, deployment, db)
+    permissions = DeploymentPermissions(owner_view=is_owner_view, operate=may_operate, member=is_member)
+    actions = (
+        sorted(a.value for a in lifecycle_service.allowed_actions(db, deployment)) if may_operate else []
+    )
+
     return DeploymentDetail(
         deploymentId=deployment.deploymentId,
         name=deployment.name,
@@ -319,6 +333,8 @@ def get_deployment(
         latest_task=task_summary,
         outputs=outputs,
         logs=logs,
+        permissions=permissions,
+        actions=actions,
     )
 
 
@@ -441,7 +457,10 @@ def create_deployment(
             deployment.teams or [],
         )
 
-    workloads = _check_pod_workloads(db, current_user, loaded_spec, deployment.teams or []) if is_pods else None
+    workloads = None
+    if is_pods:
+        _check_pod_files(loaded_spec, deployment.userInputVar)
+        workloads = _check_pod_workloads(db, current_user, loaded_spec, deployment.teams or [])
 
     db_deployment = crud_deployments.create_deployment(
         db,
@@ -736,6 +755,46 @@ def _check_pod_workloads(db: Session, owner: User, loaded_spec, teams) -> int:
                 detail={"reason": "workload_budget_exceeded", "in_use": used, "requested": len(refs), "budget": budget},
             )
     return len(refs)
+
+
+def _check_pod_files(loaded_spec, user_input: dict | None) -> None:
+    """413 unless the uploaded files of a pod app fit where they go.
+
+    The pod worker puts every file a workload gets into one Kubernetes
+    Secret, which holds at most 1 MiB, and each file variable may declare a
+    smaller ``maxSize``. The deploy would otherwise fail late, in the
+    cluster, with an error nobody can act on. Conservative: the largest slot
+    of every file variable is counted once.
+    """
+    terraform_block = (user_input or {}).get("terraform") or {}
+    total = 0
+    for variable in loaded_spec.spec.variables:
+        if variable.type != "file":
+            continue
+        limit = parse_size_bytes(variable.max_size) if variable.max_size else MAX_FILE_VARIABLE_BYTES
+        largest = 0
+        for slot_key, entry in (terraform_block.get(variable.name) or {}).items():
+            if isinstance(entry, dict) and isinstance(entry.get("uploaded"), dict):
+                entry = entry["uploaded"]
+            size = int(entry.get("size") or 0) if isinstance(entry, dict) else 0
+            if size > limit:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail={
+                        "reason": "file_too_large",
+                        "variable": variable.name,
+                        "slot": slot_key,
+                        "limit_bytes": limit,
+                        "actual_bytes": size,
+                    },
+                )
+            largest = max(largest, size)
+        total += largest
+    if total > MAX_FILE_VARIABLE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={"reason": "deployment_files_too_large", "limit_bytes": MAX_FILE_VARIABLE_BYTES},
+        )
 
 
 def _validate_teams(db: Session, teams) -> None:
@@ -1609,8 +1668,11 @@ def download_deployment_file(
             detail=f"No uploaded file under variable '{var_name}'",
         )
     # ``var_value`` is ``{slot_key: {name, content_b64, size, content_type}}``;
-    # the slot-level entry IS the file metadata, no extra wrapper.
+    # a team- or user-scoped variable wraps each entry as ``{"uploaded": …}``
+    # (its HCL type is a map of maps).
     entry = var_value.get(slot_key)
+    if isinstance(entry, dict) and isinstance(entry.get("uploaded"), dict):
+        entry = entry["uploaded"]
     if not isinstance(entry, dict) or "content_b64" not in entry:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1627,20 +1689,17 @@ def download_deployment_file(
             detail="Stored file payload is not valid base64",
         )
 
+    # Never the uploader's content type, and a name that cannot break the
+    # header: the bytes are served for saving, not for the browser to render
+    # (.github#7 R).
     filename = str(entry.get("name") or f"{var_name}-{slot_key}")
-    content_type = str(entry.get("content_type") or "application/octet-stream")
     return Response(
         content=payload,
-        media_type=content_type,
+        media_type="application/octet-stream",
         headers={
-            # ``filename*`` is the RFC 5987 form for non-ASCII names;
-            # we always emit it alongside the legacy ``filename`` so
-            # clients without UTF-8 support still see something.
-            "Content-Disposition": (
-                f'attachment; filename="{filename}"; '
-                f"filename*=UTF-8''{filename}"
-            ),
+            "Content-Disposition": content_disposition(filename),
             "Content-Length": str(len(payload)),
+            "X-Content-Type-Options": "nosniff",
         },
     )
 

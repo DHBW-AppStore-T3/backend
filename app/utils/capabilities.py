@@ -123,6 +123,17 @@ def ensure_edit_app(user: User, app: App) -> None:
         raise _forbidden("app_edit_forbidden")
 
 
+def can_publish_app(user: User, app: App) -> bool:
+    """Whether ``user`` may make ``app`` public: an admin always, the owner
+    only while no admin has deactivated it (``hidden_by_admin``, .github#7 R)."""
+    return _is_admin(user) or (_is_owner(user, app.userId) and not getattr(app, "hidden_by_admin", False))
+
+
+def ensure_publish_app(user: User, app: App) -> None:
+    if not can_publish_app(user, app):
+        raise _forbidden("app_hidden_by_admin")
+
+
 def can_delete_app(user: User, app: App) -> bool:
     """Whether ``user`` may (soft-)delete ``app``. Owner or admin only."""
     return _is_admin(user) or _is_owner(user, app.userId)
@@ -404,6 +415,8 @@ __all__ = [
     "ensure_list_all_apps",
     "can_edit_app",
     "ensure_edit_app",
+    "can_publish_app",
+    "ensure_publish_app",
     "can_delete_app",
     "ensure_delete_app",
     "can_submit_app_version",

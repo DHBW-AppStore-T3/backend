@@ -10,16 +10,17 @@ Flow:
 
 import logging
 import secrets
-import time
 import urllib.parse
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
-from app.models import Course, User, UserRole
+from app.models import Course, LtiNonce, User, UserRole
 from app.services import lti13_service
 from app.utils.keycloak_auth import higher_role
 
@@ -27,52 +28,62 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/lti13", tags=["LTI 1.3"])
 
-# In-memory nonce store: state → (nonce, created_at).
-# A background sweep is not needed for the demo — entries expire naturally
-# after NONCE_TTL seconds, and the dict stays small (one entry per launch).
-_nonce_store: dict[str, tuple[str, float]] = {}
+# A login's state/nonce pair lives in ``lti_nonces`` until its launch
+# consumes it, at most NONCE_TTL seconds. In the database because login and
+# launch are two requests that can reach different API processes
+# (``uvicorn --workers``) or replicas.
 NONCE_TTL = 300  # 5 minutes
 
 
-def _store_nonce(state: str, nonce: str) -> None:
-    _nonce_store[state] = (nonce, time.time())
+def _store_nonce(db: Session, state: str, nonce: str) -> None:
+    """Remember ``nonce`` for ``state`` (and drop pairs whose launch never came)."""
+    _purge_expired_nonces(db)
+    db.add(LtiNonce(state=state, nonce=nonce))
+    db.commit()
 
 
-def _pop_nonce(state: str) -> str | None:
-    entry = _nonce_store.pop(state, None)
-    if entry is None:
+def _pop_nonce(db: Session, state: str) -> str | None:
+    """The nonce of ``state``, removed so it serves one launch only; None if unknown or expired."""
+    row = db.execute(
+        delete(LtiNonce).where(LtiNonce.state == state).returning(LtiNonce.nonce, LtiNonce.created_at)
+    ).first()
+    db.commit()
+    if row is None:
         return None
-    nonce, created = entry
-    if time.time() - created > NONCE_TTL:
+    nonce, created = row
+    if datetime.now(UTC) - created > timedelta(seconds=NONCE_TTL):
         return None
     return nonce
 
 
-def _purge_expired_nonces() -> None:
-    now = time.time()
-    expired = [s for s, (_, t) in _nonce_store.items() if now - t > NONCE_TTL]
-    for s in expired:
-        _nonce_store.pop(s, None)
+def _purge_expired_nonces(db: Session) -> None:
+    db.execute(delete(LtiNonce).where(LtiNonce.created_at < datetime.now(UTC) - timedelta(seconds=NONCE_TTL)))
 
 
 # ── 1. OIDC 3rd-party login initiation ───────────────────────────────────────
 
 
-@router.api_route("/login", methods=["GET", "POST"])
-async def lti13_login(request: Request) -> RedirectResponse:
-    """Step 1: receive the OIDC initiation request from Moodle and redirect
-    back to Moodle's auth endpoint with a fresh state/nonce pair.
+@router.get("/login", operation_id="lti13LoginGet")
+async def lti13_login_get(request: Request, db: Session = Depends(get_db)) -> RedirectResponse:
+    """Step 1 (GET): the OIDC login initiation from Moodle, parameters in the query string."""
+    return _login(request.query_params, db)
+
+
+@router.post("/login", operation_id="lti13LoginPost")
+async def lti13_login_post(request: Request, db: Session = Depends(get_db)) -> RedirectResponse:
+    """Step 1 (POST): the same initiation with form-encoded parameters.
 
     Moodle sends this as a POST (observed against a real Moodle 5.x
     instance, 2026-09-25) even though the IMS spec allows either GET or
-    POST for the 3rd-party-initiated login — so both are accepted here,
-    reading params from the query string or form body as appropriate.
+    POST for the 3rd-party-initiated login, so both are accepted. Two
+    routes rather than one for both methods: each gets its own OpenAPI
+    operation id (one shared id broke the generated frontend types).
     """
-    if request.method == "POST":
-        params = await request.form()
-    else:
-        params = request.query_params
+    return _login(await request.form(), db)
 
+
+def _login(params, db: Session) -> RedirectResponse:
+    """Check the initiation, store a fresh state/nonce pair and redirect to Moodle's auth endpoint."""
     iss = params.get("iss")
     login_hint = params.get("login_hint")
     client_id = params.get("client_id")
@@ -88,10 +99,9 @@ async def lti13_login(request: Request) -> RedirectResponse:
             "LTI 1.3 login: client_id %r != configured %r", client_id, settings.LTI13_CLIENT_ID
         )
 
-    _purge_expired_nonces()
     state = secrets.token_urlsafe(32)
     nonce = secrets.token_urlsafe(32)
-    _store_nonce(state, nonce)
+    _store_nonce(db, state, nonce)
 
     # Set state in a short-lived cookie so we can verify it on the POST
     auth_params: dict[str, str] = {
@@ -149,7 +159,7 @@ async def lti13_launch(request: Request, db: Session = Depends(get_db)) -> HTMLR
     if not cookie_state or cookie_state != state:
         raise HTTPException(status_code=400, detail="State mismatch — possible CSRF")
 
-    nonce = _pop_nonce(state)
+    nonce = _pop_nonce(db, state)
     if nonce is None:
         raise HTTPException(status_code=400, detail="Unknown or expired state")
 
