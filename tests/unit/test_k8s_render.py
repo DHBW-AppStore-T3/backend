@@ -101,6 +101,8 @@ def test_pods_are_hardened_and_cannot_be_weakened_by_spec():
             assert sc["readOnlyRootFilesystem"] is True
         assert "hostNetwork" not in pod and "hostPID" not in pod
         assert all("hostPath" not in v for v in pod["volumes"])
+        # Scratch space is bounded, so one pod cannot fill the node's disk.
+        assert all(v["emptyDir"].get("sizeLimit") for v in pod["volumes"] if "emptyDir" in v)
 
 
 def test_network_policy_denies_by_default_and_excludes_internal_ranges_for_both_families():

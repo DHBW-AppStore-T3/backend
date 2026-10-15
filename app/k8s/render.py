@@ -88,6 +88,10 @@ class RenderSettings:
     # Hosts are <workload>-<deployment>.<app_domain>. Default apps.<zone>; set it
     # to the zone itself to stay under an existing single-level wildcard certificate.
     app_domain_override: str = ""
+    # Upper bound of each ``writablePaths`` scratch volume. Without one an
+    # emptyDir grows until the node's disk is full and the kubelet starts
+    # evicting everything on it; beyond it only this pod is evicted.
+    scratch_size_limit: str = "1Gi"
 
     @property
     def app_domain(self) -> str:
@@ -405,7 +409,7 @@ def _workload_objects(
         mounts: list[dict[str, Any]] = []
         for i, path in enumerate(c.writable_paths):
             vol = f"{c.name}-tmp-{i}"
-            volumes.append({"name": vol, "emptyDir": {}})
+            volumes.append({"name": vol, "emptyDir": {"sizeLimit": settings.scratch_size_limit}})
             mounts.append({"name": vol, "mountPath": path})
         if storage:
             mounts.append({"name": "data", "mountPath": storage.mount_path})

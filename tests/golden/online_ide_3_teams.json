@@ -363,7 +363,9 @@
           ],
           "volumes": [
             {
-              "emptyDir": {},
+              "emptyDir": {
+                "sizeLimit": "1Gi"
+              },
               "name": "ide-tmp-0"
             }
           ]
@@ -613,7 +615,9 @@
           ],
           "volumes": [
             {
-              "emptyDir": {},
+              "emptyDir": {
+                "sizeLimit": "1Gi"
+              },
               "name": "ide-tmp-0"
             }
           ]
@@ -863,7 +867,9 @@
           ],
           "volumes": [
             {
-              "emptyDir": {},
+              "emptyDir": {
+                "sizeLimit": "1Gi"
+              },
               "name": "ide-tmp-0"
             }
           ]
@@ -1113,7 +1119,9 @@
           ],
           "volumes": [
             {
-              "emptyDir": {},
+              "emptyDir": {
+                "sizeLimit": "1Gi"
+              },
               "name": "ide-tmp-0"
             }
           ]
@@ -1363,7 +1371,9 @@
           ],
           "volumes": [
             {
-              "emptyDir": {},
+              "emptyDir": {
+                "sizeLimit": "1Gi"
+              },
               "name": "ide-tmp-0"
             }
           ]
@@ -1613,7 +1623,9 @@
           ],
           "volumes": [
             {
-              "emptyDir": {},
+              "emptyDir": {
+                "sizeLimit": "1Gi"
+              },
               "name": "ide-tmp-0"
             }
           ]
