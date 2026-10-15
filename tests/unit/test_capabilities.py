@@ -293,7 +293,7 @@ class TestCanViewDeploymentOwner:
         dep = SimpleNamespace(
             deploymentId=uuid.uuid4(),
             userId=uuid.uuid4(),
-            user=SimpleNamespace(courseId=course_id),
+            user=SimpleNamespace(courseId=course_id, role=UserRole.STUDENT),
         )
         db = MagicMock()
         # First filter().first() call returns a truthy row → match.
@@ -301,6 +301,35 @@ class TestCanViewDeploymentOwner:
             SimpleNamespace(courseId=course_id, userId=teacher.userId)
         )
         assert caps.can_view_deployment_owner(teacher, dep, db) is True
+
+    @pytest.mark.parametrize("owner_role", [UserRole.TEACHER, UserRole.ADMIN])
+    def test_course_teacher_cannot_view_staff_deployments(self, teacher, owner_role):
+        # .github#7 F: putting a colleague into one's own course must not
+        # open their deployments' logs and files.
+        course_id = uuid.uuid4()
+        dep = SimpleNamespace(
+            deploymentId=uuid.uuid4(),
+            userId=uuid.uuid4(),
+            user=SimpleNamespace(courseId=course_id, role=owner_role),
+        )
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = (
+            SimpleNamespace(courseId=course_id, userId=teacher.userId)
+        )
+        assert caps.can_view_deployment_owner(teacher, dep, db) is False
+
+    def test_teacher_no_longer_member_views_everything(self, teacher):
+        dep = SimpleNamespace(deploymentId=uuid.uuid4(), userId=uuid.uuid4(), user=None)
+        db = MagicMock()
+        db.query.return_value.join.return_value.filter.return_value.first.return_value = None
+        db.query.return_value.filter.return_value.first.return_value = None
+        assert caps.can_view_deployment_member(teacher, dep, db) is False
+        assert caps.can_view_deployment(teacher, dep, db) is False
+
+    def test_register_and_deploy_need_staff(self, teacher):
+        student = _user(UserRole.STUDENT)
+        assert caps.can_register_app(teacher) and caps.can_deploy(teacher)
+        assert not caps.can_register_app(student) and not caps.can_deploy(student)
 
     def test_teacher_without_course_context_rejected(self, teacher):
         # Deployment owner has no course assigned → course-teacher path

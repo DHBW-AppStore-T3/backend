@@ -66,13 +66,14 @@ from app.task_contract import (
 )
 from app.utils.capabilities import (
     can_view_deployment_owner,
+    ensure_deploy,
     ensure_operate_deployment,
     ensure_view_app,
+    ensure_view_deployment,
     ensure_view_deployment_member,
     ensure_view_deployment_owner,
 )
 from app.utils.keycloak_auth import get_current_user_keycloak
-from app.utils.permissions import ensure_deployment_access
 from app.utils.time import utcnow
 
 logger = logging.getLogger(__name__)
@@ -198,8 +199,9 @@ def get_deployment(
             detail="Deployment not found"
         )
 
-    # Check access permission
-    ensure_deployment_access(deployment, current_user, db)
+    # Member view or owner view (a course-teacher inspecting a student's
+    # deployment); 403 otherwise. No blanket teacher access (.github#7 F).
+    ensure_view_deployment(current_user, deployment, db)
 
     # Get latest task
     latest_task = crud_deployments.get_latest_task(db, deployment_id)
@@ -322,6 +324,11 @@ def create_deployment(
     if it fails, the task row is flipped to FAILED so the deployment
     surfaces an honest error instead of hanging in PENDING forever.
     """
+    # Teachers and admins deploy; students use deployments (.github#7 F).
+    ensure_deploy(current_user)
+    # Teams are lists of existing users, each in at most one team.
+    _validate_teams(db, deployment.teams or [])
+
     # Per-user lock — serializes against PUT /me/openstack-credentials
     # and any other concurrent POST /deployments from this user. Held
     # until the next COMMIT/ROLLBACK on this connection.
@@ -585,6 +592,39 @@ def _fetch_dispatch_envelope(db: Session, user_id, *, rollback_on_missing: bool)
             status_code=status.HTTP_412_PRECONDITION_FAILED,
             detail={"reason": "openstack_credentials_missing"},
         )
+
+
+def _validate_teams(db: Session, teams) -> None:
+    """422 unless every team has a unique, non-empty name and every member
+    exists and is in exactly one team (.github#7 F).
+
+    A user id that matched nobody used to be dropped silently, and a person
+    in two teams got two workloads (or two VM accounts).
+    """
+    names = [team.name.strip() for team in teams]
+    if any(not name for name in names) or len(set(names)) != len(names):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "invalid_teams", "message": "Team names must be unique and not empty"},
+        )
+    seen: set[str] = set()
+    for team in teams:
+        for raw in team.userIds:
+            try:
+                user_id = UUID(str(raw))
+            except ValueError:
+                user_id = None
+            if user_id is None or crud_users.get_user(db, user_id) is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={"reason": "unknown_team_member", "user_id": str(raw)},
+                )
+            if str(user_id) in seen:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={"reason": "member_in_several_teams", "user_id": str(user_id)},
+                )
+            seen.add(str(user_id))
 
 
 def _member_entry(user: User) -> dict:

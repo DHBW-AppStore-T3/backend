@@ -50,11 +50,12 @@ def _app(owner_id: uuid.UUID, is_private: bool = False) -> SimpleNamespace:
     )
 
 
-def _deployment(owner_id: uuid.UUID, course_id: uuid.UUID | None = None) -> SimpleNamespace:
+def _deployment(owner_id: uuid.UUID, course_id: uuid.UUID | None = None,
+                owner_role: UserRole = UserRole.STUDENT) -> SimpleNamespace:
     return SimpleNamespace(
         deploymentId=uuid.uuid4(),
         userId=owner_id,
-        user=SimpleNamespace(courseId=course_id),
+        user=SimpleNamespace(courseId=course_id, role=owner_role),
     )
 
 
@@ -178,6 +179,20 @@ def test_ensure_view_deployment_owner_passes_for_course_teacher(teacher):
         SimpleNamespace(courseId=course_id, userId=teacher.userId)
     )
     caps.ensure_view_deployment_owner(teacher, dep, db)
+
+
+def test_ensure_view_deployment_owner_refuses_a_colleagues_deployment(teacher):
+    """The course-teacher right covers students' deployments only
+    (.github#7 F): pulling a colleague into one's course gives nothing."""
+    course_id = uuid.uuid4()
+    dep = _deployment(uuid.uuid4(), course_id=course_id, owner_role=UserRole.TEACHER)
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = (
+        SimpleNamespace(courseId=course_id, userId=teacher.userId)
+    )
+    with pytest.raises(HTTPException) as exc:
+        caps.ensure_view_deployment_owner(teacher, dep, db)
+    assert exc.value.status_code == 403
 
 
 # ================================================================

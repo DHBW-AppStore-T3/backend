@@ -143,16 +143,48 @@ def ensure_approve_app_version(user: User) -> None:
         raise _forbidden("role_required", [UserRole.ADMIN.value])
 
 
+def can_register_app(user: User) -> bool:
+    """Register an app (point the platform at a repository). Teacher or admin."""
+    return _is_staff(user)
+
+
+def ensure_register_app(user: User) -> None:
+    if not can_register_app(user):
+        raise _forbidden("role_required", [r.value for r in STAFF_ROLES])
+
+
 # ================================================================
 # DEPLOYMENTS
 # ================================================================
+def can_deploy(user: User) -> bool:
+    """Start a deployment. Teacher or admin (.github#7 F): students use
+    deployments, they do not run app code on the platform."""
+    return _is_staff(user)
+
+
+def ensure_deploy(user: User) -> None:
+    if not can_deploy(user):
+        raise _forbidden("role_required", [r.value for r in STAFF_ROLES])
+
+
 def can_view_deployment_member(user: User, dep: Deployment, db: Session) -> bool:
     """Member-view access to a deployment.
 
-    Mirrors :func:`app.utils.permissions.has_deployment_access` —
-    owner, staff, team-member, or direct UserToDeployment mapping.
+    Owner, admin, team member or direct UserToDeployment mapping
+    (:func:`app.utils.permissions.has_deployment_access`); no blanket
+    teacher access any more (.github#7 F).
     """
     return has_deployment_access(dep, user, db)
+
+
+def can_view_deployment(user: User, dep: Deployment, db: Session) -> bool:
+    """Whether ``user`` may open the deployment at all: member or owner view."""
+    return can_view_deployment_member(user, dep, db) or can_view_deployment_owner(user, dep, db)
+
+
+def ensure_view_deployment(user: User, dep: Deployment, db: Session) -> None:
+    if not can_view_deployment(user, dep, db):
+        raise _forbidden("deployment_view_forbidden")
 
 
 def ensure_view_deployment_member(user: User, dep: Deployment, db: Session) -> None:
@@ -164,9 +196,15 @@ def can_view_deployment_owner(user: User, dep: Deployment, db: Session) -> bool:
     """Owner-view access — tasks, logs, terraform state, destroy.
 
     Read access is granted to the deployment owner, admins, and
-    course-teachers of the deployment owner's course (inspect only).
-    Operate rights are separate — see :func:`can_operate_deployment`.
-    The course-teacher check is skipped when the owner has no course.
+    course-teachers of the owner's course (inspect only) when the owner is
+    a student. Operate rights are separate — see
+    :func:`can_operate_deployment`.
+
+    The course-teacher right never covers another teacher's or an admin's
+    deployment (.github#7 F, security review H-1): a teacher who manages a
+    course must not read a colleague's logs and files by putting them into
+    that course. Since only teachers and admins deploy, this leaves the
+    right for student deployments from before.
     """
     if user.role == UserRole.ADMIN:
         return True
@@ -177,7 +215,10 @@ def can_view_deployment_owner(user: User, dep: Deployment, db: Session) -> bool:
     # roles are rejected by the role gate in ``is_course_teacher_id``.
     if user.role != UserRole.TEACHER:
         return False
-    owner_course_id = getattr(getattr(dep, "user", None), "courseId", None)
+    owner = getattr(dep, "user", None)
+    if owner is None or getattr(owner, "role", None) != UserRole.STUDENT:
+        return False
+    owner_course_id = getattr(owner, "courseId", None)
     if owner_course_id is None:
         return False
     return is_course_teacher_id(user, owner_course_id, db)
@@ -263,6 +304,23 @@ def ensure_view_course_detail(user: User) -> None:
         raise _forbidden("role_required", [r.value for r in STAFF_ROLES])
 
 
+def can_view_course_roster(user: User, course: Course, db: Session) -> bool:
+    """Read a course's member list (e-mail addresses).
+
+    Staff only: any teacher may read any course's roster (an earlier team
+    decision, the team picker relies on it), students never (security
+    review M-2: ``GET /courses/{id}`` used to show every member to every
+    signed-in user). Changing the roster needs :func:`can_edit_course`.
+    """
+    del course, db
+    return _is_staff(user)
+
+
+def ensure_view_course_roster(user: User, course: Course, db: Session) -> None:
+    if not can_view_course_roster(user, course, db):
+        raise _forbidden("course_roster_forbidden")
+
+
 def can_edit_course(user: User, course: Course, db: Session) -> bool:
     """Edit / delete ``course``. Course-teacher of this course or admin."""
     if _is_admin(user):
@@ -318,7 +376,13 @@ __all__ = [
     "ensure_submit_app_version",
     "can_approve_app_version",
     "ensure_approve_app_version",
+    "can_register_app",
+    "ensure_register_app",
     # Deployments
+    "can_deploy",
+    "ensure_deploy",
+    "can_view_deployment",
+    "ensure_view_deployment",
     "can_view_deployment_member",
     "ensure_view_deployment_member",
     "can_view_deployment_owner",
@@ -333,6 +397,8 @@ __all__ = [
     "ensure_view_course_detail",
     "can_edit_course",
     "ensure_edit_course",
+    "can_view_course_roster",
+    "ensure_view_course_roster",
     # Users
     "can_view_user",
     "ensure_view_user",

@@ -37,6 +37,7 @@ from app.utils.app_image import build_image_data_url, parse_image_data_url
 from app.utils.capabilities import (
     ensure_delete_app,
     ensure_edit_app,
+    ensure_register_app,
     ensure_submit_app_version,
     ensure_view_app,
 )
@@ -444,10 +445,12 @@ def create_app(
 ):
     """
     Create a new app
+    - Teachers and admins only (403 ``role_required``, .github#7 F)
     - The repository must be public and on an allowed host
       (``APP_GIT_ALLOWED_HOSTS``); 422 otherwise, 403 if it cannot be read
     - The stored ``git_link`` is the normalised, credential-free HTTPS URL
     """
+    ensure_register_app(current_user)
     # Decode the optional image data-URL up front so a malformed
     # payload fails before we hit Git / DB.
     image_bytes, image_mime = parse_image_data_url(app.image)
