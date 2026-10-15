@@ -121,6 +121,14 @@ def derive_status(
     * ``(PAUSE,  success)``         → ``paused``
     * ``(RESUME, pending|running)`` → ``resuming``
     * ``(RESUME, success)``         → falls through to ``success``
+    * ``(REDEPLOY, pending|running)`` → ``redeploying``
+    * ``(REDEPLOY, failed|cancelled)`` → ``redeploy_failed``
+    * ``(REDEPLOY, success)``       → falls through to ``success``
+
+    A redeploy touches one VM or workload while the others keep running, so
+    it must never look like a deploy: a ``running`` deploy may be cancelled
+    (which destroys everything) and a ``failed`` one may be deleted, which
+    would hide a deployment whose resources still run (.github#7 L).
 
     PAUSE/RESUME ``failed``/``cancelled`` bleed through unchanged so the
     user sees the pause/resume itself broke. Returns ``None`` when the
@@ -159,6 +167,11 @@ def derive_status(
         # On resume success the deployment is running again; let
         # "success" pass through so the lifecycle matrix treats it like
         # a fresh successful deploy.
+    elif raw_type == "redeploy":
+        if raw_status in ("pending", "running"):
+            return "redeploying"
+        if raw_status in ("failed", "cancelled"):
+            return "redeploy_failed"
     return raw_status
 
 
@@ -412,33 +425,21 @@ def get_deployments(
             ),
         )
 
-        if status == "destroying":
-            query = query.filter(
-                latest_subq.c.type == TaskType.DESTROY,
-                latest_subq.c.status.in_((TaskStatus.PENDING, TaskStatus.RUNNING)),
-            )
-        elif status == "destroyed":
-            query = query.filter(
-                latest_subq.c.type == TaskType.DESTROY,
-                latest_subq.c.status == TaskStatus.SUCCESS,
-            )
-        else:
-            # Plain task statuses, mirroring ``derive_status``:
-            # - ``pending``/``running``/``success`` match deploy-typed
-            #   tasks only (destroy surfaces as destroying/destroyed).
-            # - ``failed``/``cancelled`` bleed through both task types.
-            try:
-                status_enum = TaskStatus(status)
-            except ValueError:
-                # Unknown status string → empty result.
-                return []
-            query = query.filter(latest_subq.c.status == status_enum)
-            if status_enum in (
-                TaskStatus.PENDING,
-                TaskStatus.RUNNING,
-                TaskStatus.SUCCESS,
-            ):
-                query = query.filter(latest_subq.c.type != TaskType.DESTROY)
+        pairs = [
+            (task_type, task_status)
+            for task_type in TaskType
+            for task_status in TaskStatus
+            if derive_status(task_status, task_type) == status
+        ]
+        if not pairs:
+            # Unknown status string → empty result.
+            return []
+        query = query.filter(
+            or_(*(
+                and_(latest_subq.c.type == task_type, latest_subq.c.status == task_status)
+                for task_type, task_status in pairs
+            ))
+        )
 
     # Order by deploymentId (UUID)
     query = query.order_by(desc(Deployment.deploymentId))

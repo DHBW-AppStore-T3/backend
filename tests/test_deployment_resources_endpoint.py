@@ -441,3 +441,72 @@ def test_redeploy_rejects_unknown_address(
     assert response.status_code == 404
     assert response.json()["detail"]["reason"] == "resource_not_in_state"
     assert not patched_celery_send.called
+
+
+# ----------------------------------------------------------------
+# Redeploy in the lifecycle matrix (.github#7 L)
+# ----------------------------------------------------------------
+def _add_task(db, deployment, task_type, task_status):
+    from datetime import datetime, timedelta
+
+    db.add(Task(
+        taskId=uuid.uuid4(), deploymentId=deployment.deploymentId, type=task_type,
+        status=task_status, created_at=datetime.utcnow() + timedelta(seconds=5),
+    ))
+    db.commit()
+
+
+@pytest.mark.integration
+def test_redeploy_refused_while_paused(client, db, mock_user, patched_user_connection, patched_celery_send):
+    _ensure_user_credentials(db, mock_user)
+    deployment = _seed_deployment_with_state(db, mock_user, _ensure_app(db, mock_user))
+    _add_task(db, deployment, TaskType.PAUSE, TaskStatus.SUCCESS)
+
+    response = client.post(f"/deployments/{deployment.deploymentId}/resources/{ADDR_A}/redeploy")
+
+    assert response.status_code == 409
+    assert "redeploy_failed" in response.json()["detail"]
+    patched_celery_send.assert_not_called()
+
+
+@pytest.mark.integration
+def test_redeploy_retry_allowed_after_redeploy_failed(
+    client, db, mock_user, patched_user_connection, patched_celery_send
+):
+    _ensure_user_credentials(db, mock_user)
+    deployment = _seed_deployment_with_state(db, mock_user, _ensure_app(db, mock_user))
+    _add_task(db, deployment, TaskType.REDEPLOY, TaskStatus.FAILED)
+
+    response = client.post(f"/deployments/{deployment.deploymentId}/resources/{ADDR_A}/redeploy")
+
+    assert response.status_code == 202, response.text
+
+
+@pytest.mark.integration
+def test_cancel_refused_while_a_redeploy_runs(client, db, mock_user, patched_celery_send):
+    """Cancel destroys the whole deployment: never for a running redeploy."""
+    _ensure_user_credentials(db, mock_user)
+    deployment = _seed_deployment_with_state(db, mock_user, _ensure_app(db, mock_user))
+    _add_task(db, deployment, TaskType.REDEPLOY, TaskStatus.RUNNING)
+
+    response = client.post(f"/deployments/{deployment.deploymentId}/cancel")
+
+    assert response.status_code == 409
+    patched_celery_send.assert_not_called()
+
+
+@pytest.mark.integration
+def test_delete_after_a_failed_redeploy_destroys_instead_of_hiding(
+    client, db, mock_user, patched_celery_send
+):
+    _ensure_user_credentials(db, mock_user)
+    deployment = _seed_deployment_with_state(db, mock_user, _ensure_app(db, mock_user))
+    _add_task(db, deployment, TaskType.REDEPLOY, TaskStatus.FAILED)
+
+    response = client.delete(f"/deployments/{deployment.deploymentId}")
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "destroying"
+    assert patched_celery_send.call_args.args[0] == "tasks.destroy_deployment"
+    db.expire_all()
+    assert db.get(Deployment, deployment.deploymentId).deleted_at is None

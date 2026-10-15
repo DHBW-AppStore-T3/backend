@@ -15,6 +15,11 @@ Status values follow ``crud_deployments.get_deployment_status``:
 * ``pausing`` — a pause task is in flight (synthetic)
 * ``paused`` — a pause task finished successfully (synthetic)
 * ``resuming`` — a resume task is in flight (synthetic)
+* ``pause_failed`` / ``resume_failed`` — the last pause/resume task ended
+  in error (synthetic)
+* ``redeploying`` — a single-VM/workload redeploy is in flight (synthetic)
+* ``redeploy_failed`` — the last redeploy ended in error; the other
+  resources are untouched (synthetic)
 """
 
 from __future__ import annotations
@@ -43,6 +48,10 @@ class DeploymentAction(str, Enum):
     # follows that also reaps the Packer build instance, which lives
     # outside Terraform state and would otherwise be left running.
     CANCEL = "cancel"
+    # Rebuild one compute instance (``apply -replace``) or restart one pod
+    # workload. Only while the deployment's resources are up, so it cannot
+    # race a pause or run against SHUTOFF instances (.github#7 L).
+    REDEPLOY = "redeploy"
 
 
 # Synthetic statuses where a worker task is currently in flight. Every
@@ -55,6 +64,7 @@ IN_FLIGHT_STATUSES: frozenset[str] = frozenset({
     "destroying",
     "pausing",
     "resuming",
+    "redeploying",
 })
 
 
@@ -67,8 +77,9 @@ _ALLOWED: dict[str, set[DeploymentAction]] = {
     # very task before doing anything else.
     "pending": {DeploymentAction.CANCEL},
     "running": {DeploymentAction.CANCEL},
-    # Deployed and running — tear down or pause compute to free quota.
-    "success": {DeploymentAction.DESTROY, DeploymentAction.PAUSE},
+    # Deployed and running — tear down or pause compute to free quota, or
+    # rebuild a single VM/workload.
+    "success": {DeploymentAction.DESTROY, DeploymentAction.PAUSE, DeploymentAction.REDEPLOY},
     # A failed deploy may have created some resources, so Destroy is
     # offered to reconcile; Delete is available when there's nothing to
     # clean up. Both end at "row hidden from UI".
@@ -93,20 +104,29 @@ _ALLOWED: dict[str, set[DeploymentAction]] = {
         DeploymentAction.PAUSE,
         DeploymentAction.DESTROY,
     },
-    # pending / running / destroying / pausing / resuming — no action
-    # allowed; a DB partial-unique index on in-flight tasks enforces
-    # this at insert time too.
+    # Redeploy failed: only that one VM/workload is in doubt, the rest
+    # runs. Allow a retry, PAUSE and DESTROY — not DELETE, which would hide
+    # a deployment whose resources still run.
+    "redeploy_failed": {
+        DeploymentAction.REDEPLOY,
+        DeploymentAction.PAUSE,
+        DeploymentAction.DESTROY,
+    },
+    # pending / running / destroying / pausing / resuming / redeploying —
+    # no action allowed (cancel only for a deploy); a DB partial-unique
+    # index on in-flight tasks enforces this at insert time too.
 }
 
 # Human-readable explanation for the 409 we throw when an action isn't
 # allowed. Keys match the action; the message lists the statuses where
 # the action is valid.
 _REQUIRED_STATES: dict[DeploymentAction, str] = {
-    DeploymentAction.DESTROY: "success, failed, paused, pause_failed or resume_failed",
+    DeploymentAction.DESTROY: "success, failed, paused, pause_failed, resume_failed or redeploy_failed",
     DeploymentAction.DELETE: "failed or cancelled",
-    DeploymentAction.PAUSE: "success, pause_failed or resume_failed",
+    DeploymentAction.PAUSE: "success, pause_failed, resume_failed or redeploy_failed",
     DeploymentAction.RESUME: "paused, pause_failed or resume_failed",
     DeploymentAction.CANCEL: "pending or running",
+    DeploymentAction.REDEPLOY: "success or redeploy_failed",
 }
 
 

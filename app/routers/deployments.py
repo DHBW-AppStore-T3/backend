@@ -548,10 +548,10 @@ def delete_deployment(
     # auto-soft-delete the row when the destroy task succeeds. ``paused``
     # also lands here: SHUTOFF instances + volumes/networks are still
     # OpenStack resources that need to be torn down before the row can
-    # be hidden. ``pause_failed`` / ``resume_failed`` likewise still
-    # have running OpenStack resources behind them — the deployment
-    # itself didn't break, only the lifecycle pass.
-    if current_status in ("success", "failed", "paused", "pause_failed", "resume_failed"):
+    # be hidden. ``pause_failed`` / ``resume_failed`` / ``redeploy_failed``
+    # likewise still have running OpenStack resources behind them — the
+    # deployment itself didn't break, only the lifecycle pass.
+    if current_status in ("success", "failed", "paused", "pause_failed", "resume_failed", "redeploy_failed"):
         return _dispatch_destroy(db, deployment, current_user)
 
     # No resources to clean up (cancelled, or anything else terminal):
@@ -1001,12 +1001,13 @@ def redeploy_deployment_resource(
     down all the team VMs, which is not what a one-VM "fix it" action
     should do.
 
-    Concurrency: same per-user advisory lock as create/destroy/pause
-    so a parallel redeploy can't race a destroy. The lock is held
-    only for the row insert; Celery dispatch happens after commit.
+    Lifecycle (.github#7 L): only from ``success`` or ``redeploy_failed``,
+    under the same per-deployment advisory lock as pause, resume, destroy
+    and cancel, so a concurrent pause and redeploy cannot both pass the
+    status check. A failed redeploy surfaces as ``redeploy_failed`` (retry,
+    pause, destroy; never delete). The lock is held only for the row
+    insert; the queue dispatch happens after commit.
     """
-    crud_locks.acquire_user_xact_lock(db, current_user.userId)
-
     deployment = crud_deployments.get_deployment(db, deployment_id)
     if not deployment:
         raise HTTPException(
@@ -1017,6 +1018,10 @@ def redeploy_deployment_resource(
     # (owner-or-admin). Course-teachers may inspect the resource via
     # the GET endpoints above but not bounce it.
     ensure_operate_deployment(current_user, deployment, db)
+    crud_locks.acquire_deployment_xact_lock(db, deployment_id)
+    lifecycle_service.ensure_action_allowed(
+        db, deployment, lifecycle_service.DeploymentAction.REDEPLOY,
+    )
 
     if not _TF_ADDRESS_RE.match(address):
         raise HTTPException(
