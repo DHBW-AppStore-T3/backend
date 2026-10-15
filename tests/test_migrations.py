@@ -159,3 +159,36 @@ def test_scram_verifier_matches_the_rfc_test_vector_shape():
     assert method == "SCRAM-SHA-256" and params.startswith("4096:")
     stored, server = keys.split(":")
     assert len(stored) == len(server) == 44  # base64 of 32 bytes
+
+
+def test_concurrent_migrations_take_turns(scratch_db):
+    """Two API replicas migrating at once: the second waits for the first (advisory lock)."""
+    import threading
+
+    url, config = scratch_db
+    done = threading.Event()
+    errors: list[BaseException] = []
+
+    def migrate():
+        try:
+            command.upgrade(config, "head")
+        except BaseException as exc:  # noqa: BLE001 - reported by the assertion below
+            errors.append(exc)
+        finally:
+            done.set()
+
+    with psycopg.connect(url) as holder:
+        holder.execute("SELECT pg_advisory_xact_lock(hashtext('appstore-backend:migrations'))")
+        worker = threading.Thread(target=migrate, daemon=True)
+        worker.start()
+        # While another migration holds the lock, this one does not start.
+        assert not done.wait(timeout=3)
+        holder.rollback()  # releases the transaction-scoped lock
+    assert done.wait(timeout=60)
+    worker.join(timeout=5)
+    assert errors == []
+    from alembic.script import ScriptDirectory
+
+    with psycopg.connect(url) as conn:
+        (version,) = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+    assert version == ScriptDirectory.from_config(config).get_current_head()
