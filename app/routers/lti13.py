@@ -117,15 +117,15 @@ async def lti13_login(request: Request) -> RedirectResponse:
     # the POST (the POST comes from Moodle's domain via form_post).
     # SameSite=None requires Secure in every modern browser — without it the
     # cookie is silently dropped and /launch always fails with "State
-    # mismatch", not just in production. DEV_MODE is the one carve-out, for
-    # plain-HTTP localhost development.
+    # mismatch", not just in production. APP_ENV=development is the one
+    # carve-out, for plain-HTTP localhost development.
     redirect.set_cookie(
         key="lti13_state",
         value=state,
         max_age=NONCE_TTL,
         httponly=True,
         samesite="none",
-        secure=not settings.DEV_MODE,
+        secure=not settings.is_development,
     )
     return redirect
 

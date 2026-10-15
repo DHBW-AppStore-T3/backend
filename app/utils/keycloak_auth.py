@@ -1,6 +1,10 @@
 """
 Keycloak Authentication & Authorization
 Handles token validation and user management with Keycloak.
+
+Access tokens are verified with PyJWT against the realm's JWKS, issuer and
+client (``app.utils.oidc``, .github#7 P). The Keycloak admin client is used
+only for the user search.
 """
 
 import logging
@@ -8,14 +12,14 @@ import threading
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JWTError, jwt
-from keycloak import KeycloakAdmin, KeycloakAuthenticationError, KeycloakOpenID
+from keycloak import KeycloakAdmin
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
 from app.models import User, UserRole
 from app.services import lti13_service
+from app.utils.oidc import IdentityProviderUnavailable, InvalidToken, OidcVerifier
 
 logger = logging.getLogger(__name__)
 
@@ -24,19 +28,8 @@ optional_security = HTTPBearer(auto_error=False)
 
 
 # ----------------------------------------------------------------
-# KEYCLOAK CLIENTS
+# KEYCLOAK ADMIN CLIENT (user search)
 # ----------------------------------------------------------------
-def get_keycloak_client() -> KeycloakOpenID:
-    """Get Keycloak OpenID client instance"""
-    return KeycloakOpenID(
-        server_url=settings.KEYCLOAK_SERVER_URL,
-        client_id=settings.KEYCLOAK_CLIENT_ID,
-        realm_name=settings.KEYCLOAK_REALM,
-        client_secret_key=settings.KEYCLOAK_CLIENT_SECRET,
-        verify=True,
-    )
-
-
 def get_keycloak_admin() -> KeycloakAdmin:
     """Get Keycloak Admin client (uses service-account client_credentials grant)."""
     return KeycloakAdmin(
@@ -49,81 +42,54 @@ def get_keycloak_admin() -> KeycloakAdmin:
 
 
 # ----------------------------------------------------------------
-# PUBLIC KEY CACHE
-# ----------------------------------------------------------------
-# python-keycloak's public_key() does a fresh HTTP GET on every call,
-# which we make on every authenticated request. The realm signing key
-# is stable for the process lifetime, so we cache the PEM-formatted key
-# after the first fetch; restart the process on key rotation.
-_public_key_pem: str | None = None
-_public_key_lock = threading.Lock()
-
-
-def _get_realm_public_key_pem() -> str:
-    global _public_key_pem
-    if _public_key_pem is not None:
-        return _public_key_pem
-    with _public_key_lock:
-        if _public_key_pem is not None:
-            return _public_key_pem
-        raw = get_keycloak_client().public_key()
-        _public_key_pem = "-----BEGIN PUBLIC KEY-----\n" + raw + "\n-----END PUBLIC KEY-----"
-        return _public_key_pem
-
-
-# ----------------------------------------------------------------
 # TOKEN VALIDATION
 # ----------------------------------------------------------------
-def verify_keycloak_token(token: str) -> dict:
-    """Validate token via Keycloak introspection (slow, server round-trip)."""
-    try:
-        keycloak_client = get_keycloak_client()
-        token_info = keycloak_client.introspect(token)
-        if not token_info.get("active"):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token is not active or has expired",
-                headers={"WWW-Authenticate": "Bearer"},
+_verifier: OidcVerifier | None = None
+_verifier_lock = threading.Lock()
+
+
+def get_verifier() -> OidcVerifier:
+    """The process-wide verifier for the realm's access tokens."""
+    global _verifier
+    with _verifier_lock:
+        if _verifier is None:
+            _verifier = OidcVerifier(
+                issuer=settings.keycloak_issuer,
+                jwks_url=settings.keycloak_jwks_url,
+                allowed_clients=settings.oidc_allowed_clients,
+                audience=settings.OIDC_AUDIENCE or None,
             )
-        return token_info
-    except KeycloakAuthenticationError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication failed",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        return _verifier
+
+
+def reset_verifier() -> None:
+    """Forget the verifier (tests, settings changes)."""
+    global _verifier
+    with _verifier_lock:
+        _verifier = None
 
 
 def verify_keycloak_token_offline(token: str) -> dict:
-    """Validate JWT signature against Keycloak public key (fast, no server round-trip)."""
+    """Verify an access token of the realm and return its claims.
+
+    401 for an invalid token, 503 when Keycloak cannot be reached to fetch
+    the keys (a 401 would send the browser into a login that cannot work).
+    """
     try:
-        public_key = _get_realm_public_key_pem()
-        return jwt.decode(
-            token,
-            public_key,
-            algorithms=["RS256"],
-            options={"verify_signature": True, "verify_aud": False, "verify_exp": True},
-        )
-    except JWTError:
+        return get_verifier().verify(token)
+    except IdentityProviderUnavailable as e:
+        logger.warning("Cannot verify a token: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The sign-in service is not reachable; try again shortly",
+        ) from e
+    except InvalidToken as e:
+        logger.info("Rejected a token: %s", e)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token",
             headers={"WWW-Authenticate": "Bearer"},
-        )
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token validation failed",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        ) from e
 
 
 # ----------------------------------------------------------------
@@ -243,7 +209,7 @@ def get_current_user_keycloak(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    if settings.LTI13_SESSION_SECRET and settings.LTI13_SESSION_SECRET != "change-me-in-production":
+    if settings.lti13_enabled:
         try:
             email = lti13_service.verify_session_token(
                 credentials.credentials, settings.LTI13_SESSION_SECRET

@@ -16,7 +16,6 @@ from app.routers import (
     courses,
     dashboard,
     deployments,
-    handoff,
     lti13,
     openstack_credentials,
     openstack_resources,
@@ -152,7 +151,6 @@ app.include_router(teams.router, prefix="/teams", tags=["Teams"])
 app.include_router(quotas.router, prefix="/quotas", tags=["Quotas"])
 app.include_router(dashboard.router, prefix="/dashboard", tags=["Dashboard"])
 app.include_router(lti13.router)
-app.include_router(handoff.router, prefix="/handoff", tags=["Handoff"])
 app.include_router(openstack_credentials.router, tags=["OpenStack Credentials"])
 # Read API for OpenStack resources (Networks, Flavors, Images, ...),
 # used by the wizard's value-help dropdowns so users don't have to type

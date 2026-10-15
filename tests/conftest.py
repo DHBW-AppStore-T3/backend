@@ -59,6 +59,10 @@ if os.getenv("TEST_DATABASE_URL"):
 # App repositories may only come from these hosts (.github#7 B); the tests'
 # fixtures use example.com and github.com.
 os.environ.setdefault("APP_GIT_ALLOWED_HOSTS", "github.com,example.com")
+# The suite runs with the published CI key and plain-HTTP URLs, which only
+# development accepts (.github#7 O); tests of the production checks build
+# their own Settings.
+os.environ.setdefault("APP_ENV", "development")
 
 import hashlib
 import tempfile

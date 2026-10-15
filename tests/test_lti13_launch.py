@@ -12,7 +12,8 @@ def test_lti13_routes_registered():
     assert "/lti13/login" in paths
     assert "/lti13/launch" in paths
     assert "/lti13/jwks" in paths
-    assert "/handoff/mint" in paths
+    # The self-service handoff minted tokens nothing accepted (.github#7 N).
+    assert "/handoff/mint" not in paths
 
 
 def test_login_redirects_to_platform_auth():
@@ -58,12 +59,12 @@ def test_login_accepts_post_from_moodle():
 def test_login_state_cookie_is_secure_by_default():
     """SameSite=None requires Secure in every modern browser — without it
     the cookie is silently dropped and /launch always fails with 'State
-    mismatch', not just in production. Only DEV_MODE opts out (plain-HTTP
-    localhost development)."""
+    mismatch', not just in production. Only APP_ENV=development opts out
+    (plain-HTTP localhost development)."""
     client = TestClient(app)
     with (
         patch.object(settings, "LTI13_PLATFORM_ISSUER", "https://moodle.example.com"),
-        patch.object(settings, "DEV_MODE", False),
+        patch.object(settings, "APP_ENV", "production"),
     ):
         response = client.get(
             "/lti13/login",

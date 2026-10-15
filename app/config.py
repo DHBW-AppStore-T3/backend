@@ -1,7 +1,36 @@
+import base64
+import binascii
+from typing import Literal
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
+
+# Placeholders and keys that are public (committed in CI files, examples or
+# old docs): never acceptable outside development (.github#7 O).
+_PLACEHOLDER_SECRETS = frozenset({"", "change-me-in-production", "changeme", "secret", "test-secret"})
+_PUBLIC_FERNET_KEYS = frozenset({
+    "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U=",  # CI test key (backend/worker)
+    "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=",  # OpenAPI export placeholder
+})
+
+
+def _fernet_key_problem(key: str) -> str | None:
+    """Why ``key`` is not a usable Fernet key, or None."""
+    try:
+        raw = base64.urlsafe_b64decode(key.encode())
+    except (binascii.Error, ValueError):
+        return "is not url-safe base64"
+    if len(raw) != 32:
+        return "does not decode to 32 bytes"
+    return None
 
 
 class Settings(BaseSettings):
+    # "development" allows plain-HTTP cookies, placeholder secrets and the
+    # test keys; anything else is production and refuses to start with
+    # them (.github#7 O).
+    APP_ENV: Literal["development", "production"] = "production"
+
     # Database
     DATABASE_URL: str
 
@@ -20,11 +49,21 @@ class Settings(BaseSettings):
     TEMP_REPO_BASE_PATH: str = "/tmp/worker_repos"
     APP_GIT_ALLOWED_HOSTS: str = "github.com"
 
-    # Keycloak — single source of truth for authentication
+    # Keycloak — single source of truth for authentication.
+    # KEYCLOAK_SERVER_URL is how the backend reaches Keycloak (keys, user
+    # search); KEYCLOAK_ISSUER is the ``iss`` of the tokens, i.e. the public
+    # URL the browser signs in at (default: derived from the server URL,
+    # which only holds where both are the same).
     KEYCLOAK_SERVER_URL: str = "http://keycloak:8080"
     KEYCLOAK_REALM: str = "dhbw"
+    KEYCLOAK_ISSUER: str = ""
     KEYCLOAK_CLIENT_ID: str = "appstore-backend"
     KEYCLOAK_CLIENT_SECRET: str = ""  # Set via environment variable
+    # Access tokens must have been issued to one of these clients (``azp``,
+    # comma-separated) and, if set, name OIDC_AUDIENCE in ``aud``
+    # (.github#7 P). The realm adds the audience with a mapper.
+    OIDC_ALLOWED_CLIENTS: str = "appstore-frontend"
+    OIDC_AUDIENCE: str = ""
 
     # CORS
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:5173"]
@@ -50,14 +89,62 @@ class Settings(BaseSettings):
     LTI13_REDIRECT_URI: str = "http://localhost:8000/lti13/launch"
     LTI13_SESSION_SECRET: str = "change-me-in-production"
 
-    # Dev mode: accept X-Dev-User header in place of a Keycloak token.
-    # Never enable in production.
-    DEV_MODE: bool = False
+    @property
+    def is_development(self) -> bool:
+        return self.APP_ENV == "development"
 
-    # Self-service-ui handoff (POST /handoff/mint). Own secret, independent
-    # of LTI13_SESSION_SECRET — a compromised LTI secret must not also open
-    # the self-service handoff path.
-    HANDOFF_SESSION_SECRET: str = "change-me-in-production"
+    @model_validator(mode="after")
+    def _refuse_unsafe_production_settings(self) -> "Settings":
+        """Fail at start-up instead of running with secrets anybody knows.
+
+        In production: a well-formed Fernet key that is not a published test
+        key; an explicit https token issuer; https browser origins only, no
+        wildcard; and once LTI is configured, a real session secret of at
+        least 32 characters.
+        """
+        problem = _fernet_key_problem(self.CREDENTIAL_ENCRYPTION_KEY)
+        if problem:
+            raise ValueError(f"CREDENTIAL_ENCRYPTION_KEY {problem}")
+        if self.is_development:
+            return self
+        problems = []
+        if self.CREDENTIAL_ENCRYPTION_KEY in _PUBLIC_FERNET_KEYS:
+            problems.append("CREDENTIAL_ENCRYPTION_KEY is a published test key")
+        if not self.KEYCLOAK_ISSUER.startswith("https://"):
+            problems.append("KEYCLOAK_ISSUER must be set to the public https URL of the realm")
+        if not self.oidc_allowed_clients:
+            problems.append("OIDC_ALLOWED_CLIENTS is empty")
+        bad_origins = [o for o in self.CORS_ORIGINS if o == "*" or not o.startswith("https://")]
+        if bad_origins:
+            problems.append(f"CORS_ORIGINS must be https origins, got {bad_origins}")
+        if self.LTI13_CLIENT_ID and (
+            self.LTI13_SESSION_SECRET in _PLACEHOLDER_SECRETS or len(self.LTI13_SESSION_SECRET) < 32
+        ):
+            problems.append("LTI13_SESSION_SECRET must be a random secret of at least 32 characters")
+        if problems:
+            raise ValueError("unsafe production configuration: " + "; ".join(problems))
+        return self
+
+    @property
+    def keycloak_issuer(self) -> str:
+        """The ``iss`` access tokens must carry."""
+        if self.KEYCLOAK_ISSUER:
+            return self.KEYCLOAK_ISSUER.rstrip("/")
+        return f"{self.KEYCLOAK_SERVER_URL.rstrip('/')}/realms/{self.KEYCLOAK_REALM}"
+
+    @property
+    def keycloak_jwks_url(self) -> str:
+        """Where the backend fetches the realm's signing keys (internal URL)."""
+        return f"{self.KEYCLOAK_SERVER_URL.rstrip('/')}/realms/{self.KEYCLOAK_REALM}/protocol/openid-connect/certs"
+
+    @property
+    def oidc_allowed_clients(self) -> frozenset[str]:
+        return frozenset(c.strip() for c in self.OIDC_ALLOWED_CLIENTS.split(",") if c.strip())
+
+    @property
+    def lti13_enabled(self) -> bool:
+        """LTI launches and their session tokens are on once a real secret is set."""
+        return bool(self.LTI13_SESSION_SECRET) and self.LTI13_SESSION_SECRET != "change-me-in-production"
 
     @property
     def celery_broker_url(self) -> str:

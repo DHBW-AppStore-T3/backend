@@ -336,24 +336,10 @@ jobs:
         run: |
           poetry run python -m pip install --upgrade pip
           poetry run python -m pip install pip-audit
-          # PYSEC-2026-1325 (ecdsa): Minerva timing side-channel on
-          # P-256. No upstream fix — python-ecdsa considers side-channel
-          # attacks out of scope, so this will never be resolved. It's
-          # pulled in transitively by python-jose. The vuln only affects
-          # *signing* (sign_digest); our only use of jose is verifying
-          # Keycloak RS256 tokens (app/utils/keycloak_auth.py), so the
-          # attack surface is not present. Ignored here rather than left
-          # to fail --strict indefinitely. Revisit if we ever sign with
-          # ecdsa or migrate off python-jose (e.g. to PyJWT).
-          #
-          # CVE-2026-85394 (python-jose <= 3.5.0, no fixed release):
-          # HS256 tokens signed with a DER public key pass verification
-          # "when algorithms are not explicitly restricted". Every
-          # jwt.decode here pins them: RS256 with the Keycloak/LTI public
-          # keys (keycloak_auth.py, lti13_service.py), HS256 only with
-          # server-side secrets (handoff_service.py, lti13_service.py).
-          # Same exit as above: PyJWT (.github#7 P).
-          poetry run pip-audit --strict --ignore-vuln PYSEC-2026-1325 --ignore-vuln CVE-2026-85394
+          # python-jose and its ecdsa dependency are gone (PyJWT, .github#7 P),
+          # and with them the two ignored advisories PYSEC-2026-1325 and
+          # CVE-2026-85394.
+          poetry run pip-audit --strict
 
       # Trivy fs runs twice on purpose:
       #   1. blocking gate — fails the job on HIGH/CRITICAL
