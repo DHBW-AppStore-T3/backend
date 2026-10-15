@@ -569,3 +569,23 @@ jobs:
             --ref main
         env:
           GH_TOKEN: ${{ secrets.DEPLOYMENT_PAT }}
+
+  # ================================================================
+  # ☸️ ROLL OUT ON K8S STAGING — spike/dev
+  # ================================================================
+  # The deployment repo pins the image just pushed (tag sha-<commit>) by its
+  # digest in k8s/env/appstore.yaml on its spike/dev; Argo CD's staging
+  # environment follows. Production only through k8s/promote.sh (a PR).
+  k8s-staging:
+    name: "☸️ Roll out on k8s staging"
+    runs-on: ubuntu-latest
+    needs: [push]
+    if: github.ref == 'refs/heads/spike/dev' && github.event_name == 'push'
+
+    steps:
+      - name: Pin the new image in the deployment repo
+        run: |
+          gh workflow run k8s-bump.yml --repo DHBW-AppStore-T3/deployment --ref spike/dev \
+            -f component=backend -f tag="sha-${GITHUB_SHA::7}"
+        env:
+          GH_TOKEN: ${{ secrets.DEPLOYMENT_PAT }}
