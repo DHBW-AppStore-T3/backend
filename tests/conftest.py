@@ -425,3 +425,43 @@ def create_app_in_db(db, user, *, name="Test App", git_link="https://github.com/
     db.commit()
     db.refresh(db_app)
     return db_app
+
+
+TEST_PROJECT = "project-1"
+
+
+def add_credential(
+    db,
+    user,
+    project_id=TEST_PROJECT,
+    *,
+    project_name="Projekt 1",
+    identifier="app-cred-id",
+    verified=True,
+    auth_url="https://keystone.example/v3",
+    credential_id=None,
+):
+    """A stored application credential of ``user`` for ``project_id``.
+
+    ``verified=False`` is a credential from before projects were taken from
+    Keystone (``project_id`` is whatever was typed).
+    """
+    from app.models import OpenStackAuthType, UserOpenStackCredential
+    from app.utils import crypto
+
+    row = UserOpenStackCredential(
+        credentialId=credential_id or uuid.uuid4(),
+        userId=user.userId,
+        auth_type=OpenStackAuthType.APPLICATION_CREDENTIAL,
+        auth_url=auth_url,
+        region_name="RegionOne",
+        project_id=project_id,
+        project_name=project_name,
+        project_verified=verified,
+        encrypted_identifier=crypto.encrypt(identifier),
+        encrypted_secret=crypto.encrypt("app-cred-secret"),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row

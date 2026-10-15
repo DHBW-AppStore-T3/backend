@@ -15,11 +15,10 @@ import pytest
 from app.models import (
     App,
     Deployment,
-    OpenStackAuthType,
     User,
-    UserOpenStackCredential,
     UserRole,
 )
+from tests.conftest import add_credential
 
 
 def _b64(b: bytes) -> str:
@@ -27,19 +26,7 @@ def _b64(b: bytes) -> str:
 
 
 def _ensure_user_credentials(db, user):
-    from app.utils import crypto
-
-    db.add(
-        UserOpenStackCredential(
-            credentialId=uuid.uuid4(),
-            userId=user.userId,
-            auth_type=OpenStackAuthType.APPLICATION_CREDENTIAL,
-            auth_url="https://keystone.example/v3",
-            encrypted_identifier=crypto.encrypt("test-id"),
-            encrypted_secret=crypto.encrypt("test-secret"),
-        )
-    )
-    db.commit()
+    return add_credential(db, user)
 
 
 def _ensure_app(db, user) -> App:
@@ -73,7 +60,7 @@ def patched_celery():
 def test_post_deployment_persists_files_under_terraform(
     client, db, mock_user, patched_celery
 ):
-    _ensure_user_credentials(db, mock_user)
+    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     pdf = b"%PDF-1.4\n%fake pdf bytes for the test\n"
@@ -81,6 +68,7 @@ def test_post_deployment_persists_files_under_terraform(
         "name": "with-files",
         "appId": str(app.appId),
         "releaseTag": "v1",
+        "credentialId": str(cred.credentialId),
         "userInputVar": {"terraform": {"some_other": "x"}, "packer": {}},
         "files": {
             "task_pdf": {
@@ -131,7 +119,7 @@ def test_post_deployment_413_when_single_file_too_large(
     client, db, mock_user, patched_celery
 ):
     """One file over 2 MB → 413, no row created, no celery dispatch."""
-    _ensure_user_credentials(db, mock_user)
+    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     big = b"x" * (2 * 1024 * 1024 + 10)
@@ -141,6 +129,7 @@ def test_post_deployment_413_when_single_file_too_large(
             "name": "too-big",
             "appId": str(app.appId),
             "releaseTag": "v1",
+            "credentialId": str(cred.credentialId),
             "files": {
                 "task_pdf": {
                     "all": {
@@ -167,7 +156,7 @@ def test_post_deployment_413_when_single_file_too_large(
 def test_post_deployment_422_on_invalid_base64(
     client, db, mock_user, patched_celery
 ):
-    _ensure_user_credentials(db, mock_user)
+    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     response = client.post(
@@ -176,6 +165,7 @@ def test_post_deployment_422_on_invalid_base64(
             "name": "bad-b64",
             "appId": str(app.appId),
             "releaseTag": "v1",
+            "credentialId": str(cred.credentialId),
             "files": {
                 "task_pdf": {
                     "all": {
@@ -196,7 +186,7 @@ def test_post_deployment_422_on_invalid_base64(
 def test_detail_endpoint_strips_file_bytes(
     client, db, mock_user, patched_celery
 ):
-    _ensure_user_credentials(db, mock_user)
+    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     pdf = b"PDF data" * 100
@@ -206,6 +196,7 @@ def test_detail_endpoint_strips_file_bytes(
             "name": "stripped-detail",
             "appId": str(app.appId),
             "releaseTag": "v1",
+            "credentialId": str(cred.credentialId),
             "files": {
                 "task_pdf": {
                     "all": {
@@ -230,7 +221,7 @@ def test_detail_endpoint_strips_file_bytes(
 def test_download_endpoint_returns_owner_bytes(
     client, db, mock_user, patched_celery
 ):
-    _ensure_user_credentials(db, mock_user)
+    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     payload_bytes = b"hello, world\n" * 10
@@ -240,6 +231,7 @@ def test_download_endpoint_returns_owner_bytes(
             "name": "downloadable",
             "appId": str(app.appId),
             "releaseTag": "v1",
+            "credentialId": str(cred.credentialId),
             "files": {
                 "task_pdf": {
                     "all": {
@@ -265,7 +257,7 @@ def test_download_endpoint_returns_owner_bytes(
 def test_download_endpoint_404_for_unknown_slot(
     client, db, mock_user, patched_celery
 ):
-    _ensure_user_credentials(db, mock_user)
+    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     payload_bytes = b"x" * 32
@@ -275,6 +267,7 @@ def test_download_endpoint_404_for_unknown_slot(
             "name": "with-one-slot",
             "appId": str(app.appId),
             "releaseTag": "v1",
+            "credentialId": str(cred.credentialId),
             "files": {
                 "task_pdf": {
                     "all": {
@@ -305,7 +298,7 @@ def test_download_endpoint_member_403(
 ):
     """A team member with read-access to the deployment must NOT be
     able to fetch file bytes — only the owner-view does."""
-    _ensure_user_credentials(db, mock_user)
+    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     payload_bytes = b"secret" * 100
@@ -315,6 +308,7 @@ def test_download_endpoint_member_403(
             "name": "owner-only-download",
             "appId": str(app.appId),
             "releaseTag": "v1",
+            "credentialId": str(cred.credentialId),
             "files": {
                 "task_pdf": {
                     "all": {

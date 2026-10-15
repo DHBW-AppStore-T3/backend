@@ -26,6 +26,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.crud import app_version_approvals as crud_approvals
+from app.crud import openstack_credentials as crud_openstack_credentials
 from app.models import App, Course, CourseTeacher, Deployment, User, UserRole
 from app.utils.permissions import (
     STAFF_ROLES,
@@ -192,13 +193,27 @@ def ensure_view_deployment_member(user: User, dep: Deployment, db: Session) -> N
         raise _forbidden("deployment_view_forbidden")
 
 
+def is_project_peer(user: User, dep: Deployment, db: Session) -> bool:
+    """Whether ``user`` holds an own verified credential for the VM deployment's project.
+
+    dhbw-appstore's peer model: whoever can reach the OpenStack project the
+    deployment lives in can see and run it anyway, so the app does not
+    pretend otherwise. Project ids come from Keystone tokens only
+    (``crud.openstack_credentials``), so this cannot be claimed.
+    """
+    project_id = getattr(dep, "os_project_id", None)
+    if not project_id:
+        return False
+    return crud_openstack_credentials.holds_project(db, user.userId, project_id)
+
+
 def can_view_deployment_owner(user: User, dep: Deployment, db: Session) -> bool:
     """Owner-view access — tasks, logs, terraform state, destroy.
 
-    Read access is granted to the deployment owner, admins, and
-    course-teachers of the owner's course (inspect only) when the owner is
-    a student. Operate rights are separate — see
-    :func:`can_operate_deployment`.
+    Read access is granted to the deployment owner, its project peers
+    (:func:`is_project_peer`), admins, and course-teachers of the owner's
+    course (inspect only) when the owner is a student. Operate rights are
+    separate — see :func:`can_operate_deployment`.
 
     The course-teacher right never covers another teacher's or an admin's
     deployment (.github#7 F, security review H-1): a teacher who manages a
@@ -209,6 +224,8 @@ def can_view_deployment_owner(user: User, dep: Deployment, db: Session) -> bool:
     if user.role == UserRole.ADMIN:
         return True
     if str(dep.userId) == str(user.userId):
+        return True
+    if is_project_peer(user, dep, db):
         return True
 
     # Course-teacher inspect right applies only to teachers; other
@@ -230,9 +247,14 @@ def ensure_view_deployment_owner(user: User, dep: Deployment, db: Session) -> No
 
 
 def can_operate_deployment(user: User, dep: Deployment, db: Session) -> bool:
-    """Pause / Resume / Destroy / Redeploy on a deployment. Owner or admin only."""
-    del db
-    return _is_admin(user) or _is_owner(user, dep.userId)
+    """Pause / Resume / Destroy / Redeploy / Cancel: the owner or a project peer.
+
+    Every action runs with the caller's own credential for the
+    deployment's project, never with the owner's, so admins are read-only
+    on VM deployments unless they hold a credential for the project
+    themselves (dhbw-appstore's model).
+    """
+    return _is_owner(user, dep.userId) or is_project_peer(user, dep, db)
 
 
 def ensure_operate_deployment(user: User, dep: Deployment, db: Session) -> None:

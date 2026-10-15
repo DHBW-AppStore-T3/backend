@@ -15,12 +15,11 @@ import pytest
 from app.models import (
     App,
     Deployment,
-    OpenStackAuthType,
     Task,
     TaskStatus,
     TaskType,
-    UserOpenStackCredential,
 )
+from tests.conftest import TEST_PROJECT, add_credential
 
 
 def _make_deployment_with_creds(
@@ -37,7 +36,6 @@ def _make_deployment_with_creds(
     before the dispatch path even runs. The cleartext doesn't matter
     for these tests — Celery is patched out.
     """
-    from app.utils import crypto
 
     app = App(
         appId=uuid.uuid4(),
@@ -54,6 +52,7 @@ def _make_deployment_with_creds(
         appId=app.appId,
         userId=user.userId,
         releaseTag="v1.0.0",
+        os_project_id=TEST_PROJECT,
         userInputVar=json.dumps({"terraform": {}, "packer": {}}),
     )
     db.add(deployment)
@@ -69,17 +68,8 @@ def _make_deployment_with_creds(
         )
     )
 
-    db.add(
-        UserOpenStackCredential(
-            credentialId=uuid.uuid4(),
-            userId=user.userId,
-            auth_type=OpenStackAuthType.APPLICATION_CREDENTIAL,
-            auth_url="https://keystone.example/v3",
-            encrypted_identifier=crypto.encrypt("test-id"),
-            encrypted_secret=crypto.encrypt("test-secret"),
-        )
-    )
     db.commit()
+    add_credential(db, user)
     db.refresh(deployment)
     return deployment
 

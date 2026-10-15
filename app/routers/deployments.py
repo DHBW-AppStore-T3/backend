@@ -39,9 +39,11 @@ from app.schemas import (
 )
 from app.services import (
     access,
+    openstack_client,
     task_events,
     task_finalizer,
     task_results,
+    tf_state_store,
 )
 from app.services import lifecycle as lifecycle_service
 from app.services import task_service as task_service_module
@@ -55,6 +57,7 @@ from app.services.deployment_status import (
     build_resource_detail,
     build_resource_views,
 )
+from app.services.openstack_validator import auth_url_allowed
 from app.services.tf_state_parser import parse_tf_state
 from app.task_contract import (
     EVENT_FAILED,
@@ -64,6 +67,7 @@ from app.task_contract import (
     TERMINAL_EVENTS,
     terminal_payload,
 )
+from app.utils import crypto
 from app.utils.capabilities import (
     can_view_deployment_owner,
     ensure_deploy,
@@ -102,6 +106,8 @@ def list_deployments(
       * **Students** (and any non-staff role): deployments they own
         OR are a member of — either via a team mapping or a direct
         ``UserToDeployment`` row.
+      * Either way also every VM deployment in an OpenStack project the
+        caller holds a verified credential for (project peers).
 
     A ``?scope=course`` branch used to sit here, listing every
     deployment whose owner was in a course the caller teaches. It had
@@ -112,6 +118,7 @@ def list_deployments(
     endpoint with a working filter and tests, not this.
     """
     is_staff = current_user.role in (UserRole.TEACHER, UserRole.ADMIN)
+    peer_project_ids = crud_openstack_credentials.project_ids_of(db, current_user.userId)
 
     if is_staff:
         deployments = crud_deployments.get_deployments(
@@ -119,6 +126,7 @@ def list_deployments(
             skip=skip,
             limit=limit,
             user_id=current_user.userId,
+            peer_project_ids=peer_project_ids,
             app_id=app_id,
             status=status_filter,
         )
@@ -128,6 +136,7 @@ def list_deployments(
             skip=skip,
             limit=limit,
             member_user_id=current_user.userId,
+            peer_project_ids=peer_project_ids,
             app_id=app_id,
             status=status_filter,
         )
@@ -166,6 +175,7 @@ def list_deployments(
             userId=deployment.userId,
             releaseTag=deployment.releaseTag,
             commit_sha=deployment.commit_sha,
+            os_project_id=deployment.os_project_id,
             userInputVar=user_input_var_parsed,
             status=status_value,
             created_at=first_created_at,
@@ -292,6 +302,7 @@ def get_deployment(
         userId=deployment.userId,
         releaseTag=deployment.releaseTag,
         commit_sha=deployment.commit_sha,
+        os_project_id=deployment.os_project_id,
         userInputVar=user_input_var_parsed,
         status=status_value,
         created_at=created_at,
@@ -329,10 +340,17 @@ def create_deployment(
     # Teams are lists of existing users, each in at most one team.
     _validate_teams(db, deployment.teams or [])
 
-    # Per-user lock — serializes against PUT /me/openstack-credentials
-    # and any other concurrent POST /deployments from this user. Held
-    # until the next COMMIT/ROLLBACK on this connection.
+    # Per-user lock — serializes against POST/DELETE
+    # /me/openstack-credentials and any other concurrent POST /deployments
+    # from this user. Held until the next COMMIT/ROLLBACK on this connection.
     crud_locks.acquire_user_xact_lock(db, current_user.userId)
+
+    # The deployment lives in the project of the credential the caller
+    # picked; it must be theirs and its project confirmed by Keystone,
+    # because the project decides who the deployment's peers are. Read
+    # inside the locked TX, so a concurrent change of the credential is
+    # serialized behind us.
+    credential = openstack_client.deploy_credential(db, current_user, deployment.credentialId)
 
     # Refuse the create if the target app is soft-deleted.
     target_app = crud_apps.get_app(db, deployment.appId)
@@ -397,7 +415,7 @@ def create_deployment(
         )
 
     db_deployment = crud_deployments.create_deployment(
-        db, deployment, current_user.userId, commit_sha
+        db, deployment, current_user.userId, commit_sha, os_project_id=credential.project_id
     )
 
     user_ids_in_deployment = set()
@@ -442,14 +460,8 @@ def create_deployment(
                     team_users.append(_member_entry(user))
             teams_dict[team.name] = team_users
 
-    # Per-user OpenStack credentials are required to deploy. The envelope
-    # carries ciphertext only — the worker decrypts in-process. Reading
-    # this inside the locked TX guarantees the envelope matches whatever
-    # credential row a concurrent PUT might have committed: PUT is
-    # serialized behind us by the same advisory lock.
-    openstack_envelope = _fetch_dispatch_envelope(
-        db, current_user.userId, rollback_on_missing=True
-    )
+    # The envelope carries ciphertext only — the worker decrypts in-process.
+    openstack_envelope = _dispatch_envelope(db, credential, rollback=True)
 
     # Insert PENDING task row in the SAME transaction as the deployment,
     # commit atomically (deployment + teams + user_to_deployments + task),
@@ -484,6 +496,7 @@ def create_deployment(
         userId=db_deployment.userId,
         releaseTag=db_deployment.releaseTag,
         commit_sha=db_deployment.commit_sha,
+        os_project_id=db_deployment.os_project_id,
         userInputVar=user_input_var_parsed,
         status=status_value,
         created_at=created_at,
@@ -574,24 +587,35 @@ def delete_deployment(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-def _fetch_dispatch_envelope(db: Session, user_id, *, rollback_on_missing: bool):
-    """Fetch the encrypted OpenStack credential envelope for a dispatch.
+def _dispatch_envelope(db: Session, credential, *, rollback: bool = False) -> dict:
+    """The encrypted envelope of ``credential`` for a job.
 
-    Raises ``HTTPException(412, openstack_credentials_missing)`` when the
-    user has no credentials. ``rollback_on_missing`` is used by the
-    create path, which holds an uncommitted deployment insert that must
-    be rolled back before the 412 escapes; lifecycle callers have no such
-    pending insert and pass ``False``.
+    422 ``auth_url_not_allowed`` when its Keystone URL is not (or no
+    longer) on the allowlist: the worker would send the login there
+    (.github#7 C). ``rollback`` is for the create path, which holds an
+    uncommitted deployment insert that must not survive the error.
     """
-    try:
-        return crud_openstack_credentials.get_dispatch_envelope(db, user_id)
-    except crud_openstack_credentials.NoCredentialError:
-        if rollback_on_missing:
+    if not auth_url_allowed(credential.auth_url):
+        if rollback:
             db.rollback()
         raise HTTPException(
-            status_code=status.HTTP_412_PRECONDITION_FAILED,
-            detail={"reason": "openstack_credentials_missing"},
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "auth_url_not_allowed"},
         )
+    return crud_openstack_credentials.dispatch_envelope(credential)
+
+
+def _fetch_dispatch_envelope(db: Session, user: User, deployment) -> dict:
+    """The caller's own credential envelope for the deployment's project.
+
+    Lifecycle actions run with the credential of whoever triggers them,
+    never with the owner's (dhbw-appstore's model): 403
+    ``openstack_credentials_missing_for_project`` without one, 409
+    ``deployment_project_unknown`` for an old deployment whose project is
+    not known yet (``openstack_client.project_credential``).
+    """
+    row = openstack_client.project_credential(db, user, deployment.os_project_id)
+    return _dispatch_envelope(db, row)
 
 
 def _validate_teams(db: Session, teams) -> None:
@@ -694,6 +718,10 @@ def _commit_and_dispatch(
     ``after_task_id`` parks the message until that task's worker has let
     go of it (cancel → destroy).
 
+    Every task gets a fresh state token for OpenTofu's HTTP backend
+    (``services/tf_state_store``): the row keeps its hash, the job message
+    carries it Fernet-sealed as ``state_token_enc``.
+
     Returns the committed, dispatched ``Task``.
     """
     try:
@@ -709,6 +737,7 @@ def _commit_and_dispatch(
             status_code=status.HTTP_409_CONFLICT,
             detail="Deployment already has an active task",
         )
+    state_token = tf_state_store.issue_token(task)
 
     db.commit()
     db.refresh(task)
@@ -718,7 +747,7 @@ def _commit_and_dispatch(
             db,
             task=task,
             celery_task_name=celery_task_name,
-            celery_kwargs=celery_kwargs,
+            celery_kwargs={**celery_kwargs, "state_token_enc": crypto.encrypt_b64(state_token)},
             after_task_id=after_task_id,
         )
     except Exception:
@@ -835,9 +864,7 @@ def _dispatch_lifecycle_task(
             members = crud_deployments.get_team_members(db, team.teamId)
             teams_dict[team.name] = [_member_entry(m) for m in members]
 
-    openstack_envelope = _fetch_dispatch_envelope(
-        db, current_user.userId, rollback_on_missing=False
-    )
+    openstack_envelope = _fetch_dispatch_envelope(db, current_user, deployment)
     _pin_legacy_commit(db, deployment)
 
     task = _commit_and_dispatch(
@@ -909,16 +936,17 @@ _TF_ADDRESS_RE = re.compile(
 
 
 def _latest_tf_state_for(deployment_id: UUID, db: Session) -> str | None:
-    """Return the JSON blob of the most recent task that captured a
-    Terraform state for this deployment, or None when no apply ever
-    succeeded yet.
+    """The deployment's OpenTofu state as JSON, or None before the first apply.
 
-    Note: we deliberately do NOT filter by ``task.type`` — the worker
-    captures state on deploy / destroy / pause / resume / redeploy
-    alike, and any of those produce a valid snapshot. The "most
-    recent" task wins, mirroring the existing ``get_deployment_outputs``
-    semantics in ``crud/deployments.py``.
+    Read from the state backend's own table (``services/tf_state_store``):
+    it is what OpenTofu last wrote, not a copy some task took along the
+    way. Deployments whose state was not moved there yet
+    (``app.import_pg_tfstate``) fall back to the copy of their most recent
+    task that captured one.
     """
+    state = tf_state_store.read(db, deployment_id)
+    if state is not None:
+        return state
     candidates = (
         db.query(TaskModel)
         .filter(TaskModel.deploymentId == deployment_id)
@@ -960,11 +988,18 @@ def list_deployment_resources(
     ensure_view_deployment_owner(current_user, deployment, db)
 
     state_json = _latest_tf_state_for(deployment_id, db)
+    # Live data is fetched with the caller's own credential for the project,
+    # never the owner's. Without one (an admin or a course teacher reading)
+    # the cached state is shown.
+    live = refresh and crud_openstack_credentials.holds_project(
+        db, current_user.userId, deployment.os_project_id
+    )
     views = build_resource_views(
         db=db,
         user=current_user,
+        project_id=deployment.os_project_id,
         tf_state_json=state_json,
-        refresh=refresh,
+        refresh=live,
     )
     # Convert dataclasses → Pydantic models via dict-roundtrip. The
     # fields line up 1:1 by name, so ``model_validate`` works directly
@@ -973,7 +1008,7 @@ def list_deployment_resources(
         DeploymentResourceSchema.model_validate(_view_asdict(v))
         for v in views
     ]
-    return DeploymentResourceListResponse(resources=payload, live=refresh)
+    return DeploymentResourceListResponse(resources=payload, live=live)
 
 
 @router.get(
@@ -1011,9 +1046,11 @@ def get_deployment_resource_detail(
         )
 
     state_json = _latest_tf_state_for(deployment_id, db)
+    # Always live; 403 without an own credential for the project.
     view = build_resource_detail(
         db=db,
         user=current_user,
+        project_id=deployment.os_project_id,
         tf_state_json=state_json,
         address=address,
     )

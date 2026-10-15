@@ -21,14 +21,14 @@ UI can still render something.
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from sqlalchemy.orm import Session
 
 from app.models import User
-from app.services.openstack_client import user_connection
+from app.services.openstack_client import project_connection
 from app.services.tf_state_parser import TfResource, parse_tf_state
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 # latency is ``max(per_call)`` not ``sum(per_call)``.
 _PER_SERVER_TIMEOUT_S = 5.0
 _MAX_PARALLEL_FETCHES = 8
+# Budget for all stage-1 fetches of one request: with 8 in parallel, four
+# rounds of per-server timeouts, enough for ~30 VMs.
+_STAGE1_BUDGET_S = _PER_SERVER_TIMEOUT_S * 4
 
 
 # Live-status enums kept narrow so the frontend can switch on them.
@@ -77,8 +80,11 @@ class HardwareSpec:
 
 @dataclass
 class NetworkAddress:
-    """One entry per NIC × IP. Networks with multiple addresses (fixed
-    + floating) show up as several rows under the same network name."""
+    """One row per network the server is attached to.
+
+    A fixed and a floating IP on the same network share one row (see
+    ``_addresses_from``); further addresses on that network are not shown.
+    """
     network: str
     fixed_ip: str | None = None
     floating_ip: str | None = None
@@ -146,10 +152,15 @@ def build_resource_views(
     *,
     db: Session,
     user: User,
+    project_id: str,
     tf_state_json: str | None,
     refresh: bool,
 ) -> list[DeploymentResourceView]:
     """Parse the cached state and (when refresh=True) overlay live data.
+
+    Stage 1, for the resource list. Live data is fetched with the caller's
+    own credential for ``project_id`` (see ``project_connection``, which
+    raises if the caller has none). Returns ``[]`` for missing/empty state.
 
     Non-compute resources travel through with TF-cached data only;
     the UI shows them in read-only network/security sections, where
@@ -170,9 +181,9 @@ def build_resource_views(
     if not instance_views:
         return views
 
-    # Single connection, reused across the fan-out. Closing it on
-    # exit happens in the user_connection contextmanager.
-    with user_connection(db, user) as conn:
+    # Single connection with the caller's own credential for the project,
+    # reused across the fan-out; closed by the contextmanager.
+    with project_connection(db, user, project_id) as conn:
         _enrich_instances_stage1(conn, instance_views)
     return views
 
@@ -198,42 +209,43 @@ def _enrich_instances_stage1(
 
     Mutates ``instance_views`` in place. Failures are absorbed per-VM:
     the view degrades to ``drift = stale`` / ``drift = missing`` and
-    other VMs continue.
+    other VMs continue. The whole fan-out has one time budget; VMs still
+    unanswered then are ``stale`` and the response does not wait for them.
     """
-    def _one(view: DeploymentResourceView) -> None:
-        try:
-            server = conn.compute.find_server(view.provider_id, ignore_missing=True)
-        except Exception as exc:  # noqa: BLE001 — SDK + transport
-            logger.warning(
-                "stage1: find_server(%s) failed: %s", view.provider_id, exc
-            )
-            view.drift = "stale"
-            return
-        if server is None:
-            view.drift = "missing"
-            return
-        view.lifecycle = _lifecycle_from(server)
-        view.hardware = _hardware_from(server)
-        view.addresses = _addresses_from(server)
+    def _one(view: DeploymentResourceView) -> Any:
+        # Returns the server (or None) instead of writing the view, so a
+        # call that finishes after the budget cannot change a view that is
+        # already being serialised.
+        return conn.compute.find_server(view.provider_id, ignore_missing=True)
 
-    # ThreadPool fans out the per-server calls with a per-call timeout
-    # via ``Future.result(timeout=...)``. A timed-out future is
-    # abandoned (the underlying HTTP request isn't cancelled).
     if not instance_views:
         return
     workers = min(_MAX_PARALLEL_FETCHES, len(instance_views))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
         futures = {pool.submit(_one, v): v for v in instance_views}
-        for fut in as_completed(futures, timeout=_PER_SERVER_TIMEOUT_S * 4):
+        done, _pending = wait(futures, timeout=_STAGE1_BUDGET_S)
+        for fut, view in futures.items():
+            if fut not in done:
+                logger.warning("stage1: find_server(%s) timed out", view.provider_id)
+                view.drift = "stale"
+                continue
             try:
-                fut.result(timeout=_PER_SERVER_TIMEOUT_S)
-            except Exception as exc:  # noqa: BLE001
-                view = futures[fut]
-                logger.warning(
-                    "stage1 timeout/error for %s: %s", view.provider_id, exc
-                )
-                if view.drift == "in_sync":
-                    view.drift = "stale"
+                server = fut.result()
+            except Exception as exc:  # noqa: BLE001 — SDK + transport
+                logger.warning("stage1: find_server(%s) failed: %s", view.provider_id, exc)
+                view.drift = "stale"
+                continue
+            if server is None:
+                view.drift = "missing"
+                continue
+            view.lifecycle = _lifecycle_from(server)
+            view.hardware = _hardware_from(server)
+            view.addresses = _addresses_from(server)
+    finally:
+        # A hung SDK call cannot be interrupted; abandon it rather than let
+        # the request wait for it (queued calls are dropped).
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 # ----------------------------------------------------------------
@@ -243,6 +255,7 @@ def build_resource_detail(
     *,
     db: Session,
     user: User,
+    project_id: str,
     tf_state_json: str | None,
     address: str,
 ) -> DeploymentResourceView | None:
@@ -250,7 +263,9 @@ def build_resource_detail(
     volumes, resolved image name, full metadata).
 
     Returns None if the address isn't a known instance in the cached
-    state — the endpoint translates that into a 404.
+    state — the endpoint translates that into a 404. Always hits OpenStack
+    (no cache flag); a server that cannot be fetched comes back with
+    ``drift`` set and the stage-2 fields left None.
     """
     cached = parse_tf_state(tf_state_json)
     target = next((r for r in cached if r.address == address), None)
@@ -258,7 +273,7 @@ def build_resource_detail(
         return None
 
     view = _view_from_cached(target)
-    with user_connection(db, user) as conn:
+    with project_connection(db, user, project_id) as conn:
         try:
             server = conn.compute.find_server(
                 target.provider_id, ignore_missing=True
@@ -294,6 +309,7 @@ def build_resource_detail(
 
 
 def _fetch_ports(conn: Any, server_id: str) -> list[NetworkPort]:
+    """List the server's Neutron ports (first fixed IP each); ``[]`` on failure."""
     out: list[NetworkPort] = []
     try:
         ports = list(conn.network.ports(device_id=server_id))
@@ -406,6 +422,7 @@ def _fetch_volumes(conn: Any, server_id: str) -> list[VolumeAttachment]:
 
 
 def _resolve_image_name(conn: Any, image_id: str) -> str | None:
+    """Look up the image's name in Glance; None if unknown or the lookup fails."""
     try:
         img = conn.image.find_image(image_id, ignore_missing=True)
     except Exception as exc:  # noqa: BLE001
@@ -420,8 +437,8 @@ def _resolve_image_name(conn: Any, image_id: str) -> str | None:
 def _lifecycle_from(server: Any) -> LifecycleStates:
     """Pull the four lifecycle states + fault message from a server.
 
-    Tries the canonical snake_case attribute first, falling back to the
-    raw ``OS-EXT-*`` keys, so it's robust to either SDK flavor.
+    Reads the SDK's snake_case attributes; ``fault`` may be a dict or an
+    object depending on the SDK version, both are handled.
     """
     status = getattr(server, "status", None)
     fault = None
@@ -455,6 +472,7 @@ _POWER_STATE_LABELS = {
 
 
 def _translate_power_state(raw: Any) -> str | None:
+    """Map Nova's integer power state to its label; strings pass through."""
     if raw is None:
         return None
     if isinstance(raw, str):
@@ -465,6 +483,11 @@ def _translate_power_state(raw: Any) -> str | None:
 
 
 def _hardware_from(server: Any) -> HardwareSpec:
+    """Read flavor, image id, AZ and launch time from a server (stage 1).
+
+    Uses the flavor embedded in the server (microversion >= 2.47), so no
+    extra flavor lookup is needed; ``image_name`` is left for stage 2.
+    """
     flavor = getattr(server, "flavor", None) or {}
     if not isinstance(flavor, dict):
         # SDK may return a Munch / typed object — coerce best-effort
@@ -493,9 +516,9 @@ def _addresses_from(server: Any) -> list[NetworkAddress]:
     """Flatten the ``addresses`` dict into one row per (network, IP).
 
     OpenStack's ``addresses`` is ``{network_name: [{"addr": ..., "type":
-    "fixed"|"floating", ...}, ...]}``. We pair fixed and floating IPs
-    that share the same network name into a single row when both
-    exist, otherwise emit one row per address.
+    "fixed"|"floating", ...}, ...]}``. Emits exactly one row per network:
+    its first fixed IP (with MAC) and its floating IP (the last one, if
+    several). Additional fixed IPs on the same network are dropped.
     """
     raw = getattr(server, "addresses", None) or {}
     if not isinstance(raw, dict):

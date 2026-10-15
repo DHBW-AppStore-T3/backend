@@ -244,11 +244,13 @@ def test_create_team_member_rules(db, mock_user, mock_student):
 # PUT / DELETE /teams/{team_id}
 # ---------------------------------------------------------------------------
 @pytest.mark.integration
-def test_rename_and_delete_owner_and_admin_ok(db, mock_admin, mock_user):
+def test_rename_and_delete_owner_ok_admin_read_only(db, mock_admin, mock_user):
     dep = _make_deployment(db, mock_user)
     team = _make_team(db, name="Before", deployment=dep)
 
-    assert _call(mock_admin, "put", f"/teams/{team.teamId}", json={"name": "Admin"}).status_code == 200
+    # Admins are read-only on VM deployments (they hold no credential for
+    # the project, and every change applies with one).
+    assert _call(mock_admin, "put", f"/teams/{team.teamId}", json={"name": "Admin"}).status_code == 403
     assert _call(mock_user, "put", f"/teams/{team.teamId}", json={"name": "Owner"}).status_code == 200
     db.expire_all()
     assert db.get(Team, team.teamId).name == "Owner"

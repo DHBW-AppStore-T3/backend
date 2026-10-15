@@ -114,10 +114,10 @@ class User(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
-    openstack_credential = relationship(
+    # One credential per OpenStack project (dhbw-appstore's model).
+    openstack_credentials = relationship(
         "UserOpenStackCredential",
         back_populates="user",
-        uselist=False,
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
@@ -171,6 +171,13 @@ class Deployment(Base):
     # The commit ``releaseTag`` pointed to when the deployment was created.
     # Every job of the deployment runs exactly this commit (.github#7 G).
     commit_sha = Column(String(40), nullable=True)
+    # VM deployments: the OpenStack project of the credential they were
+    # created with (as Keystone scoped it). Everyone holding an own verified
+    # credential for this project is a peer: owner view and operate, each
+    # with their own credential. None for pod deployments, and for VM
+    # deployments made before projects were verified until their owner's
+    # old credential is re-checked (``crud.openstack_credentials``).
+    os_project_id = Column(String, nullable=True, index=True)
     userInputVar = Column(Text, nullable=True)  # could also be JSON
     userId = Column(UUID(as_uuid=True), ForeignKey("users.userId"), nullable=False, index=True)
     appId = Column(UUID(as_uuid=True), ForeignKey("apps.appId"), nullable=False, index=True)
@@ -252,6 +259,10 @@ class Task(Base):
     # worker reported them (``app.services.task_results``). Replaces the
     # plaintext ``outputs``/``tf_state`` for tasks run since .github#5.
     outputs_enc = Column(LargeBinary, nullable=True)
+    # SHA-256 of the random token that lets this task's OpenTofu reach the
+    # state of its deployment through ``/internal/tfstate`` while the task
+    # is RUNNING. The token itself travels sealed in the job message only.
+    state_token_hash = Column(String(64), nullable=True)
 
     __table_args__ = (
         # At most one PENDING/RUNNING task per deployment: the database
@@ -313,6 +324,33 @@ class TaskEvent(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 
     __table_args__ = (Index("ix_task_events_task", "task_id", "id"),)
+
+
+# ----------------------------------------------------------------
+# TERRAFORM STATE MODEL
+# ----------------------------------------------------------------
+# The OpenTofu state of one VM deployment, written and read by OpenTofu
+# through the API's HTTP state backend (``routers/internal_tfstate``), never
+# by the worker directly; the job holds no database credentials. It lists
+# every resource with its attributes, generated passwords included, so it is
+# stored Fernet-encrypted. Deleted once a destroy has succeeded.
+class TerraformState(Base):
+    __tablename__ = "terraform_states"
+
+    deploymentId = Column(
+        UUID(as_uuid=True),
+        ForeignKey("deployments.deploymentId", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    state = Column(LargeBinary, nullable=True)  # Fernet, JSON inside
+    # OpenTofu's lock: its id, the lock info it sent (returned to a
+    # competing client) and the task that took it. A lock whose task no
+    # longer runs is stale and may be taken over, so a worker that died
+    # mid-apply cannot block the deployment for good.
+    lock_id = Column(String, nullable=True)
+    lock_info = Column(Text, nullable=True)
+    lock_task_id = Column(UUID(as_uuid=True), nullable=True)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 # ----------------------------------------------------------------
@@ -401,7 +439,6 @@ class UserOpenStackCredential(Base):
         UUID(as_uuid=True),
         ForeignKey("users.userId", ondelete="CASCADE"),
         nullable=False,
-        unique=True,
         index=True,
     )
     auth_type = Column(
@@ -418,10 +455,18 @@ class UserOpenStackCredential(Base):
     region_name = Column(String, nullable=True)
     interface = Column(String, nullable=True, default="public")
     identity_api_version = Column(String, nullable=True, default="3")
-    project_id = Column(String, nullable=True)
+    # The project Keystone scoped the token to, once ``project_verified``:
+    # it decides who is a project peer, so a typed value must never count.
+    # For password auth it is also the scope requested at login.
+    project_id = Column(String, nullable=True, index=True)
     project_name = Column(String, nullable=True)
     user_domain_name = Column(String, nullable=True)
     project_domain_name = Column(String, nullable=True)
+    # True once ``project_id`` came from a Keystone token. Credentials saved
+    # before projects were taken from Keystone carry whatever the user typed
+    # (an application credential ignores it entirely), so they are False
+    # until re-checked and count for nobody's project.
+    project_verified = Column(Boolean, nullable=False, default=False, server_default=text("false"))
 
     # Encrypted (Fernet ciphertext) — never logged, never returned via API
     encrypted_identifier = Column(LargeBinary, nullable=False)
@@ -432,7 +477,20 @@ class UserOpenStackCredential(Base):
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
-    user = relationship("User", back_populates="openstack_credential")
+    __table_args__ = (
+        # One verified credential per user and project; saving another one
+        # for the same project replaces it (that is how a secret is rotated).
+        # Unverified old rows stay out of it until re-checked.
+        Index(
+            "uq_user_openstack_credentials_project",
+            "userId",
+            "project_id",
+            unique=True,
+            postgresql_where=text("project_verified"),
+        ),
+    )
+
+    user = relationship("User", back_populates="openstack_credentials")
 
 
 # ----------------------------------------------------------------

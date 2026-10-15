@@ -1,11 +1,13 @@
 """
-Read API for the OpenStack resources of the calling user.
+Read API for the OpenStack resources of one of the caller's credentials.
 
-Used by the wizard so the user no longer has to copy UUIDs from the
-Horizon dashboard. Each endpoint:
+Used by the wizard's resource picker (``@openstack:`` markers, plan E4) so
+the user no longer has to copy UUIDs from the Horizon dashboard. Mounted
+under ``/me/openstack-credentials/{credential_id}/resources``: the picker
+shows the project the deployment will be created in. Each endpoint:
 
-- Authenticates via Keycloak token
-- Obtains an OpenStack connection from the service layer (per-request)
+- Authenticates the caller and checks the credential is theirs (404 otherwise)
+- Obtains an OpenStack connection with that credential (per-request)
 - Caches the response 60 s process-locally (see ``services/openstack_client``)
 - Reduces the SDK object to a flat dict — only the fields that the
   frontend needs for display + selection. We do not want to leak SDK
@@ -13,19 +15,31 @@ Horizon dashboard. Each endpoint:
 
 Error strategy: 502 for OpenStack-side failures (no 500 — that is
 reserved for "backend bug"). The frontend then renders a banner
-"OpenStack not reachable, enter ID manually". 412 if credentials are missing.
+"OpenStack not reachable, enter ID manually".
 """
 
 from __future__ import annotations
 
 import logging
 from typing import Any
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import User
+from app.models import User, UserOpenStackCredential
+from app.schemas import (
+    AvailabilityZoneItem,
+    DescribedItem,
+    FlavorItem,
+    ImageItem,
+    KeypairItem,
+    NetworkItem,
+    RouterItem,
+    SubnetItem,
+    VolumeItem,
+)
 from app.services import openstack_client
 from app.utils.keycloak_auth import get_current_user_keycloak
 
@@ -38,9 +52,11 @@ router = APIRouter()
 # Helpers
 # ----------------------------------------------------------------
 def _safe_get(obj: Any, *names: str, default: Any = None) -> Any:
-    """
-    SDK objects are partly dict-like, partly property objects.
-    We try all passed names in order.
+    """Return the first non-None attribute of ``obj`` among ``names``, else ``default``.
+
+    SDK objects are partly dict-like, partly property objects, and the same
+    field has different names across API versions (``is_shared``/``shared``);
+    properties that raise on access are skipped.
     """
     for n in names:
         try:
@@ -52,19 +68,30 @@ def _safe_get(obj: Any, *names: str, default: Any = None) -> Any:
     return default
 
 
+def _credential(
+    credential_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_keycloak),
+) -> UserOpenStackCredential:
+    """Dependency: the caller's credential from the path; 404 for anyone else's."""
+    return openstack_client.owned_credential(db, current_user, credential_id)
+
+
 def _list_with_oserror(
-    user: User,
+    credential: UserOpenStackCredential,
     kind: str,
     filters: dict | None,
     fetch_fn,
 ) -> list[dict]:
-    """
-    Wrapper that runs ``fetch_fn`` through the TTL cache and
-    translates OpenStack exceptions into 502s.
+    """Run ``fetch_fn`` through the per-credential TTL cache under key ``(kind, filters)``.
+
+    HTTPExceptions (e.g. 502 ``openstack_unavailable`` from the connection,
+    400 from a fetch) pass through; any other error becomes 502
+    ``openstack_list_failed`` with the ``kind``.
     """
     try:
         return openstack_client.cached_list(
-            user_id=user.userId,
+            credential_id=credential.credentialId,
             kind=kind,
             filters=filters,
             fetch=fetch_fn,
@@ -73,48 +100,80 @@ def _list_with_oserror(
         raise
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "OpenStack list %s failed for user %s: %s", kind, user.userId, exc
+            "OpenStack list %s failed for credential %s: %s", kind, credential.credentialId, exc
         )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail={"reason": "openstack_list_failed", "kind": kind, "message": str(exc)},
-        )
+            detail={"reason": "openstack_list_failed", "kind": kind},
+        ) from None
 
 
 # ----------------------------------------------------------------
 # Cache-Refresh
 # ----------------------------------------------------------------
+# ``kind`` as the UI knows it (the ``@openstack:<kind>`` marker vocabulary)
+# → the cache kind the list endpoints below store under. Availability zones
+# are cached per service (``availability_zones_compute`` …), so their entry
+# is a prefix.
+_REFRESH_KINDS: dict[str, str] = {
+    "network": "networks",
+    "subnet": "subnets",
+    "flavor": "flavors",
+    "image": "images",
+    "keypair": "keypairs",
+    "security_group": "security_groups",
+    "floating_ip_pool": "floating_ip_pools",
+    "volume": "volumes",
+    "router": "routers",
+    "availability_zone": "availability_zones",
+}
+
+
 @router.post("/refresh", status_code=status.HTTP_204_NO_CONTENT)
-def refresh_cache(
-    kind: str | None = Query(default=None, description="Optional: nur diese Resource-Art invalidieren"),
-    current_user: User = Depends(get_current_user_keycloak),
+def refresh_resource_cache(
+    kind: str | None = Query(
+        default=None,
+        description="Only invalidate this kind: a marker kind such as network or security_group",
+    ),
+    credential: UserOpenStackCredential = Depends(_credential),
 ):
+    """Drop the cached resource lists of this credential (204).
+
+    Triggered by the refresh button next to a wizard picker — the user has
+    just created a resource in Horizon and wants to see it. With ``kind``
+    only that kind is dropped (the ``@openstack:<kind>`` marker names, e.g.
+    ``network``, ``security_group``, ``availability_zone``); 422 for an
+    unknown one. 404 for a credential that is not the caller's.
     """
-    Cache bust for the calling user. Triggered by a click on the
-    "Refresh" button next to a picker — the user has just created a
-    new resource in Horizon and wants to see it.
-    """
-    removed = openstack_client.invalidate_user(current_user.userId, kind)
-    logger.info("Cache invalidated for user %s (kind=%s, %d entries removed)",
-                current_user.userId, kind, removed)
+    cache_kind = None
+    if kind is not None:
+        cache_kind = _REFRESH_KINDS.get(kind)
+        if cache_kind is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"reason": "unknown_resource_kind", "kind": kind},
+            )
+    removed = openstack_client.invalidate(credential.credentialId, cache_kind)
+    logger.info("Cache invalidated for credential %s (kind=%s, %d entries removed)",
+                credential.credentialId, kind, removed)
     return None
 
 
 # ----------------------------------------------------------------
 # Networks
 # ----------------------------------------------------------------
-@router.get("/networks")
+@router.get("/networks", response_model=list[NetworkItem])
 def list_networks(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user_keycloak),
+    credential: UserOpenStackCredential = Depends(_credential),
 ):
-    """Lists all networks that the user can see in their project.
+    """List all networks visible to the credential's project.
 
-    ``shared`` and ``router_external`` are included so the frontend can
-    render "External Network" hints.
+    ``shared`` and ``external`` are included so the frontend can render
+    "External Network" hints. Like every endpoint here: 404 for a credential
+    that is not the caller's, 502 when OpenStack fails.
     """
     def fetch() -> list[dict]:
-        with openstack_client.user_connection(db, current_user) as conn:
+        with openstack_client.credential_connection(credential) as conn:
             return [
                 {
                     "id": _safe_get(n, "id"),
@@ -127,30 +186,28 @@ def list_networks(
                 for n in conn.network.networks()
             ]
 
-    return _list_with_oserror(current_user, "networks", None, fetch)
+    return _list_with_oserror(credential, "networks", None, fetch)
 
 
 # ----------------------------------------------------------------
 # Subnets — optionally filtered by network
 # ----------------------------------------------------------------
-@router.get("/subnets")
+@router.get("/subnets", response_model=list[SubnetItem])
 def list_subnets(
-    network_id: str | None = Query(default=None, description="Filter: nur Subnets in diesem Network"),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user_keycloak),
+    network_id: str | None = Query(default=None, description="Only subnets of this network"),
+    credential: UserOpenStackCredential = Depends(_credential),
 ):
-    """
-    With ``network_id``: subnets of that network. Without: all subnets in
-    the project. Filtering happens server-side (OpenStack API), not only
-    after the cache — otherwise we would have a separate cache key per
-    network, and the unfiltered list cache would never help.
+    """List subnets, optionally only those of ``network_id``.
+
+    The filter is passed to the OpenStack API, and each filter value is
+    cached under its own key next to the unfiltered list.
     """
     filters: dict[str, Any] = {}
     if network_id:
         filters["network_id"] = network_id
 
     def fetch() -> list[dict]:
-        with openstack_client.user_connection(db, current_user) as conn:
+        with openstack_client.credential_connection(credential) as conn:
             kwargs: dict[str, Any] = {}
             if network_id:
                 kwargs["network_id"] = network_id
@@ -166,24 +223,23 @@ def list_subnets(
                 for s in conn.network.subnets(**kwargs)
             ]
 
-    return _list_with_oserror(current_user, "subnets", filters or None, fetch)
+    return _list_with_oserror(credential, "subnets", filters or None, fetch)
 
 
 # ----------------------------------------------------------------
 # Flavors
 # ----------------------------------------------------------------
-@router.get("/flavors")
+@router.get("/flavors", response_model=list[FlavorItem])
 def list_flavors(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user_keycloak),
+    credential: UserOpenStackCredential = Depends(_credential),
 ):
-    """
-    Compute flavors with the three spec fields the user really wants
-    (CPU/RAM/Disk). ``is_public=False`` means private — we still emit
-    it, the frontend can render a note.
+    """List compute flavors with vCPUs, RAM (MB) and disk (GB).
+
+    Private flavors (``is_public=false``) are included; the frontend can
+    render a note.
     """
     def fetch() -> list[dict]:
-        with openstack_client.user_connection(db, current_user) as conn:
+        with openstack_client.credential_connection(credential) as conn:
             out: list[dict] = []
             for f in conn.compute.flavors(get_extra_specs=False):
                 out.append({
@@ -196,31 +252,30 @@ def list_flavors(
                 })
             return out
 
-    return _list_with_oserror(current_user, "flavors", None, fetch)
+    return _list_with_oserror(credential, "flavors", None, fetch)
 
 
 # ----------------------------------------------------------------
 # Images
 # ----------------------------------------------------------------
-@router.get("/images")
+@router.get("/images", response_model=list[ImageItem])
 def list_images(
     status_filter: str = Query(
         default="active",
         alias="status",
-        description="OS Image Status (default: active). Alle Stati: 'all'",
+        description="Image status to list (default: active); 'all' for every status",
     ),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user_keycloak),
+    credential: UserOpenStackCredential = Depends(_credential),
 ):
-    """
-    Default ``status=active`` — we do not want to show "queued" or
-    "deleted" images in the picker. ``status=all`` for power users who
-    really want to see everything.
+    """List Glance images visible to the project, by default only ``active`` ones.
+
+    Default ``status=active`` keeps "queued" or "deleted" images out of the
+    picker; ``status=all`` returns every image. ``size`` is in bytes.
     """
     filters = {"status": status_filter}
 
     def fetch() -> list[dict]:
-        with openstack_client.user_connection(db, current_user) as conn:
+        with openstack_client.credential_connection(credential) as conn:
             kwargs: dict[str, Any] = {}
             if status_filter and status_filter != "all":
                 kwargs["status"] = status_filter
@@ -236,24 +291,23 @@ def list_images(
                 })
             return out
 
-    return _list_with_oserror(current_user, "images", filters, fetch)
+    return _list_with_oserror(credential, "images", filters, fetch)
 
 
 # ----------------------------------------------------------------
 # Keypairs
 # ----------------------------------------------------------------
-@router.get("/keypairs")
+@router.get("/keypairs", response_model=list[KeypairItem])
 def list_keypairs(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user_keycloak),
+    credential: UserOpenStackCredential = Depends(_credential),
 ):
-    """
-    SSH keypairs of the user. Here the identity is always the ``name``,
-    never the ID — Keystone keypairs do have IDs but Terraform modules
-    use the name.
+    """List the SSH keypairs of the credential's OpenStack user.
+
+    Nova keypairs belong to the user, not the project, and Terraform modules
+    reference them by ``name``; ``id`` therefore repeats the name.
     """
     def fetch() -> list[dict]:
-        with openstack_client.user_connection(db, current_user) as conn:
+        with openstack_client.credential_connection(credential) as conn:
             return [
                 {
                     "name": _safe_get(k, "name") or "",
@@ -266,19 +320,19 @@ def list_keypairs(
                 for k in conn.compute.keypairs()
             ]
 
-    return _list_with_oserror(current_user, "keypairs", None, fetch)
+    return _list_with_oserror(credential, "keypairs", None, fetch)
 
 
 # ----------------------------------------------------------------
 # Security Groups
 # ----------------------------------------------------------------
-@router.get("/security-groups")
+@router.get("/security-groups", response_model=list[DescribedItem])
 def list_security_groups(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user_keycloak),
+    credential: UserOpenStackCredential = Depends(_credential),
 ):
+    """List the security groups visible to the credential's project."""
     def fetch() -> list[dict]:
-        with openstack_client.user_connection(db, current_user) as conn:
+        with openstack_client.credential_connection(credential) as conn:
             return [
                 {
                     "id": _safe_get(sg, "id"),
@@ -288,24 +342,24 @@ def list_security_groups(
                 for sg in conn.network.security_groups()
             ]
 
-    return _list_with_oserror(current_user, "security_groups", None, fetch)
+    return _list_with_oserror(credential, "security_groups", None, fetch)
 
 
 # ----------------------------------------------------------------
 # Floating IP Pools (External Networks)
 # ----------------------------------------------------------------
-@router.get("/floating-ip-pools")
+@router.get("/floating-ip-pools", response_model=list[DescribedItem])
 def list_floating_ip_pools(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user_keycloak),
+    credential: UserOpenStackCredential = Depends(_credential),
 ):
-    """
+    """List the floating IP pools, i.e. the external networks.
+
     There is no dedicated ``Pool`` resource in OpenStack — pools are
     networks with ``router:external = true``. Terraform modules usually
     expect the **name** of the external network.
     """
     def fetch() -> list[dict]:
-        with openstack_client.user_connection(db, current_user) as conn:
+        with openstack_client.credential_connection(credential) as conn:
             out: list[dict] = []
             for n in conn.network.networks():
                 is_ext = bool(_safe_get(n, "is_router_external", "router:external", default=False))
@@ -318,24 +372,23 @@ def list_floating_ip_pools(
                 })
             return out
 
-    return _list_with_oserror(current_user, "floating_ip_pools", None, fetch)
+    return _list_with_oserror(credential, "floating_ip_pools", None, fetch)
 
 
 # ----------------------------------------------------------------
 # Volumes
 # ----------------------------------------------------------------
-@router.get("/volumes")
+@router.get("/volumes", response_model=list[VolumeItem])
 def list_volumes(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user_keycloak),
+    credential: UserOpenStackCredential = Depends(_credential),
 ):
-    """
-    Cinder volumes. The frontend filters ``status`` itself if needed
-    — we emit all of them, because a user can well attach a second
-    instance to an ``in-use`` volume.
+    """List the project's Cinder volumes in every status (``size`` in GB).
+
+    The frontend filters ``status`` itself if needed; ``in-use`` volumes are
+    included because a multi-attach volume can take a second instance.
     """
     def fetch() -> list[dict]:
-        with openstack_client.user_connection(db, current_user) as conn:
+        with openstack_client.credential_connection(credential) as conn:
             return [
                 {
                     "id": _safe_get(v, "id"),
@@ -348,19 +401,19 @@ def list_volumes(
                 for v in conn.volume.volumes()
             ]
 
-    return _list_with_oserror(current_user, "volumes", None, fetch)
+    return _list_with_oserror(credential, "volumes", None, fetch)
 
 
 # ----------------------------------------------------------------
 # Routers
 # ----------------------------------------------------------------
-@router.get("/routers")
+@router.get("/routers", response_model=list[RouterItem])
 def list_routers(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user_keycloak),
+    credential: UserOpenStackCredential = Depends(_credential),
 ):
+    """List the routers visible to the project, with their external gateway info."""
     def fetch() -> list[dict]:
-        with openstack_client.user_connection(db, current_user) as conn:
+        with openstack_client.credential_connection(credential) as conn:
             return [
                 {
                     "id": _safe_get(r, "id"),
@@ -371,29 +424,29 @@ def list_routers(
                 for r in conn.network.routers()
             ]
 
-    return _list_with_oserror(current_user, "routers", None, fetch)
+    return _list_with_oserror(credential, "routers", None, fetch)
 
 
 # ----------------------------------------------------------------
 # Availability Zones
 # ----------------------------------------------------------------
-@router.get("/availability-zones")
+@router.get("/availability-zones", response_model=list[AvailabilityZoneItem])
 def list_availability_zones(
     service: str = Query(
         default="compute",
-        description="OpenStack-Service: compute (Nova), network (Neutron), volume (Cinder)",
+        description="OpenStack service: compute (Nova), network (Neutron) or volume (Cinder)",
     ),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user_keycloak),
+    credential: UserOpenStackCredential = Depends(_credential),
 ):
-    """
-    AZs differ per service. Default: compute (Nova), because that is
-    the most common use case (VM placement).
+    """List the availability zones of one service; the zone name doubles as ``id``.
+
+    AZs differ per service. Default: compute (Nova), the common case (VM
+    placement). 400 for a ``service`` other than compute, network or volume.
     """
     filters = {"service": service}
 
     def fetch() -> list[dict]:
-        with openstack_client.user_connection(db, current_user) as conn:
+        with openstack_client.credential_connection(credential) as conn:
             if service == "compute":
                 source = conn.compute.availability_zones()
             elif service == "network":
@@ -418,4 +471,4 @@ def list_availability_zones(
                 })
             return out
 
-    return _list_with_oserror(current_user, f"availability_zones_{service}", filters, fetch)
+    return _list_with_oserror(credential, f"availability_zones_{service}", filters, fetch)

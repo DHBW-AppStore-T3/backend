@@ -16,13 +16,17 @@ from app.models import (
     AppVersionApproval,
     AppVersionApprovalStatus,
     Deployment,
-    OpenStackAuthType,
     Task,
     TaskStatus,
     TaskType,
-    UserOpenStackCredential,
 )
-from tests.conftest import FakeGitRemote, approve_version_in_db, create_app_in_db
+from tests.conftest import (
+    TEST_PROJECT,
+    FakeGitRemote,
+    add_credential,
+    approve_version_in_db,
+    create_app_in_db,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -38,22 +42,13 @@ def sent():
 
 
 def _credential(db, user):
-    from app.utils import crypto
-
-    db.add(UserOpenStackCredential(
-        credentialId=uuid.uuid4(),
-        userId=user.userId,
-        auth_type=OpenStackAuthType.APPLICATION_CREDENTIAL,
-        auth_url="https://keystone.example/v3",
-        encrypted_identifier=crypto.encrypt("id"),
-        encrypted_secret=crypto.encrypt("secret"),
-    ))
-    db.commit()
+    return add_credential(db, user)
 
 
-def _deploy(client, app, tag="v1.0.0"):
+def _deploy(client, app, cred, tag="v1.0.0"):
     return client.post("/deployments/", json={
         "name": "pinned", "appId": str(app.appId), "releaseTag": tag, "teams": [],
+        "credentialId": str(cred.credentialId),
     })
 
 
@@ -127,9 +122,9 @@ def test_registration_stores_the_normalised_url(client):
 def test_deploy_of_an_approved_commit_pins_it(client, db, mock_user, mock_admin, sent, fake_git):
     app = create_app_in_db(db, mock_admin)
     approve_version_in_db(db, app, "v1.0.0")
-    _credential(db, mock_user)
+    cred = _credential(db, mock_user)
 
-    resp = _deploy(client, app)
+    resp = _deploy(client, app, cred)
 
     assert resp.status_code == 201, resp.text
     assert resp.json()["commit_sha"] == FakeGitRemote.sha_for("v1.0.0")
@@ -139,9 +134,9 @@ def test_deploy_of_an_approved_commit_pins_it(client, db, mock_user, mock_admin,
 def test_deploy_refuses_an_unapproved_version_of_a_public_app(client, db, mock_user, mock_admin, sent):
     app = create_app_in_db(db, mock_admin)
     approve_version_in_db(db, app, "v1.0.0")
-    _credential(db, mock_user)
+    cred = _credential(db, mock_user)
 
-    resp = _deploy(client, app, tag="v2.0.0")
+    resp = _deploy(client, app, cred, tag="v2.0.0")
 
     assert resp.status_code == 403
     assert resp.json()["detail"]["code"] == "version_not_approved"
@@ -152,9 +147,9 @@ def test_deploy_refuses_a_tag_moved_after_approval(client, db, mock_user, mock_a
     app = create_app_in_db(db, mock_admin)
     approve_version_in_db(db, app, "v1.0.0")
     fake_git.move("v1.0.0")
-    _credential(db, mock_user)
+    cred = _credential(db, mock_user)
 
-    resp = _deploy(client, app)
+    resp = _deploy(client, app, cred)
 
     assert resp.status_code == 403
     assert resp.json()["detail"]["code"] == "version_not_approved"
@@ -169,9 +164,9 @@ def test_deploy_needs_a_version(client, db, mock_user, sent):
 
 def test_owner_deploys_any_tag_of_a_private_app_pinned(client, db, mock_user, sent, fake_git):
     app = create_app_in_db(db, mock_user, is_private=True)
-    _credential(db, mock_user)
+    cred = _credential(db, mock_user)
 
-    resp = _deploy(client, app, tag="feature-x")
+    resp = _deploy(client, app, cred, tag="feature-x")
 
     assert resp.status_code == 201, resp.text
     assert resp.json()["commit_sha"] == FakeGitRemote.sha_for("feature-x")
@@ -179,10 +174,10 @@ def test_owner_deploys_any_tag_of_a_private_app_pinned(client, db, mock_user, se
 
 def test_deploy_fails_closed_without_the_repository(client, db, mock_user, sent, fake_git):
     app = create_app_in_db(db, mock_user, is_private=True)
-    _credential(db, mock_user)
+    cred = _credential(db, mock_user)
     fake_git.readable = False
 
-    resp = _deploy(client, app)
+    resp = _deploy(client, app, cred)
 
     assert resp.status_code == 502
     assert db.query(Deployment).count() == 0
@@ -191,10 +186,10 @@ def test_deploy_fails_closed_without_the_repository(client, db, mock_user, sent,
 
 def test_deploy_of_an_unknown_tag_is_404(client, db, mock_user, sent, fake_git):
     app = create_app_in_db(db, mock_user, is_private=True)
-    _credential(db, mock_user)
+    cred = _credential(db, mock_user)
     fake_git.any_tag = False
 
-    resp = _deploy(client, app, tag="nope")
+    resp = _deploy(client, app, cred, tag="nope")
 
     assert resp.status_code == 404
     assert resp.json()["detail"]["reason"] == "version_not_found"
@@ -206,7 +201,8 @@ def test_deploy_of_an_unknown_tag_is_404(client, db, mock_user, sent, fake_git):
 def _deployment(db, user, app, *, commit_sha):
     dep = Deployment(
         deploymentId=uuid.uuid4(), name="d", appId=app.appId, userId=user.userId,
-        releaseTag="v1.0.0", commit_sha=commit_sha, userInputVar=json.dumps({"terraform": {}}),
+        releaseTag="v1.0.0", commit_sha=commit_sha, os_project_id=TEST_PROJECT,
+        userInputVar=json.dumps({"terraform": {}}),
     )
     db.add(dep)
     db.flush()

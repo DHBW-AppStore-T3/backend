@@ -8,8 +8,9 @@ runs the real migration chain instead:
   migrations agree, every index is declared on the models);
 - the ``task_events`` trigger sends ``NOTIFY``;
 - the worker role ``appstore_worker`` logs in (``app.worker_db_role``) and
-  gets exactly its rights: queue, events, result columns; ``permission
-  denied`` on users, apps and credentials;
+  gets exactly its rights: queue, events, result columns, the live
+  deployments view; ``permission denied`` on users, apps, credentials and
+  OpenTofu states;
 - down to the previous revision and up again.
 """
 from __future__ import annotations
@@ -134,12 +135,15 @@ def test_worker_role_has_only_its_rights(scratch_db):
             (task_id,),
         ).fetchone()
         worker.execute("SELECT pg_try_advisory_lock(1), pg_advisory_unlock(1)").fetchone()
+        # App and project of live deployments, for the image cleanup on destroy.
+        assert worker.execute('SELECT "appId", os_project_id FROM worker_live_deployments').fetchall()
 
         denied = [
             "SELECT * FROM users",
             "SELECT * FROM apps",
             "SELECT * FROM user_openstack_credentials",
             "SELECT * FROM deployments",
+            "SELECT * FROM terraform_states",
             "SELECT logs FROM tasks",
             "SELECT tf_state FROM tasks",
             "UPDATE tasks SET tf_state = 'x'",

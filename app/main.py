@@ -16,6 +16,7 @@ from app.routers import (
     courses,
     dashboard,
     deployments,
+    internal_tfstate,
     lti13,
     openstack_credentials,
     openstack_resources,
@@ -148,18 +149,21 @@ app.include_router(admin_apps.router, prefix="/admin", tags=["Admin"])
 app.include_router(deployments.router, prefix="/deployments", tags=["Deployments"])
 app.include_router(tasks.router, prefix="/tasks", tags=["Tasks"])
 app.include_router(teams.router, prefix="/teams", tags=["Teams"])
-app.include_router(quotas.router, prefix="/quotas", tags=["Quotas"])
 app.include_router(dashboard.router, prefix="/dashboard", tags=["Dashboard"])
 app.include_router(lti13.router)
 app.include_router(openstack_credentials.router, tags=["OpenStack Credentials"])
-# Read API for OpenStack resources (Networks, Flavors, Images, ...),
-# used by the wizard's value-help dropdowns so users don't have to type
-# UUIDs from Horizon.
+app.include_router(quotas.router, tags=["OpenStack Credentials"])
+# Read API for the OpenStack resources of one of the caller's credentials
+# (networks, flavors, images, ...), used by the wizard's value-help
+# dropdowns so users don't have to type UUIDs from Horizon.
 app.include_router(
     openstack_resources.router,
-    prefix="/me/openstack/resources",
+    prefix="/me/openstack-credentials/{credential_id}/resources",
     tags=["OpenStack Resources"],
 )
+# OpenTofu's HTTP state backend for the worker's VM jobs. Not in the
+# OpenAPI document; the ingress does not route /api/internal/.
+app.include_router(internal_tfstate.router, prefix="/internal/tfstate")
 
 
 # ----------------------------------------------------------------

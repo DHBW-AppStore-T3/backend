@@ -23,7 +23,6 @@ from sqlalchemy.exc import IntegrityError
 from app.models import (
     App,
     Deployment,
-    OpenStackAuthType,
     Task,
     TaskEvent,
     TaskStatus,
@@ -44,7 +43,7 @@ from app.task_contract import (
     terminal_payload,
 )
 from app.utils import crypto
-from tests.conftest import _TEST_DB_URL, TestingSessionLocal
+from tests.conftest import _TEST_DB_URL, TEST_PROJECT, TestingSessionLocal, add_credential
 
 pytestmark = pytest.mark.integration
 
@@ -63,7 +62,7 @@ def _seed(db, user, *, task_type=TaskType.DEPLOY, task_status=TaskStatus.SUCCESS
     db.add(app)
     db.flush()
     deployment = Deployment(deploymentId=uuid.uuid4(), name=f"d-{uuid.uuid4().hex[:6]}", appId=app.appId,
-                            userId=user.userId, releaseTag="v1.0.0",
+                            userId=user.userId, releaseTag="v1.0.0", os_project_id=TEST_PROJECT,
                             userInputVar=json.dumps({"terraform": {}, "packer": {}}))
     db.add(deployment)
     db.flush()
@@ -72,13 +71,9 @@ def _seed(db, user, *, task_type=TaskType.DEPLOY, task_status=TaskStatus.SUCCESS
     task = Task(taskId=task_id, celeryTaskId=str(task_id), deploymentId=deployment.deploymentId, type=task_type,
                 status=task_status, **task_fields)
     db.add(task)
-    if db.query(UserOpenStackCredential).filter_by(userId=user.userId).first() is None:
-        db.add(UserOpenStackCredential(
-            credentialId=uuid.uuid4(), userId=user.userId,
-            auth_type=OpenStackAuthType.APPLICATION_CREDENTIAL, auth_url="https://keystone.example/v3",
-            encrypted_identifier=crypto.encrypt("id"), encrypted_secret=crypto.encrypt("secret"),
-        ))
     db.commit()
+    if db.query(UserOpenStackCredential).filter_by(userId=user.userId).first() is None:
+        add_credential(db, user)
     return deployment, task
 
 

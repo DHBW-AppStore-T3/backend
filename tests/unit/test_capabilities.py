@@ -344,8 +344,9 @@ class TestCanViewDeploymentOwner:
 
 
 class TestCanOperateDeployment:
-    """Phase 2: operate is owner-or-admin only. Teachers no longer get
-    a blanket operate right via the staff bypass."""
+    """Operate is for the owner and project peers. Teachers get no blanket
+    right via the staff bypass, and admins are read-only on VM deployments:
+    every action runs with the caller's own credential for the project."""
 
     def test_owner_can_operate(self, student, db_mock):
         dep = _deployment(student.userId)
@@ -357,9 +358,26 @@ class TestCanOperateDeployment:
         dep = _deployment(uuid.uuid4())
         assert caps.can_operate_deployment(teacher, dep, db_mock) is False
 
-    def test_admin_can_operate(self, admin, db_mock):
+    def test_admin_cannot_operate_a_vm_deployment(self, admin, db_mock):
         dep = _deployment(uuid.uuid4())
-        assert caps.can_operate_deployment(admin, dep, db_mock) is True
+        assert caps.can_operate_deployment(admin, dep, db_mock) is False
+
+    def test_project_peer_can_operate_and_inspect(self, teacher, db_mock, monkeypatch):
+        dep = SimpleNamespace(deploymentId=uuid.uuid4(), userId=uuid.uuid4(), os_project_id="p-1")
+        holds = MagicMock(side_effect=lambda _db, _user_id, project_id: project_id == "p-1")
+        monkeypatch.setattr(caps.crud_openstack_credentials, "holds_project", holds)
+
+        assert caps.can_operate_deployment(teacher, dep, db_mock) is True
+        assert caps.can_view_deployment_owner(teacher, dep, db_mock) is True
+        holds.assert_called_with(db_mock, teacher.userId, "p-1")
+
+    def test_no_project_makes_no_peer(self, teacher, db_mock, monkeypatch):
+        holds = MagicMock(return_value=True)
+        monkeypatch.setattr(caps.crud_openstack_credentials, "holds_project", holds)
+        dep = SimpleNamespace(deploymentId=uuid.uuid4(), userId=uuid.uuid4(), os_project_id=None)
+
+        assert caps.can_operate_deployment(teacher, dep, db_mock) is False
+        holds.assert_not_called()
 
     def test_unrelated_student_cannot_operate(self, student, db_mock):
         dep = _deployment(uuid.uuid4())

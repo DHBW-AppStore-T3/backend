@@ -1,19 +1,18 @@
-"""Unit tests for :mod:`app.services.openstack_validator`.
+"""Unit tests for :mod:`app.services.openstack_validator` and :mod:`app.keystone_urls`.
 
-The tests mock ``openstack.connect`` so no real Keystone is required.
-Pydantic schema validation is exercised in the missing-fields case;
-all other cases construct a valid payload and assert on the
-authorize round-trip and error-mapping branches.
+``openstack.connect`` is mocked, no real Keystone is required. The
+API-level behaviour (what is stored, which project counts) is covered in
+``tests/test_openstack_credentials_api.py``.
 """
 from __future__ import annotations
 
-import socket
 from unittest.mock import MagicMock, patch
 
 import pytest
-from openstack import exceptions as os_exc
+from keystoneauth1.identity.base import BaseIdentityPlugin
 from pydantic import ValidationError
 
+from app import keystone_urls
 from app.models import OpenStackAuthType
 from app.schemas import OpenStackCredentialUpsert
 from app.services import openstack_validator
@@ -21,9 +20,6 @@ from app.services import openstack_validator
 pytestmark = pytest.mark.unit
 
 
-# ----------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------
 def _password_payload(**overrides) -> OpenStackCredentialUpsert:
     base = {
         "auth_type": OpenStackAuthType.PASSWORD,
@@ -38,110 +34,78 @@ def _password_payload(**overrides) -> OpenStackCredentialUpsert:
     return OpenStackCredentialUpsert(**base)
 
 
-def _appcred_payload(**overrides) -> OpenStackCredentialUpsert:
-    base = {
-        "auth_type": OpenStackAuthType.APPLICATION_CREDENTIAL,
-        "auth_url": "https://keystone.example/v3",
-        "region_name": "RegionOne",
-        "identifier": "ac-id-123",
-        "secret": "ac-secret-xyz",
-    }
-    base.update(overrides)
-    return OpenStackCredentialUpsert(**base)
-
-
-# ----------------------------------------------------------------
-# Tests
-# ----------------------------------------------------------------
-def test_validate_password_payload_calls_keystone_authenticate():
-    """Password auth: connect() receives v3password kwargs and authorize() is called."""
-    payload = _password_payload()
+def _connection(project_id="p-1", project_name="Demo") -> MagicMock:
+    auth = MagicMock(spec=BaseIdentityPlugin)
+    auth.get_access.return_value = MagicMock(project_id=project_id, project_name=project_name)
     conn = MagicMock()
-    conn.authorize.return_value = "tok-abc"
+    conn.session.auth = auth
+    return conn
 
-    with patch.object(openstack_validator.openstack, "connect", return_value=conn) as mock_connect:
-        ok, err = openstack_validator.validate(payload)
 
-    assert ok is True
-    assert err is None
-    conn.authorize.assert_called_once()
-    mock_connect.assert_called_once()
-    kwargs = mock_connect.call_args.kwargs
+def test_password_login_maps_to_v3password_and_closes_the_connection():
+    conn = _connection()
+    with patch.object(openstack_validator.openstack, "connect", return_value=conn) as connect:
+        scope = openstack_validator.validate(_password_payload())
+
+    assert scope == openstack_validator.Scope(project_id="p-1", project_name="Demo")
+    kwargs = connect.call_args.kwargs
     assert kwargs["auth_type"] == "password"
-    assert kwargs["username"] == "alice"
-    assert kwargs["password"] == "s3cret"
+    assert (kwargs["username"], kwargs["password"]) == ("alice", "s3cret")
     assert kwargs["project_name"] == "demo"
-    assert kwargs["user_domain_name"] == "Default"
-    # project_domain_name falls back to user_domain_name
-    assert kwargs["project_domain_name"] == "Default"
-    assert kwargs["auth_url"] == "https://keystone.example/v3"
+    assert kwargs["project_domain_name"] == "Default"  # falls back to the user domain
+    assert kwargs["api_timeout"] == openstack_validator.TIMEOUT_SECONDS
+    conn.close.assert_called_once()
 
 
-def test_validate_application_credential_payload():
-    """Application-credential auth: connect() gets v3applicationcredential kwargs."""
-    payload = _appcred_payload()
-    conn = MagicMock()
-    conn.authorize.return_value = "tok-xyz"
+def test_no_process_wide_socket_timeout_is_touched():
+    import socket
 
-    with patch.object(openstack_validator.openstack, "connect", return_value=conn) as mock_connect:
-        ok, err = openstack_validator.validate(payload)
-
-    assert ok is True
-    assert err is None
-    conn.authorize.assert_called_once()
-    kwargs = mock_connect.call_args.kwargs
-    assert kwargs["auth_type"] == "v3applicationcredential"
-    assert kwargs["application_credential_id"] == "ac-id-123"
-    assert kwargs["application_credential_secret"] == "ac-secret-xyz"
-    # No username/password leaked into the connect kwargs for appcred auth
-    assert "username" not in kwargs
-    assert "password" not in kwargs
+    before = socket.getdefaulttimeout()
+    with patch.object(openstack_validator.openstack, "connect", return_value=_connection()):
+        openstack_validator.validate(_password_payload())
+    assert socket.getdefaulttimeout() == before
 
 
-def test_validate_invalid_credentials_returns_failure():
-    """A 401 from Keystone maps to ``Invalid credentials``; secret is not echoed."""
-    payload = _password_payload(secret="wrong-password")
-    http_err = os_exc.HttpException(message="Unauthorized")
-    http_err.status_code = 401
-
-    conn = MagicMock()
-    conn.authorize.side_effect = http_err
-
-    with patch.object(openstack_validator.openstack, "connect", return_value=conn):
-        ok, err = openstack_validator.validate(payload)
-
-    assert ok is False
-    assert err == "Invalid credentials"
-    assert "wrong-password" not in (err or "")
+def test_missing_password_fields_fail_in_the_schema():
+    with pytest.raises(ValidationError):
+        _password_payload(user_domain_name=None)
 
 
-def test_validate_network_error_returns_failure_with_reason():
-    """gaierror / TimeoutError surface as a short ``Could not reach auth_url`` message."""
-    payload = _password_payload(auth_url="https://unreachable.invalid/v3")
-
-    with patch.object(
-        openstack_validator.openstack,
-        "connect",
-        side_effect=socket.gaierror("Name or service not known"),
-    ):
-        ok, err = openstack_validator.validate(payload)
-
-    assert ok is False
-    assert err is not None
-    assert err.startswith("Could not reach auth_url")
-    assert "Name or service not known" in err
+def test_a_url_outside_the_allowlist_never_connects(monkeypatch):
+    monkeypatch.setattr(openstack_validator.settings, "APP_ENV", "production")
+    monkeypatch.setattr(openstack_validator.settings, "OPENSTACK_ALLOWED_AUTH_URLS", "https://keystone.example/v3")
+    with patch.object(openstack_validator.openstack, "connect") as connect, pytest.raises(
+        openstack_validator.CredentialRejected
+    ) as exc:
+        openstack_validator.validate(_password_payload(auth_url="https://evil.example/v3"))
+    assert exc.value.reason == "auth_url_not_allowed"
+    connect.assert_not_called()
 
 
-def test_validate_rejects_missing_required_fields():
-    """Password auth without a project_* / user_domain_name fails Pydantic validation."""
-    with pytest.raises(ValidationError) as exc:
-        OpenStackCredentialUpsert(
-            auth_type=OpenStackAuthType.PASSWORD,
-            auth_url="https://keystone.example/v3",
-            identifier="alice",
-            secret="s3cret",
-            # missing user_domain_name and project_name/project_id
-        )
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://Keystone.Example:5000/v3/", "https://keystone.example:5000"),
+        ("https://keystone.example/identity/v3", "https://keystone.example/identity"),
+        ("https://keystone.example", "https://keystone.example"),
+        (" https://keystone.example/v3 ", "https://keystone.example"),
+        ("http://keystone.example/v3", None),
+        ("https://u:p@keystone.example/v3", None),
+        ("https://keystone.example/v3?x=1", None),
+        ("https://keystone.example:99999/v3", None),
+        ("ftp://keystone.example", None),
+        ("keystone.example", None),
+    ],
+)
+def test_normalised(url, expected):
+    assert keystone_urls.normalised(url) == expected
 
-    msg = str(exc.value)
-    assert "user_domain_name" in msg or "project" in msg
+
+def test_allowlist_matching():
+    allowlist = "https://keystone.example:5000/v3, not a url ,https://other.example"
+    assert keystone_urls.auth_url_allowed("https://keystone.example:5000", allowlist, development=False)
+    assert keystone_urls.auth_url_allowed("https://other.example/v3", allowlist, development=False)
+    assert not keystone_urls.auth_url_allowed("https://keystone.example", allowlist, development=True)
+    assert not keystone_urls.auth_url_allowed(None, allowlist, development=True)
+    assert keystone_urls.auth_url_allowed("https://any.example", "", development=True)
+    assert not keystone_urls.auth_url_allowed("https://any.example", "", development=False)

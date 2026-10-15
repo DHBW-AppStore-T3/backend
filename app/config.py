@@ -73,6 +73,12 @@ class Settings(BaseSettings):
     # Generate: python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
     CREDENTIAL_ENCRYPTION_KEY: str
 
+    # Keystone URLs OpenStack credentials may point to, comma-separated
+    # (e.g. ``https://keystone.example.org:5000/v3``; a trailing ``/v3`` is
+    # ignored). API and worker send no login anywhere else (.github#7 C).
+    # Empty: in development any https URL, in production none.
+    OPENSTACK_ALLOWED_AUTH_URLS: str = ""
+
     # Public URL of the frontend; the LTI launch redirects there. No
     # trailing slash.
     APP_BASE_URL: str = "http://localhost:5173"

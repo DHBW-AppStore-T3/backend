@@ -224,6 +224,10 @@ class DeploymentCreate(DeploymentBase):
     # ends up 1:1 in the Terraform variable.
     files: dict[str, dict[str, DeploymentFileUpload]] | None = None
     teams: list[Team] = []
+    # VM apps: which of the caller's OpenStack credentials to deploy with;
+    # the deployment lives in its project, and holders of a credential for
+    # that project become its peers.
+    credentialId: UUID | None = None
 
 
 class DeploymentResponse(DeploymentBase):
@@ -232,6 +236,8 @@ class DeploymentResponse(DeploymentBase):
     releaseTag: str | None = None
     # The commit every job of the deployment runs.
     commit_sha: str | None = None
+    # VM deployments: the OpenStack project they live in.
+    os_project_id: str | None = None
     userInputVar: dict[str, Any] | None = None
     status: str | None = None  # From latest task
     created_at: datetime | None = None
@@ -568,22 +574,115 @@ class OpenStackCredentialFromYaml(BaseModel):
     )
 
 
-class OpenStackCredentialResponse(OpenStackCredentialBase):
-    """Masked response — never returns identifier/secret material.
+class OpenStackCredentialResponse(BaseModel):
+    """A stored credential, masked — never identifier or secret material.
 
-    When `has_credential` is False, base fields are absent/empty and the
-    consumer should branch on `has_credential`. `is_locked` and
-    `active_deployments` are populated regardless so the frontend can
-    render the appropriate guard UI even before any credential exists.
+    ``project_id``/``project_name`` are the project Keystone scoped the
+    credential to once ``project_verified``; a credential saved before
+    projects were checked is unverified until re-checked (``/test``) and
+    cannot be deployed with. ``active_deployments`` counts the caller's
+    live deployments in that project (for an unverified credential: those
+    whose project is still unknown); deleting the credential is refused
+    while there are any, so they cannot be orphaned.
     """
-    auth_type: OpenStackAuthType | None = None  # type: ignore[assignment]
-    auth_url: str | None = None  # type: ignore[assignment]
-    has_credential: bool = True
+    credentialId: UUID
+    auth_type: OpenStackAuthType
+    auth_url: str
+    region_name: str | None = None
+    interface: str | None = None
+    identity_api_version: str | None = None
+    project_id: str | None = None
+    project_name: str | None = None
+    project_verified: bool = False
+    user_domain_name: str | None = None
+    project_domain_name: str | None = None
     last_validated_at: datetime | None = None
     last_validation_error: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
-    is_locked: bool = False
     active_deployments: int = 0
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# ----------------------------------------------------------------
+# OPENSTACK RESOURCE PICKER (``/me/openstack-credentials/{id}/resources``)
+# ----------------------------------------------------------------
+# Flat views of what the wizard offers for ``@openstack:`` markers. Every
+# item has ``id`` and ``name``, so a picker reads them uniformly.
+class PickerItem(BaseModel):
+    """An OpenStack resource offered in the deploy wizard's value help."""
+
+    id: str | None = None
+    name: str = ""
+
+
+class NetworkItem(PickerItem):
+    """A Neutron network."""
+
+    description: str = ""
+    shared: bool = False
+    external: bool = False
+    status: str = ""
+
+
+class SubnetItem(PickerItem):
+    """A Neutron subnet."""
+
+    cidr: str = ""
+    ip_version: int | None = 4
+    network_id: str | None = None
+    gateway_ip: str = ""
+
+
+class FlavorItem(PickerItem):
+    """A Nova flavor."""
+
+    vcpus: int = 0
+    ram: int = Field(0, description="MB")
+    disk: int = Field(0, description="GB")
+    is_public: bool = True
+
+
+class ImageItem(PickerItem):
+    """A Glance image."""
+
+    status: str = ""
+    visibility: str = ""
+    size: int = Field(0, description="bytes")
+    disk_format: str = ""
+
+
+class KeypairItem(PickerItem):
+    """A Nova key pair of the credential's user."""
+
+    fingerprint: str = ""
+    type: str = "ssh"
+
+
+class DescribedItem(PickerItem):
+    """A resource with a description (security groups, floating IP pools)."""
+
+    description: str = ""
+
+
+class VolumeItem(PickerItem):
+    """A Cinder volume."""
+
+    size: int = Field(0, description="GB")
+    status: str = ""
+    volume_type: str = ""
+    bootable: bool = False
+
+
+class RouterItem(PickerItem):
+    """A Neutron router."""
+
+    status: str = ""
+    external_gateway_info: dict[str, Any] | None = None
+
+
+class AvailabilityZoneItem(PickerItem):
+    """A compute availability zone."""
+
+    state: str | dict[str, Any] = ""

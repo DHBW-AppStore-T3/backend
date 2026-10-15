@@ -6,7 +6,7 @@ Covers:
  * POST /deployments/{id}/resources/{address}/redeploy   (whitelist + dispatch)
 
 The OpenStack ``Connection`` is mocked end-to-end via
-``app.services.openstack_client.user_connection`` so tests don't need a
+``app.services.openstack_client.project_connection`` so tests don't need a
 real cloud — we control what the live-fetch returns, including the
 "server gone" case that drives ``drift=missing``.
 """
@@ -22,13 +22,14 @@ import pytest
 from app.models import (
     App,
     Deployment,
-    OpenStackAuthType,
     Task,
     TaskStatus,
     TaskType,
+    TerraformState,
     User,
-    UserOpenStackCredential,
 )
+from app.utils.crypto import encrypt
+from tests.conftest import TEST_PROJECT, add_credential
 
 # ----------------------------------------------------------------
 # Helpers / fixtures
@@ -76,20 +77,8 @@ _DEMO_STATE = {
 
 
 def _ensure_user_credentials(db, user):
-    """User needs credentials so ``user_connection`` doesn't 412."""
-    from app.utils import crypto
-
-    db.add(
-        UserOpenStackCredential(
-            credentialId=uuid.uuid4(),
-            userId=user.userId,
-            auth_type=OpenStackAuthType.APPLICATION_CREDENTIAL,
-            auth_url="https://keystone.example/v3",
-            encrypted_identifier=crypto.encrypt("test-id"),
-            encrypted_secret=crypto.encrypt("test-secret"),
-        )
-    )
-    db.commit()
+    """User needs an own credential for the project so ``project_connection`` doesn't 403."""
+    return add_credential(db, user)
 
 
 def _ensure_app(db, user) -> App:
@@ -105,16 +94,18 @@ def _ensure_app(db, user) -> App:
     return app
 
 
-def _seed_deployment_with_state(db, user: User, app_row: App) -> Deployment:
-    """Create a deployment + a successful DEPLOY task carrying the
-    demo TF state. The resource endpoint reads from the most-recent
-    task with a non-null state, so one task is enough."""
+def _seed_deployment_with_state(db, user: User, app_row: App, *, legacy_state: bool = False) -> Deployment:
+    """Create a deployment with a successful DEPLOY task and the demo
+    state in the state backend's table, where the resource endpoints read
+    it; with ``legacy_state`` only as the copy a task took before the
+    switch (the fallback until ``app.import_pg_tfstate`` ran)."""
     deployment = Deployment(
         deploymentId=uuid.uuid4(),
         name="resource-test",
         appId=app_row.appId,
         userId=user.userId,
         releaseTag="main",
+        os_project_id=TEST_PROJECT,
     )
     db.add(deployment)
     db.commit()
@@ -126,9 +117,11 @@ def _seed_deployment_with_state(db, user: User, app_row: App) -> Deployment:
         celeryTaskId="fake-celery-id",
         type=TaskType.DEPLOY,
         status=TaskStatus.SUCCESS,
-        tf_state=json.dumps(_DEMO_STATE),
+        tf_state=json.dumps(_DEMO_STATE) if legacy_state else None,
     )
     db.add(task)
+    if not legacy_state:
+        db.add(TerraformState(deploymentId=deployment.deploymentId, state=encrypt(json.dumps(_DEMO_STATE))))
     db.commit()
     return deployment
 
@@ -169,20 +162,20 @@ def _make_server_mock(
 
 @pytest.fixture
 def patched_user_connection():
-    """Replace the ``user_connection`` contextmanager with a fake that
+    """Replace the ``project_connection`` contextmanager with a fake that
     yields a configured Mock-Connection. Tests can mutate
     ``conn.compute.find_server.side_effect`` per case."""
     conn = MagicMock()
 
     @contextmanager
-    def _fake_conn(_db, _user):
+    def _fake_conn(_db, _user, _project_id):
         yield conn
 
     # Patch both call sites — the resource endpoint and any other
     # importers — so the import-time binding doesn't slip past the
     # mock.
     with patch(
-        "app.services.deployment_status.user_connection", _fake_conn
+        "app.services.deployment_status.project_connection", _fake_conn
     ):
         yield conn
 
@@ -254,6 +247,36 @@ def test_list_resources_skip_refresh_returns_cached_only(
     # Cached fields survive without lifecycle/hardware enrichment
     for r in body["resources"]:
         assert r["lifecycle"] is None
+
+
+@pytest.mark.integration
+def test_list_resources_without_an_own_credential_shows_the_cached_state(
+    admin_client, db, mock_user, patched_user_connection
+):
+    """An admin reads with no credential for the project: no live data,
+    and never with the owner's credential."""
+    _ensure_user_credentials(db, mock_user)
+    deployment = _seed_deployment_with_state(db, mock_user, _ensure_app(db, mock_user))
+
+    response = admin_client.get(f"/deployments/{deployment.deploymentId}/resources")
+
+    assert response.status_code == 200
+    assert response.json()["live"] is False
+    assert {r["address"] for r in response.json()["resources"]} >= {ADDR_A, ADDR_B}
+    assert not patched_user_connection.compute.find_server.called
+
+
+@pytest.mark.integration
+def test_list_resources_falls_back_to_the_last_task_copy_before_the_import(
+    client, db, mock_user, patched_user_connection
+):
+    _ensure_user_credentials(db, mock_user)
+    deployment = _seed_deployment_with_state(db, mock_user, _ensure_app(db, mock_user), legacy_state=True)
+
+    response = client.get(f"/deployments/{deployment.deploymentId}/resources", params={"refresh": False})
+
+    assert response.status_code == 200
+    assert {r["address"] for r in response.json()["resources"]} >= {ADDR_A, ADDR_B}
 
 
 @pytest.mark.integration

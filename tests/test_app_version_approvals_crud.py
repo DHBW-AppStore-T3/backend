@@ -1,9 +1,8 @@
-"""Integration-tests for two CRUD-Module mit niedriger Coverage.
+"""Integration-tests for ``app.crud.app_version_approvals``.
 
-Deckt die Branches von ``app.crud.app_version_approvals`` (Submission-,
-Review- und Lifecycle-Pfade der ``AppVersionApproval``-Tabelle) und
-``app.crud.openstack_credentials`` (Upsert, Validierungs-Stamping,
-Loeschen und die zwei Lese-Pfade fuer Backend bzw. Celery-Dispatch) ab.
+Deckt die Submission-, Review- und Lifecycle-Pfade der
+``AppVersionApproval``-Tabelle ab. Die Credential-CRUD testet
+``tests/test_openstack_credentials_crud.py``.
 
 Alle Tests sind ``@pytest.mark.integration`` und ziehen die ``db``-Fixture
 aus ``tests/conftest.py``. ORM-Objekte werden direkt konstruiert; die
@@ -12,7 +11,6 @@ testen.
 """
 from __future__ import annotations
 
-import base64
 import hashlib
 import uuid
 from datetime import datetime
@@ -21,18 +19,13 @@ import pytest
 from fastapi import HTTPException
 
 from app.crud import app_version_approvals as crud_approvals
-from app.crud import openstack_credentials as crud_creds
 from app.models import (
     App,
     AppVersionApproval,
     AppVersionApprovalStatus,
-    OpenStackAuthType,
     User,
-    UserOpenStackCredential,
     UserRole,
 )
-from app.schemas import OpenStackCredentialUpsert
-from app.utils import crypto
 
 
 # ----------------------------------------------------------------
@@ -69,18 +62,6 @@ def _make_app(db, owner: User, *, is_private: bool = False, name: str = "App") -
     db.commit()
     db.refresh(application)
     return application
-
-
-def _ac_payload(**overrides) -> OpenStackCredentialUpsert:
-    base = {
-        "auth_type": OpenStackAuthType.APPLICATION_CREDENTIAL,
-        "auth_url": "https://example/openstack",
-        "identifier": "id",
-        "secret": "sec",
-        "project_id": "proj",
-    }
-    base.update(overrides)
-    return OpenStackCredentialUpsert(**base)
 
 
 # ================================================================
@@ -508,181 +489,3 @@ def test_terminal_ops_raise_404_for_unknown_version(db):
             db, application.appId, "ghost", admin.userId, "x"
         )
     assert exc.value.status_code == 404
-
-
-# ================================================================
-# app.crud.openstack_credentials
-# ================================================================
-@pytest.mark.integration
-def test_get_for_user_miss_returns_none(db):
-    """get_for_user gibt None, wenn keine Zeile existiert."""
-    user = _make_user(db)
-    assert crud_creds.get_for_user(db, user.userId) is None
-
-
-@pytest.mark.integration
-def test_upsert_creates_then_updates_same_row(db):
-    """Zweiter upsert-Aufruf updated dieselbe Zeile (kein Duplikat)."""
-    user = _make_user(db)
-
-    first = crud_creds.upsert(
-        db, user.userId, _ac_payload(secret="sec"), (True, None)
-    )
-    first_id = first.credentialId
-    first_secret_ct = bytes(first.encrypted_secret)
-    assert first.last_validated_at is not None
-    assert first.last_validation_error is None
-
-    # Zweiter Aufruf mit neuem secret -> dieselbe credentialId, neuer Ciphertext.
-    second = crud_creds.upsert(
-        db, user.userId, _ac_payload(secret="rotated"), (True, None)
-    )
-
-    assert second.credentialId == first_id
-    assert bytes(second.encrypted_secret) != first_secret_ct
-    assert crypto.decrypt(bytes(second.encrypted_secret)) == "rotated"
-
-    # Genau eine Zeile pro User.
-    count = (
-        db.query(UserOpenStackCredential)
-        .filter(UserOpenStackCredential.userId == user.userId)
-        .count()
-    )
-    assert count == 1
-
-
-@pytest.mark.integration
-def test_upsert_persists_row_even_on_failed_validation(db):
-    """Failed validation -> Zeile wird trotzdem persistiert, error stamped."""
-    user = _make_user(db)
-
-    row = crud_creds.upsert(
-        db, user.userId, _ac_payload(), (False, "bad creds")
-    )
-
-    assert row.last_validated_at is None
-    assert row.last_validation_error == "bad creds"
-    # Persistenz: per fresh-read.
-    db.expire_all()
-    refreshed = crud_creds.get_for_user(db, user.userId)
-    assert refreshed is not None
-    assert refreshed.last_validation_error == "bad creds"
-
-
-@pytest.mark.integration
-def test_stamp_validation_ok_clears_error_and_sets_timestamp(db):
-    """stamp_validation(ok=True) clears error, stamps timestamp."""
-    user = _make_user(db)
-    row = crud_creds.upsert(
-        db, user.userId, _ac_payload(), (False, "initial error")
-    )
-    assert row.last_validation_error == "initial error"
-    assert row.last_validated_at is None
-
-    before = datetime.utcnow()
-    crud_creds.stamp_validation(db, row, (True, None))
-
-    assert row.last_validation_error is None
-    assert row.last_validated_at is not None
-    assert row.last_validated_at >= before
-
-
-@pytest.mark.integration
-def test_stamp_validation_failure_sets_only_error(db):
-    """stamp_validation(ok=False) ueberschreibt nur den Error-Text."""
-    user = _make_user(db)
-    row = crud_creds.upsert(db, user.userId, _ac_payload(), (True, None))
-    original_timestamp = row.last_validated_at
-    assert original_timestamp is not None
-
-    crud_creds.stamp_validation(db, row, (False, "now broken"))
-
-    assert row.last_validation_error == "now broken"
-    # last_validated_at bleibt unangetastet.
-    assert row.last_validated_at == original_timestamp
-
-
-@pytest.mark.integration
-def test_delete_returns_true_when_row_exists_false_otherwise(db):
-    """delete -> True wenn Zeile vorhanden, sonst False."""
-    user = _make_user(db)
-
-    # Zuerst False ohne Zeile.
-    assert crud_creds.delete(db, user.userId) is False
-
-    crud_creds.upsert(db, user.userId, _ac_payload(), (True, None))
-    assert crud_creds.delete(db, user.userId) is True
-
-    # Nochmals False, Zeile ist weg.
-    assert crud_creds.delete(db, user.userId) is False
-
-
-@pytest.mark.integration
-def test_get_dispatch_envelope_returns_b64_ciphertext(db):
-    """get_dispatch_envelope: b64-encoded ciphertext-Felder."""
-    user = _make_user(db)
-    crud_creds.upsert(
-        db,
-        user.userId,
-        _ac_payload(identifier="id", secret="sec"),
-        (True, None),
-    )
-
-    envelope = crud_creds.get_dispatch_envelope(db, user.userId)
-
-    assert "encrypted_identifier_b64" in envelope
-    assert "encrypted_secret_b64" in envelope
-    # base64-Strings decodieren und Fernet-roundtrip auf plaintext.
-    id_ct = base64.b64decode(envelope["encrypted_identifier_b64"].encode("ascii"))
-    sec_ct = base64.b64decode(envelope["encrypted_secret_b64"].encode("ascii"))
-    assert crypto.decrypt(id_ct) == "id"
-    assert crypto.decrypt(sec_ct) == "sec"
-    # Plaintext darf nicht in der Envelope auftauchen.
-    assert "identifier" not in envelope
-    assert "secret" not in envelope
-    # Enum-Wert als JSON-safe string.
-    assert envelope["auth_type"] == OpenStackAuthType.APPLICATION_CREDENTIAL.value
-
-
-@pytest.mark.integration
-def test_get_dispatch_envelope_raises_when_missing(db):
-    """get_dispatch_envelope ohne Zeile -> NoCredentialError."""
-    user = _make_user(db)
-    with pytest.raises(crud_creds.NoCredentialError):
-        crud_creds.get_dispatch_envelope(db, user.userId)
-
-
-@pytest.mark.integration
-def test_get_decrypted_for_backend_roundtrip(db):
-    """get_decrypted_for_backend gibt Plaintext zurueck."""
-    user = _make_user(db)
-    crud_creds.upsert(
-        db,
-        user.userId,
-        _ac_payload(identifier="id", secret="sec"),
-        (True, None),
-    )
-
-    decrypted = crud_creds.get_decrypted_for_backend(db, user.userId)
-
-    assert decrypted["identifier"] == "id"
-    assert decrypted["secret"] == "sec"
-    assert decrypted["auth_url"] == "https://example/openstack"
-    assert decrypted["project_id"] == "proj"
-    assert (
-        decrypted["auth_type"]
-        == OpenStackAuthType.APPLICATION_CREDENTIAL.value
-    )
-    # Ciphertext-Felder sind NICHT enthalten.
-    assert "encrypted_identifier" not in decrypted
-    assert "encrypted_secret" not in decrypted
-    assert "encrypted_identifier_b64" not in decrypted
-    assert "encrypted_secret_b64" not in decrypted
-
-
-@pytest.mark.integration
-def test_get_decrypted_for_backend_raises_when_missing(db):
-    """get_decrypted_for_backend ohne Zeile -> NoCredentialError."""
-    user = _make_user(db)
-    with pytest.raises(crud_creds.NoCredentialError):
-        crud_creds.get_decrypted_for_backend(db, user.userId)

@@ -1,254 +1,174 @@
-"""Phase C6: CRUD-level tests for the per-user OpenStack credential row.
+"""``app.crud.openstack_credentials``: one credential per user and project.
 
-Exercises the encryption round-trip on real DB rows: ciphertext on disk,
-plaintext only in-process. Integration-marked because Fernet round-trip
-plus the BYTEA columns requires the test database.
-
-Each test maps to one CRUD entry point in
-`app/crud/openstack_credentials.py`:
-
-  * upsert                         — write path, encrypts at rest
-  * get_decrypted_for_backend      — backend-only plaintext read
-  * stamp_validation               — touch-up of validation metadata
-  * delete                         — idempotent removal
-  * get_dispatch_envelope          — JSON-safe Celery envelope
+Stored only with the project Keystone named (``project_verified``);
+credentials from before carry a typed project and count for nobody until a
+re-check names theirs. Secrets are encrypted at rest and leave the table
+either as ciphertext (job envelope) or as plaintext for the backend's own
+calls, never anything else.
 """
 from __future__ import annotations
 
 import base64
-from datetime import datetime
+import json
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from app.crud import openstack_credentials as crud_creds
-from app.models import OpenStackAuthType, UserOpenStackCredential
+from app.models import (
+    App,
+    Deployment,
+    OpenStackAuthType,
+    Task,
+    TaskStatus,
+    TaskType,
+    UserOpenStackCredential,
+)
 from app.schemas import OpenStackCredentialUpsert
 from app.utils import crypto
+from tests.conftest import TEST_PROJECT, add_credential
+
+pytestmark = pytest.mark.integration
 
 
-# ----------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------
-def _password_payload(**overrides) -> OpenStackCredentialUpsert:
+def _payload(**overrides) -> OpenStackCredentialUpsert:
     base = {
         "auth_type": OpenStackAuthType.PASSWORD,
         "auth_url": "https://keystone.example/v3",
         "region_name": "RegionOne",
-        "interface": "public",
-        "identity_api_version": "3",
-        "project_id": "project-uuid",
-        "project_name": "demo",
+        "project_name": "typed-name",
         "user_domain_name": "Default",
-        "project_domain_name": "Default",
         "identifier": "alice",
-        "secret": "s3cret",
+        "secret": "hunter2",
     }
     base.update(overrides)
     return OpenStackCredentialUpsert(**base)
 
 
-# ----------------------------------------------------------------
-# upsert: ciphertext at rest
-# ----------------------------------------------------------------
-@pytest.mark.integration
-def test_upsert_encrypts_password_at_rest(db, mock_user):
-    payload = _password_payload(identifier="alice", secret="s3cret")
+def _deployment(db, owner, project_id):
+    app = App(name="a", userId=owner.userId, git_link="https://github.com/example/app")
+    db.add(app)
+    db.flush()
+    dep = Deployment(name="d", appId=app.appId, userId=owner.userId, os_project_id=project_id)
+    db.add(dep)
+    db.flush()
+    db.add(Task(deploymentId=dep.deploymentId, type=TaskType.DEPLOY, status=TaskStatus.SUCCESS))
+    db.commit()
+    return dep
 
-    row = crud_creds.upsert(db, mock_user.userId, payload, (True, None))
 
-    # The persisted columns must be Fernet ciphertext bytes, never the raw
-    # plaintext UTF-8 bytes.
-    assert isinstance(row.encrypted_identifier, (bytes, bytearray, memoryview))
-    assert isinstance(row.encrypted_secret, (bytes, bytearray, memoryview))
-    assert bytes(row.encrypted_identifier) != b"alice"
-    assert bytes(row.encrypted_secret) != b"s3cret"
-    assert b"alice" not in bytes(row.encrypted_identifier)
-    assert b"s3cret" not in bytes(row.encrypted_secret)
+def test_save_encrypts_and_takes_the_project_from_keystone(db, mock_user):
+    row, created = crud_creds.save(db, mock_user.userId, _payload(), "kp-1", "Keystone Name")
 
-    # And the round-trip must decrypt cleanly back to the originals.
-    assert crypto.decrypt(bytes(row.encrypted_identifier)) == "alice"
-    assert crypto.decrypt(bytes(row.encrypted_secret)) == "s3cret"
+    assert created is True
+    assert (row.project_id, row.project_name, row.project_verified) == ("kp-1", "Keystone Name", True)
+    assert b"hunter2" not in row.encrypted_secret and b"alice" not in row.encrypted_identifier
+    assert crypto.decrypt(row.encrypted_secret) == "hunter2"
+    assert row.last_validated_at is not None and row.last_validation_error is None
 
-    # Validation success stamps the timestamp and clears any prior error.
-    assert row.last_validated_at is not None
-    assert row.last_validation_error is None
 
-    # Re-read straight from the DB to confirm we are not just looking at
-    # in-memory attributes that bypassed the column.
+def test_save_for_the_same_project_replaces(db, mock_user):
+    first, _ = crud_creds.save(db, mock_user.userId, _payload(), "kp-1", None)
+    second, created = crud_creds.save(db, mock_user.userId, _payload(secret="rotated"), "kp-1", None)
+    other, other_created = crud_creds.save(db, mock_user.userId, _payload(), "kp-2", None)
+
+    assert created is False and second.credentialId == first.credentialId
+    assert crypto.decrypt(second.encrypted_secret) == "rotated"
+    assert other_created is True
+    assert {r.project_id for r in crud_creds.list_for_user(db, mock_user.userId)} == {"kp-1", "kp-2"}
+
+
+def test_verified_projects_are_unique_per_user_unverified_ones_are_not(db, mock_user):
+    add_credential(db, mock_user, "kp-1", verified=False)
+    add_credential(db, mock_user, "kp-1")  # an old row typed the same id: allowed
+
+    with pytest.raises(IntegrityError):
+        add_credential(db, mock_user, "kp-1")
+    db.rollback()
+
+
+def test_lookups_never_cross_users_and_ignore_unverified_rows(db, mock_user, mock_admin):
+    mine = add_credential(db, mock_user)
+    theirs = add_credential(db, mock_admin)
+    add_credential(db, mock_user, "typed", verified=False)
+
+    assert crud_creds.get_owned(db, mock_user.userId, mine.credentialId).credentialId == mine.credentialId
+    assert crud_creds.get_owned(db, mock_user.userId, theirs.credentialId) is None
+    assert crud_creds.get_for_project(db, mock_user.userId, TEST_PROJECT).credentialId == mine.credentialId
+    assert crud_creds.get_for_project(db, mock_user.userId, "typed") is None
+    assert crud_creds.get_for_project(db, mock_user.userId, None) is None
+    assert crud_creds.project_ids_of(db, mock_user.userId) == [TEST_PROJECT]
+
+
+def test_stamp_validation_failure_keeps_the_last_success(db, mock_user):
+    row = add_credential(db, mock_user)
+    row = crud_creds.stamp_validation(db, row, None)
+    stamped = row.last_validated_at
+
+    row = crud_creds.stamp_validation(db, row, "invalid_credentials")
+
+    assert row.last_validation_error == "invalid_credentials"
+    assert row.last_validated_at == stamped
+
+
+def test_a_recheck_never_moves_a_verified_credential(db, mock_user):
+    row = add_credential(db, mock_user)
+
+    row = crud_creds.stamp_validation(db, row, None, ("elsewhere", "Else"))
+
+    assert (row.project_id, row.project_verified) == (TEST_PROJECT, True)
+
+
+def test_a_recheck_of_an_old_credential_places_only_its_owners_unplaced_deployments(db, mock_user, mock_admin):
+    old = add_credential(db, mock_user, "typed", verified=False)
+    unplaced = _deployment(db, mock_user, None)
+    placed = _deployment(db, mock_user, "kp-9")
+    someone_elses = _deployment(db, mock_admin, None)
+
+    row = crud_creds.stamp_validation(db, old, None, ("kp-real", "Real"))
+
+    assert (row.project_id, row.project_name, row.project_verified) == ("kp-real", "Real", True)
     db.expire_all()
-    refreshed = crud_creds.get_for_user(db, mock_user.userId)
-    assert refreshed is not None
-    assert crypto.decrypt(bytes(refreshed.encrypted_identifier)) == "alice"
-    assert crypto.decrypt(bytes(refreshed.encrypted_secret)) == "s3cret"
+    assert db.get(Deployment, unplaced.deploymentId).os_project_id == "kp-real"
+    assert db.get(Deployment, placed.deploymentId).os_project_id == "kp-9"
+    assert db.get(Deployment, someone_elses.deploymentId).os_project_id is None
 
 
-# ----------------------------------------------------------------
-# get_decrypted_for_backend: plaintext for the backend's own OpenStack calls
-# ----------------------------------------------------------------
-@pytest.mark.integration
-def test_get_decrypted_for_backend_returns_plaintext(db, mock_user):
-    crud_creds.upsert(
-        db,
-        mock_user.userId,
-        _password_payload(identifier="alice", secret="s3cret"),
-        (True, None),
-    )
+def test_a_failed_recheck_places_nothing(db, mock_user):
+    old = add_credential(db, mock_user, "typed", verified=False)
+    unplaced = _deployment(db, mock_user, None)
 
-    decrypted = crud_creds.get_decrypted_for_backend(db, mock_user.userId)
+    row = crud_creds.stamp_validation(db, old, "invalid_credentials", None)
 
-    # Plaintext keys present.
-    assert decrypted["identifier"] == "alice"
-    assert decrypted["secret"] == "s3cret"
-
-    # Connection metadata is carried through verbatim.
-    assert decrypted["auth_type"] == OpenStackAuthType.PASSWORD.value
-    assert decrypted["auth_url"] == "https://keystone.example/v3"
-    assert decrypted["region_name"] == "RegionOne"
-    assert decrypted["interface"] == "public"
-    assert decrypted["identity_api_version"] == "3"
-    assert decrypted["project_id"] == "project-uuid"
-    assert decrypted["project_name"] == "demo"
-    assert decrypted["user_domain_name"] == "Default"
-    assert decrypted["project_domain_name"] == "Default"
-
-    # No ciphertext leaks into the plaintext-only dict.
-    assert "encrypted_identifier" not in decrypted
-    assert "encrypted_secret" not in decrypted
-    assert "encrypted_identifier_b64" not in decrypted
-    assert "encrypted_secret_b64" not in decrypted
-
-    # And when no credential exists, the dedicated error fires (rather
-    # than a generic AttributeError further down the stack).
-    crud_creds.delete(db, mock_user.userId)
-    with pytest.raises(crud_creds.NoCredentialError):
-        crud_creds.get_decrypted_for_backend(db, mock_user.userId)
-
-
-# ----------------------------------------------------------------
-# stamp_validation: metadata update without rotating ciphertext
-# ----------------------------------------------------------------
-@pytest.mark.integration
-def test_stamp_validation_records_timestamp_and_status(db, mock_user):
-    # Seed via upsert so we have a real row, but persist with a *failed*
-    # validation so last_validated_at starts as None.
-    row = crud_creds.upsert(
-        db,
-        mock_user.userId,
-        _password_payload(),
-        (False, "initial failure"),
-    )
-    assert row.last_validated_at is None
-    assert row.last_validation_error == "initial failure"
-
-    original_id_ct = bytes(row.encrypted_identifier)
-    original_sec_ct = bytes(row.encrypted_secret)
-
-    # 1. A failing stamp must NOT touch last_validated_at, but MUST
-    #    overwrite the error message.
-    before = datetime.utcnow()
-    crud_creds.stamp_validation(db, row, (False, "still bad"))
-    assert row.last_validated_at is None
-    assert row.last_validation_error == "still bad"
-
-    # 2. A passing stamp clears the error and writes a fresh timestamp.
-    crud_creds.stamp_validation(db, row, (True, None))
-    assert row.last_validation_error is None
-    assert row.last_validated_at is not None
-    assert row.last_validated_at >= before
-
-    # 3. Ciphertext columns are untouched — stamp_validation is purely
-    #    metadata, never a re-encrypt.
+    assert row.project_verified is False
     db.expire_all()
-    refreshed = crud_creds.get_for_user(db, mock_user.userId)
-    assert refreshed is not None
-    assert bytes(refreshed.encrypted_identifier) == original_id_ct
-    assert bytes(refreshed.encrypted_secret) == original_sec_ct
-    assert refreshed.last_validation_error is None
-    assert refreshed.last_validated_at is not None
+    assert db.get(Deployment, unplaced.deploymentId).os_project_id is None
 
 
-# ----------------------------------------------------------------
-# delete: idempotent removal
-# ----------------------------------------------------------------
-@pytest.mark.integration
-def test_delete_removes_row_idempotently(db, mock_user):
-    crud_creds.upsert(db, mock_user.userId, _password_payload(), (True, None))
-    assert crud_creds.get_for_user(db, mock_user.userId) is not None
+def test_dispatch_envelope_is_ciphertext_only(db, mock_user):
+    row = add_credential(db, mock_user, identifier="the-id")
 
-    # First delete: row exists, returns True.
-    assert crud_creds.delete(db, mock_user.userId) is True
-    db.expire_all()
-    assert crud_creds.get_for_user(db, mock_user.userId) is None
+    envelope = crud_creds.dispatch_envelope(row)
 
-    # Second delete on the same user: no row, returns False, no exception.
-    assert crud_creds.delete(db, mock_user.userId) is False
-    assert crud_creds.get_for_user(db, mock_user.userId) is None
-
-    # No phantom row was created as a side effect of the second call.
-    remaining = db.query(UserOpenStackCredential).filter(
-        UserOpenStackCredential.userId == mock_user.userId
-    ).count()
-    assert remaining == 0
+    assert "app-cred-secret" not in json.dumps(envelope) and "the-id" not in json.dumps(envelope)
+    assert crypto.decrypt(base64.b64decode(envelope["encrypted_identifier_b64"])) == "the-id"
+    assert crypto.decrypt(base64.b64decode(envelope["encrypted_secret_b64"])) == "app-cred-secret"
+    assert envelope["auth_type"] == "v3applicationcredential"
+    assert envelope["project_id"] == TEST_PROJECT
 
 
-# ----------------------------------------------------------------
-# get_dispatch_envelope: JSON-safe Celery payload
-# ----------------------------------------------------------------
-@pytest.mark.integration
-def test_get_dispatch_envelope_includes_minimal_fields_for_celery(db, mock_user):
-    crud_creds.upsert(
-        db,
-        mock_user.userId,
-        _password_payload(identifier="alice", secret="s3cret"),
-        (True, None),
-    )
+def test_decrypted_is_plaintext_for_the_backend_only(db, mock_user):
+    row = add_credential(db, mock_user, identifier="the-id")
 
-    envelope = crud_creds.get_dispatch_envelope(db, mock_user.userId)
+    plain = crud_creds.decrypted(row)
 
-    # ---- Required keys ----
-    expected_keys = {
-        "auth_type",
-        "auth_url",
-        "region_name",
-        "interface",
-        "identity_api_version",
-        "project_id",
-        "project_name",
-        "user_domain_name",
-        "project_domain_name",
-        "encrypted_identifier_b64",
-        "encrypted_secret_b64",
-    }
-    assert expected_keys.issubset(envelope.keys())
+    assert (plain["identifier"], plain["secret"]) == ("the-id", "app-cred-secret")
+    assert plain["auth_url"] == "https://keystone.example/v3"
 
-    # ---- Plaintext secrets MUST NOT appear ----
-    assert "identifier" not in envelope
-    assert "secret" not in envelope
-    # The literal plaintext must not leak anywhere in the envelope values
-    # (e.g. accidentally placed in metadata).
-    for value in envelope.values():
-        if isinstance(value, str):
-            assert "alice" not in value or value == envelope["encrypted_identifier_b64"]
-            assert "s3cret" not in value or value == envelope["encrypted_secret_b64"]
 
-    # ---- Auth metadata serialized as the enum value (JSON-safe) ----
-    assert envelope["auth_type"] == OpenStackAuthType.PASSWORD.value
-    assert isinstance(envelope["auth_type"], str)
+def test_delete(db, mock_user):
+    row = add_credential(db, mock_user)
 
-    # ---- Ciphertext is base64-ascii so it survives Celery JSON transport ----
-    id_b64 = envelope["encrypted_identifier_b64"]
-    sec_b64 = envelope["encrypted_secret_b64"]
-    assert isinstance(id_b64, str)
-    assert isinstance(sec_b64, str)
+    crud_creds.delete(db, row)
 
-    # Decoding the b64 must yield the same Fernet ciphertext that's on disk,
-    # which in turn decrypts back to the original plaintext.
-    id_ct = base64.b64decode(id_b64.encode("ascii"))
-    sec_ct = base64.b64decode(sec_b64.encode("ascii"))
-    assert crypto.decrypt(id_ct) == "alice"
-    assert crypto.decrypt(sec_ct) == "s3cret"
-
-    # ---- Missing credential raises NoCredentialError, not a generic error ----
-    crud_creds.delete(db, mock_user.userId)
-    with pytest.raises(crud_creds.NoCredentialError):
-        crud_creds.get_dispatch_envelope(db, mock_user.userId)
+    assert db.query(UserOpenStackCredential).count() == 0
