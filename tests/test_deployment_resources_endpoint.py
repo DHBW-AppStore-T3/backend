@@ -97,7 +97,7 @@ def _ensure_app(db, user) -> App:
         appId=uuid.uuid4(),
         name=f"app-{uuid.uuid4().hex[:8]}",
         userId=user.userId,
-        git_link="https://example.com/repo.git",
+        git_link="https://example.com/acme/repo.git",
     )
     db.add(app)
     db.commit()
@@ -397,15 +397,15 @@ def test_redeploy_resource_dispatches_celery_task(
     body = response.json()
     assert body["status"] == "redeploying"
 
-    # Celery was called with the redeploy task name and the address as
-    # the extra positional arg.
+    # Celery was called with the redeploy task name; the address travels
+    # as the task's ``resource_address`` keyword, next to the pinned commit.
     patched_celery_send.assert_called_once()
     name = patched_celery_send.call_args.args[0]
-    args = patched_celery_send.call_args.kwargs["args"]
+    kwargs = patched_celery_send.call_args.kwargs["kwargs"]
     assert name == "tasks.redeploy_resource"
-    # 7 standard args + 1 extra (resource_address)
-    assert len(args) == 8
-    assert args[-1] == ADDR_A
+    assert kwargs["resource_address"] == ADDR_A
+    assert kwargs["deployment_id"] == str(deployment.deploymentId)
+    assert len(kwargs["commit_sha"]) == 40
 
 
 @pytest.mark.integration

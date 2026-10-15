@@ -59,7 +59,7 @@ def _sessions_on_test_db(monkeypatch):
 def _seed(db, user, *, task_type=TaskType.DEPLOY, task_status=TaskStatus.SUCCESS, **task_fields) -> tuple:
     """App + deployment + one task + the user's OpenStack credential."""
     app = App(appId=uuid.uuid4(), name=f"app-{uuid.uuid4().hex[:6]}", userId=user.userId,
-              git_link="https://example.com/repo.git")
+              git_link="https://example.com/acme/repo.git")
     db.add(app)
     db.flush()
     deployment = Deployment(deploymentId=uuid.uuid4(), name=f"d-{uuid.uuid4().hex[:6]}", appId=app.appId,
@@ -126,7 +126,7 @@ def test_second_active_task_is_refused_by_the_database(db, mock_user):
 # ----------------------------------------------------------------
 def test_cancel_before_a_worker_claimed_the_job(client, db, mock_user):
     deployment, task = _seed(db, mock_user, task_status=TaskStatus.PENDING)
-    task_service.dispatch_to_celery(db, task, "tasks.deploy_application", [str(deployment.deploymentId)])
+    task_service.dispatch_to_celery(db, task, "tasks.deploy_application", {"deployment_id": str(deployment.deploymentId)})
 
     response = client.post(f"/deployments/{deployment.deploymentId}/cancel")
     assert response.status_code == 202
@@ -147,7 +147,7 @@ def test_cancel_while_a_worker_runs_the_job_parks_the_destroy(client, db, mock_u
         db, mock_user, task_status=TaskStatus.RUNNING,
         claimed_by="worker-1:42", lease_until=datetime.now(UTC) + timedelta(minutes=2),
     )
-    task_service.dispatch_to_celery(db, task, "tasks.deploy_application", [str(deployment.deploymentId)])
+    task_service.dispatch_to_celery(db, task, "tasks.deploy_application", {"deployment_id": str(deployment.deploymentId)})
     db.execute(text("UPDATE celery_queue SET claimed_by = 'worker-1', visible_after = now() + interval '5 min'"))
     db.commit()
 
@@ -342,7 +342,7 @@ def test_reconciler_fails_lost_dispatches_but_not_queued_or_fresh_ones(db, mock_
     old = datetime.utcnow() - timedelta(minutes=5)
     _, lost = _seed(db, mock_user, task_status=TaskStatus.PENDING, created_at=old)
     queued_dep, queued = _seed(db, mock_user, task_status=TaskStatus.PENDING, created_at=old)
-    task_service.dispatch_to_celery(db, queued, "tasks.deploy_application", [str(queued_dep.deploymentId)])
+    task_service.dispatch_to_celery(db, queued, "tasks.deploy_application", {"deployment_id": str(queued_dep.deploymentId)})
     _, fresh = _seed(db, mock_user, task_status=TaskStatus.PENDING)
 
     reconciler.reconcile_once()
@@ -360,7 +360,7 @@ def test_reconciler_releases_a_destroy_parked_behind_a_dead_worker(db, mock_user
                    status=TaskStatus.PENDING)
     db.add(destroy)
     db.commit()
-    task_service.dispatch_to_celery(db, destroy, "tasks.destroy_deployment", [], after_task_id=cancelled.taskId)
+    task_service.dispatch_to_celery(db, destroy, "tasks.destroy_deployment", {}, after_task_id=cancelled.taskId)
     assert not _queue_rows(db)[0]["visible"]
 
     reconciler.reconcile_once()

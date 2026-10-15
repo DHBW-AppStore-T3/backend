@@ -14,9 +14,11 @@ class Settings(BaseSettings):
     # deployment step that runs that command needs it.
     WORKER_DB_PASSWORD: str = ""
 
-    # Git
+    # Git: app repositories are public and read anonymously (.github#7 B).
+    # Apps may only be registered from these hosts (comma-separated, exact
+    # names); the worker checks the same list before it clones.
     TEMP_REPO_BASE_PATH: str = "/tmp/worker_repos"
-    GIT_ACCESS_TOKEN: str = ""  # Token for HTTPS git authentication
+    APP_GIT_ALLOWED_HOSTS: str = "github.com"
 
     # Keycloak — single source of truth for authentication
     KEYCLOAK_SERVER_URL: str = "http://keycloak:8080"

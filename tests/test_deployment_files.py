@@ -47,7 +47,9 @@ def _ensure_app(db, user) -> App:
         appId=uuid.uuid4(),
         name=f"app-{uuid.uuid4().hex[:8]}",
         userId=user.userId,
-        git_link="https://example.com/repo.git",
+        git_link="https://example.com/acme/repo.git",
+        # The owner's own private app: deployable without an approval.
+        is_private=True,
     )
     db.add(app)
     db.commit()
@@ -115,11 +117,13 @@ def test_post_deployment_persists_files_under_terraform(
     # Existing terraform vars were preserved through the merge.
     assert persisted["terraform"]["some_other"] == "x"
 
-    # Celery args carry the same dict — the worker sees what's in
-    # the DB.
-    celery_args = patched_celery.call_args.kwargs.get("args") or patched_celery.call_args.args[1]
-    user_vars_arg = celery_args[4]
+    # The job's keyword arguments carry the same dict — the worker sees
+    # what's in the DB — and the commit the deployment is pinned to.
+    job_kwargs = patched_celery.call_args.kwargs["kwargs"]
+    user_vars_arg = job_kwargs["user_vars"]
     assert user_vars_arg["terraform"]["task_pdf"]["all"]["content_b64"] == _b64(pdf)
+    assert job_kwargs["commit_sha"] == deployment.commit_sha
+    assert len(deployment.commit_sha) == 40
 
 
 @pytest.mark.integration

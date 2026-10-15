@@ -61,7 +61,7 @@ def _make_deployment_with_creds(
         appId=uuid.uuid4(),
         name=f"app-{uuid.uuid4().hex[:8]}",
         userId=user.userId,
-        git_link="https://example.com/repo.git",
+        git_link="https://example.com/acme/repo.git",
     )
     db.add(app)
     db.flush()

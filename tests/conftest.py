@@ -56,6 +56,13 @@ os.environ.setdefault("DISABLE_BACKGROUND_TASKS", "1")
 # tests that send for real must write into the test database.
 if os.getenv("TEST_DATABASE_URL"):
     os.environ.setdefault("CELERY_BROKER_URL", "pgq+" + os.environ["TEST_DATABASE_URL"])
+# App repositories may only come from these hosts (.github#7 B); the tests'
+# fixtures use example.com and github.com.
+os.environ.setdefault("APP_GIT_ALLOWED_HOSTS", "github.com,example.com")
+
+import hashlib
+import tempfile
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -147,6 +154,87 @@ def _truncate_tables(_setup_schema):
     with engine.connect() as conn:
         conn.execute(text(f"TRUNCATE {quoted} RESTART IDENTITY CASCADE"))
         conn.commit()
+
+
+# ----------------------------------------------------------------
+# Fake Git remote — no test reaches a real Git host.
+# ----------------------------------------------------------------
+class FakeGitRemote:
+    """Stands in for the app repositories behind ``git_service``.
+
+    ``tags`` maps tag -> commit SHA. With ``any_tag`` (the default) every
+    tag a test asks for exists and points to ``sha_for(tag)``; set
+    ``any_tag = False`` to make only ``tags`` exist. ``files`` maps a path
+    inside the repository to its content and is written into every sparse
+    clone, so ``load_variable_definitions`` parses it. ``moved`` makes a
+    tag point to another commit from now on (a moved tag).
+    """
+
+    def __init__(self) -> None:
+        self.any_tag = True
+        self.tags: dict[str, str] = {}
+        self.files: dict[str, str] = {}
+        self.clones: list[tuple[str, str, str]] = []
+        self.readable = True
+
+    @staticmethod
+    def sha_for(tag: str, salt: str = "") -> str:
+        return hashlib.sha1(f"{salt}{tag}".encode()).hexdigest()
+
+    def move(self, tag: str) -> str:
+        self.tags[tag] = self.sha_for(tag, salt="moved:")
+        return self.tags[tag]
+
+    def ls_remote(self, git_url: str):
+        import git as gitpython
+
+        from app.services.git_service import checked_url
+
+        checked_url(git_url)
+        if not self.readable:
+            raise gitpython.GitCommandError(["git", "ls-remote"], 128, stderr="repository not found")
+        tags = dict(self.tags)
+        return [{"version": t, "commit": s[:8], "sha": s, "type": "tag"} for t, s in tags.items()]
+
+    def verify(self, git_url: str) -> dict:
+        self.ls_remote(git_url)
+        return {"success": True, "message": "ok"}
+
+    def resolve(self, git_url: str, tag: str):
+        self.ls_remote(git_url)
+        if tag in self.tags:
+            return self.tags[tag]
+        return self.sha_for(tag) if self.any_tag else None
+
+    def clone(self, git_url: str, tag: str, commit_sha: str) -> str:
+        self.ls_remote(git_url)
+        self.clones.append((git_url, tag, commit_sha))
+        path = Path(tempfile.mkdtemp(prefix="fake_vars_"))
+        for rel, content in self.files.items():
+            target = path / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        return str(path)
+
+
+@pytest.fixture(autouse=True)
+def fake_git(request, monkeypatch):
+    """Every test talks to a ``FakeGitRemote`` unless marked ``real_git``."""
+    from app.routers import apps as apps_router
+    from app.services import git_service as git_module
+
+    apps_router.clear_variable_cache()
+    remote = FakeGitRemote()
+    if request.node.get_closest_marker("real_git"):
+        yield remote
+        return
+    svc = git_module.git_service
+    monkeypatch.setattr(svc, "_ls_remote_tags", remote.ls_remote)
+    monkeypatch.setattr(svc, "resolve_tag", remote.resolve)
+    monkeypatch.setattr(svc, "clone_release_vars", remote.clone)
+    monkeypatch.setattr(svc, "verify_repository_access", remote.verify)
+    yield remote
+    apps_router.clear_variable_cache()
 
 
 # ----------------------------------------------------------------
@@ -305,6 +393,22 @@ def unauth_client():
 # ----------------------------------------------------------------
 # SHARED DB HELPERS
 # ----------------------------------------------------------------
+def approve_version_in_db(db, app, version_tag="v1.0.0", commit_sha=None, status=None):
+    """Store an approval of ``version_tag`` at ``commit_sha`` (default: what the fake remote resolves)."""
+    from app.models import AppVersionApproval, AppVersionApprovalStatus
+
+    approval = AppVersionApproval(
+        appId=app.appId,
+        version_tag=version_tag,
+        commit_sha=commit_sha or FakeGitRemote.sha_for(version_tag),
+        status=status or AppVersionApprovalStatus.APPROVED,
+    )
+    db.add(approval)
+    db.commit()
+    db.refresh(approval)
+    return approval
+
+
 def create_app_in_db(db, user, *, name="Test App", git_link="https://github.com/example/repo", is_private=False):
     db_app = App(
         appId=uuid.uuid4(),

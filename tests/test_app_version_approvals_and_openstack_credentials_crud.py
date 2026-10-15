@@ -13,6 +13,7 @@ testen.
 from __future__ import annotations
 
 import base64
+import hashlib
 import uuid
 from datetime import datetime
 
@@ -37,6 +38,11 @@ from app.utils import crypto
 # ----------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------
+def _sha(tag: str) -> str:
+    """A commit SHA for ``tag`` (the tests never reach a Git host)."""
+    return hashlib.sha1(tag.encode()).hexdigest()
+
+
 def _make_user(db, *, role: UserRole = UserRole.STUDENT) -> User:
     user = User(
         userId=uuid.uuid4(),
@@ -90,6 +96,7 @@ def test_submit_version_creates_pending_row(db):
         db,
         application.appId,
         "v1.0.0",
+        _sha("v1.0.0"),
         diff_url="https://example/diff",
         notes="initial submission",
     )
@@ -97,6 +104,7 @@ def test_submit_version_creates_pending_row(db):
     assert approval.status == AppVersionApprovalStatus.PENDING
     assert approval.appId == application.appId
     assert approval.version_tag == "v1.0.0"
+    assert approval.commit_sha == _sha("v1.0.0")
     assert approval.diff_url == "https://example/diff"
     assert approval.notes == "initial submission"
     assert approval.reviewed_at is None
@@ -109,10 +117,10 @@ def test_submit_version_conflict_when_already_pending(db):
     """Erneutes submit auf eine PENDING-Zeile gibt 409."""
     owner = _make_user(db)
     application = _make_app(db, owner)
-    crud_approvals.submit_version(db, application.appId, "v1.0.0")
+    crud_approvals.submit_version(db, application.appId, "v1.0.0", _sha("v1.0.0"))
 
     with pytest.raises(HTTPException) as exc:
-        crud_approvals.submit_version(db, application.appId, "v1.0.0")
+        crud_approvals.submit_version(db, application.appId, "v1.0.0", _sha("v1.0.0"))
     assert exc.value.status_code == 409
     assert "pending" in exc.value.detail.lower()
 
@@ -123,11 +131,11 @@ def test_submit_version_conflict_when_already_approved(db):
     owner = _make_user(db)
     admin = _make_user(db, role=UserRole.ADMIN)
     application = _make_app(db, owner)
-    crud_approvals.submit_version(db, application.appId, "v1.0.0")
+    crud_approvals.submit_version(db, application.appId, "v1.0.0", _sha("v1.0.0"))
     crud_approvals.approve(db, application.appId, "v1.0.0", admin.userId)
 
     with pytest.raises(HTTPException) as exc:
-        crud_approvals.submit_version(db, application.appId, "v1.0.0")
+        crud_approvals.submit_version(db, application.appId, "v1.0.0", _sha("v1.0.0"))
     assert exc.value.status_code == 409
     assert "approved" in exc.value.detail.lower()
 
@@ -138,12 +146,12 @@ def test_submit_version_after_rejection_replaces_row(db):
     owner = _make_user(db)
     admin = _make_user(db, role=UserRole.ADMIN)
     application = _make_app(db, owner)
-    first = crud_approvals.submit_version(db, application.appId, "v1.0.0")
+    first = crud_approvals.submit_version(db, application.appId, "v1.0.0", _sha("v1.0.0"))
     crud_approvals.reject(
         db, application.appId, "v1.0.0", admin.userId, "needs work"
     )
 
-    second = crud_approvals.submit_version(db, application.appId, "v1.0.0")
+    second = crud_approvals.submit_version(db, application.appId, "v1.0.0", _sha("v1.0.0"))
 
     assert second.status == AppVersionApprovalStatus.PENDING
     assert second.approvalId != first.approvalId
@@ -167,8 +175,8 @@ def test_get_pending_approvals_only_public_apps(db):
     public_app = _make_app(db, owner, is_private=False, name="pub")
     private_app = _make_app(db, owner, is_private=True, name="priv")
 
-    pending_pub = crud_approvals.submit_version(db, public_app.appId, "v1")
-    crud_approvals.submit_version(db, private_app.appId, "v1")
+    pending_pub = crud_approvals.submit_version(db, public_app.appId, "v1", _sha("v1"))
+    crud_approvals.submit_version(db, private_app.appId, "v1", _sha("v1"))
 
     result = crud_approvals.get_pending_approvals(db)
 
@@ -185,13 +193,13 @@ def test_get_pending_approvals_excludes_non_pending(db):
     admin = _make_user(db, role=UserRole.ADMIN)
     application = _make_app(db, owner, is_private=False)
 
-    crud_approvals.submit_version(db, application.appId, "v1")
+    crud_approvals.submit_version(db, application.appId, "v1", _sha("v1"))
     crud_approvals.approve(db, application.appId, "v1", admin.userId)
 
-    crud_approvals.submit_version(db, application.appId, "v2")
+    crud_approvals.submit_version(db, application.appId, "v2", _sha("v2"))
     crud_approvals.reject(db, application.appId, "v2", admin.userId, "no")
 
-    pending_v3 = crud_approvals.submit_version(db, application.appId, "v3")
+    pending_v3 = crud_approvals.submit_version(db, application.appId, "v3", _sha("v3"))
 
     result = crud_approvals.get_pending_approvals(db)
     assert [a.approvalId for a in result] == [pending_v3.approvalId]
@@ -203,17 +211,17 @@ def test_get_approvals_for_app_newest_first(db):
     owner = _make_user(db)
     application = _make_app(db, owner)
 
-    a1 = crud_approvals.submit_version(db, application.appId, "v1")
+    a1 = crud_approvals.submit_version(db, application.appId, "v1", _sha("v1"))
     # Direkt nach dem Commit Datum manuell setzen, damit die Ordnung
     # deterministisch ist (keine Sleeps).
     a1.created_at = datetime(2024, 1, 1, 12, 0, 0)
     db.commit()
 
-    a2 = crud_approvals.submit_version(db, application.appId, "v2")
+    a2 = crud_approvals.submit_version(db, application.appId, "v2", _sha("v2"))
     a2.created_at = datetime(2024, 6, 1, 12, 0, 0)
     db.commit()
 
-    a3 = crud_approvals.submit_version(db, application.appId, "v3")
+    a3 = crud_approvals.submit_version(db, application.appId, "v3", _sha("v3"))
     a3.created_at = datetime(2024, 12, 1, 12, 0, 0)
     db.commit()
 
@@ -237,22 +245,22 @@ def test_has_approved_version_true_and_false(db):
 
     # Keine Approval-Zeile vorhanden -> False.
     assert (
-        crud_approvals.has_approved_version(db, application.appId, "v1") is False
+        crud_approvals.has_approved_version(db, application.appId, "v1", _sha("v1")) is False
     )
 
-    crud_approvals.submit_version(db, application.appId, "v1")
+    crud_approvals.submit_version(db, application.appId, "v1", _sha("v1"))
     # PENDING zaehlt nicht.
     assert (
-        crud_approvals.has_approved_version(db, application.appId, "v1") is False
+        crud_approvals.has_approved_version(db, application.appId, "v1", _sha("v1")) is False
     )
 
     crud_approvals.approve(db, application.appId, "v1", admin.userId)
     assert (
-        crud_approvals.has_approved_version(db, application.appId, "v1") is True
+        crud_approvals.has_approved_version(db, application.appId, "v1", _sha("v1")) is True
     )
     # Andere Version: False.
     assert (
-        crud_approvals.has_approved_version(db, application.appId, "v2") is False
+        crud_approvals.has_approved_version(db, application.appId, "v2", _sha("v2")) is False
     )
 
 
@@ -265,7 +273,7 @@ def test_has_any_approved_version_true_and_false(db):
 
     assert crud_approvals.has_any_approved_version(db, application.appId) is False
 
-    crud_approvals.submit_version(db, application.appId, "v1")
+    crud_approvals.submit_version(db, application.appId, "v1", _sha("v1"))
     assert crud_approvals.has_any_approved_version(db, application.appId) is False
 
     crud_approvals.approve(db, application.appId, "v1", admin.userId)
@@ -273,11 +281,83 @@ def test_has_any_approved_version_true_and_false(db):
 
 
 @pytest.mark.integration
+def test_approval_covers_only_its_commit(db):
+    """A moved tag is not approved any more (.github#7 G)."""
+    owner = _make_user(db)
+    admin = _make_user(db, role=UserRole.ADMIN)
+    application = _make_app(db, owner)
+    crud_approvals.submit_version(db, application.appId, "v1", _sha("v1"))
+    crud_approvals.approve(db, application.appId, "v1", admin.userId)
+
+    assert crud_approvals.has_approved_version(db, application.appId, "v1", _sha("v1")) is True
+    assert crud_approvals.has_approved_version(db, application.appId, "v1", _sha("other")) is False
+    assert crud_approvals.has_approved_version(db, application.appId, "v1", "") is False
+    assert crud_approvals.approved_commits(db, application.appId) == {"v1": _sha("v1")}
+
+
+@pytest.mark.integration
+def test_resubmitting_a_moved_tag_replaces_the_approval(db):
+    """The tag points elsewhere now: submitting it again starts a new review."""
+    owner = _make_user(db)
+    admin = _make_user(db, role=UserRole.ADMIN)
+    application = _make_app(db, owner)
+    crud_approvals.submit_version(db, application.appId, "v1", _sha("v1"))
+    crud_approvals.approve(db, application.appId, "v1", admin.userId)
+
+    again = crud_approvals.submit_version(db, application.appId, "v1", _sha("moved"))
+
+    assert again.status == AppVersionApprovalStatus.PENDING
+    assert again.commit_sha == _sha("moved")
+    assert crud_approvals.has_approved_version(db, application.appId, "v1", _sha("v1")) is False
+
+
+@pytest.mark.integration
+def test_unpinned_approvals_never_count(db):
+    """Approvals from before the pinning have no commit and approve nothing."""
+    owner = _make_user(db)
+    admin = _make_user(db, role=UserRole.ADMIN)
+    application = _make_app(db, owner)
+    db.add(AppVersionApproval(
+        appId=application.appId, version_tag="v1", status=AppVersionApprovalStatus.APPROVED,
+    ))
+    db.add(AppVersionApproval(
+        appId=application.appId, version_tag="v2", status=AppVersionApprovalStatus.PENDING,
+    ))
+    db.commit()
+
+    assert crud_approvals.has_any_approved_version(db, application.appId) is False
+    assert crud_approvals.approved_commits(db, application.appId) == {}
+    with pytest.raises(HTTPException) as exc:
+        crud_approvals.approve(db, application.appId, "v2", admin.userId)
+    assert exc.value.status_code == 409
+    assert exc.value.detail["reason"] == "version_not_pinned"
+
+
+@pytest.mark.integration
+def test_pin_unpinned_records_the_current_commit(db):
+    """The backfill pins entries whose tag still exists and leaves the rest."""
+    owner = _make_user(db)
+    application = _make_app(db, owner)
+    db.add(AppVersionApproval(
+        appId=application.appId, version_tag="v1", status=AppVersionApprovalStatus.APPROVED,
+    ))
+    db.add(AppVersionApproval(
+        appId=application.appId, version_tag="gone", status=AppVersionApprovalStatus.APPROVED,
+    ))
+    db.commit()
+
+    done = crud_approvals.pin_unpinned(db, application.appId, {"v1": _sha("v1")}.get)
+
+    assert sorted(done, key=lambda d: d[0]) == [("gone", None), ("v1", _sha("v1"))]
+    assert crud_approvals.approved_commits(db, application.appId) == {"v1": _sha("v1")}
+
+
+@pytest.mark.integration
 def test_withdraw_deletes_pending_row(db):
     """withdraw entfernt eine PENDING-Zeile vollstaendig."""
     owner = _make_user(db)
     application = _make_app(db, owner)
-    crud_approvals.submit_version(db, application.appId, "v1")
+    crud_approvals.submit_version(db, application.appId, "v1", _sha("v1"))
 
     crud_approvals.withdraw(db, application.appId, "v1")
 
@@ -298,7 +378,7 @@ def test_withdraw_conflict_when_approved(db):
     owner = _make_user(db)
     admin = _make_user(db, role=UserRole.ADMIN)
     application = _make_app(db, owner)
-    crud_approvals.submit_version(db, application.appId, "v1")
+    crud_approvals.submit_version(db, application.appId, "v1", _sha("v1"))
     crud_approvals.approve(db, application.appId, "v1", admin.userId)
 
     with pytest.raises(HTTPException) as exc:
@@ -312,7 +392,7 @@ def test_approve_sets_reviewer_and_timestamp(db):
     owner = _make_user(db)
     admin = _make_user(db, role=UserRole.ADMIN)
     application = _make_app(db, owner)
-    crud_approvals.submit_version(db, application.appId, "v1")
+    crud_approvals.submit_version(db, application.appId, "v1", _sha("v1"))
 
     before = datetime.utcnow()
     approval = crud_approvals.approve(
@@ -332,7 +412,7 @@ def test_approve_conflict_when_already_approved(db):
     owner = _make_user(db)
     admin = _make_user(db, role=UserRole.ADMIN)
     application = _make_app(db, owner)
-    crud_approvals.submit_version(db, application.appId, "v1")
+    crud_approvals.submit_version(db, application.appId, "v1", _sha("v1"))
     crud_approvals.approve(db, application.appId, "v1", admin.userId)
 
     with pytest.raises(HTTPException) as exc:
@@ -346,7 +426,7 @@ def test_reject_requires_pending(db):
     owner = _make_user(db)
     admin = _make_user(db, role=UserRole.ADMIN)
     application = _make_app(db, owner)
-    crud_approvals.submit_version(db, application.appId, "v1")
+    crud_approvals.submit_version(db, application.appId, "v1", _sha("v1"))
 
     rejected = crud_approvals.reject(
         db, application.appId, "v1", admin.userId, "not good"
@@ -357,7 +437,7 @@ def test_reject_requires_pending(db):
     assert rejected.reviewed_at is not None
 
     # Erneut submitten, danach approven, dann reject -> 409.
-    crud_approvals.submit_version(db, application.appId, "v1")
+    crud_approvals.submit_version(db, application.appId, "v1", _sha("v1"))
     crud_approvals.approve(db, application.appId, "v1", admin.userId)
     with pytest.raises(HTTPException) as exc:
         crud_approvals.reject(
@@ -372,7 +452,7 @@ def test_revoke_requires_approved(db):
     owner = _make_user(db)
     admin = _make_user(db, role=UserRole.ADMIN)
     application = _make_app(db, owner)
-    crud_approvals.submit_version(db, application.appId, "v1")
+    crud_approvals.submit_version(db, application.appId, "v1", _sha("v1"))
     crud_approvals.approve(db, application.appId, "v1", admin.userId)
 
     before = datetime.utcnow()
@@ -393,7 +473,7 @@ def test_revoke_conflict_when_pending(db):
     owner = _make_user(db)
     admin = _make_user(db, role=UserRole.ADMIN)
     application = _make_app(db, owner)
-    crud_approvals.submit_version(db, application.appId, "v1")
+    crud_approvals.submit_version(db, application.appId, "v1", _sha("v1"))
 
     with pytest.raises(HTTPException) as exc:
         crud_approvals.revoke(

@@ -446,7 +446,7 @@ def get_deployments(
     return query.offset(skip).limit(limit).all()
 
 
-def create_deployment(db: Session, deployment: DeploymentCreate, user_id: UUID) -> Deployment:
+def create_deployment(db: Session, deployment: DeploymentCreate, user_id: UUID, commit_sha: str) -> Deployment:
     """Insert a deployment row in the current transaction.
 
     Does NOT commit — the caller is expected to also insert teams/tasks
@@ -464,6 +464,7 @@ def create_deployment(db: Session, deployment: DeploymentCreate, user_id: UUID) 
         appId=deployment.appId,
         userId=user_id,
         releaseTag=deployment.releaseTag,
+        commit_sha=commit_sha,
         userInputVar=user_input_var_json,
     )
     db.add(db_deployment)

@@ -76,7 +76,7 @@ def _make_app(
     app_row = App(
         name=name,
         description="desc",
-        git_link="https://example.com/repo.git",
+        git_link="https://example.com/acme/repo.git",
         is_private=is_private,
         userId=user_id,
     )

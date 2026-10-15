@@ -161,6 +161,9 @@ class AppVersionApprovalResponse(BaseModel):
     approvalId: UUID
     appId: UUID
     version_tag: str
+    # The reviewed commit; the approval does not cover the tag once it
+    # moves (.github#7 G). None for reviews from before the pinning.
+    commit_sha: str | None = None
     status: AppVersionApprovalStatus
     diff_url: str | None = None
     notes: str | None = None
@@ -208,7 +211,9 @@ class DeploymentFileUpload(BaseModel):
 
 
 class DeploymentCreate(DeploymentBase):
-    releaseTag: str | None = None
+    # Required: the deployment runs the commit this tag points to now,
+    # which must be the approved one for a public app (.github#7 G).
+    releaseTag: str = Field(..., min_length=1)
     userInputVar: dict[str, Any] | None = None
     # Files-map keyed by ``@openstack:file:<scope>``-marked variable
     # name. Inner key:
@@ -225,6 +230,8 @@ class DeploymentResponse(DeploymentBase):
     deploymentId: UUID
     userId: UUID
     releaseTag: str | None = None
+    # The commit every job of the deployment runs.
+    commit_sha: str | None = None
     userInputVar: dict[str, Any] | None = None
     status: str | None = None  # From latest task
     created_at: datetime | None = None

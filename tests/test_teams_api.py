@@ -59,7 +59,7 @@ def _make_deployment(db, owner: User) -> Deployment:
     app_row = App(
         appId=uuid.uuid4(),
         name=f"App-{uuid.uuid4().hex[:6]}",
-        git_link="https://example.com/repo.git",
+        git_link="https://example.com/acme/repo.git",
         is_private=False,
         userId=owner.userId,
     )

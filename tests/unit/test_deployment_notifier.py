@@ -82,7 +82,7 @@ def test_notify_deployment_succeeded_sends_emails_to_all_members():
 
     team = SimpleNamespace(teamId=uuid.uuid4(), name="Team-1")
     app_obj = SimpleNamespace(
-        appId=uuid.uuid4(), name="my-app", git_link="https://example.com/r.git",
+        appId=uuid.uuid4(), name="my-app", git_link="https://example.com/acme/r.git",
     )
     deployment = SimpleNamespace(
         deploymentId=uuid.uuid4(),
@@ -158,7 +158,7 @@ def test_resend_user_access_to_single_recipient():
 
     team = SimpleNamespace(teamId=uuid.uuid4(), name="Team-1")
     app_obj = SimpleNamespace(
-        appId=uuid.uuid4(), name="my-app", git_link="https://example.com/r.git",
+        appId=uuid.uuid4(), name="my-app", git_link="https://example.com/acme/r.git",
     )
     deployment = SimpleNamespace(
         deploymentId=uuid.uuid4(),
@@ -226,7 +226,7 @@ def test_resend_user_access_raises_when_outputs_missing():
 
     team = SimpleNamespace(teamId=uuid.uuid4(), name="Team-1")
     app_obj = SimpleNamespace(
-        appId=uuid.uuid4(), name="my-app", git_link="https://example.com/r.git",
+        appId=uuid.uuid4(), name="my-app", git_link="https://example.com/acme/r.git",
     )
     deployment = SimpleNamespace(
         deploymentId=uuid.uuid4(),
@@ -283,7 +283,7 @@ def test_notify_handles_smtp_failure_gracefully():
 
     team = SimpleNamespace(teamId=uuid.uuid4(), name="Team-1")
     app_obj = SimpleNamespace(
-        appId=uuid.uuid4(), name="my-app", git_link="https://example.com/r.git",
+        appId=uuid.uuid4(), name="my-app", git_link="https://example.com/acme/r.git",
     )
     deployment = SimpleNamespace(
         deploymentId=uuid.uuid4(),

@@ -65,7 +65,7 @@ def _seed_deployment_with_team(
         appId=uuid.uuid4(),
         name=f"app-{uuid.uuid4().hex[:8]}",
         userId=owner.userId,
-        git_link="https://example.com/repo.git",
+        git_link="https://example.com/acme/repo.git",
     )
     db.add(app)
     db.flush()

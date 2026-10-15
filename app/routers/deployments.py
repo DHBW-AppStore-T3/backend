@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import desc, or_, select, text
 from sqlalchemy.orm import Session
 
+from app.crud import app_version_approvals as crud_approvals
 from app.crud import apps as crud_apps
 from app.crud import deployments as crud_deployments
 from app.crud import locks as crud_locks
@@ -164,6 +165,7 @@ def list_deployments(
             appId=deployment.appId,
             userId=deployment.userId,
             releaseTag=deployment.releaseTag,
+            commit_sha=deployment.commit_sha,
             userInputVar=user_input_var_parsed,
             status=status_value,
             created_at=first_created_at,
@@ -285,6 +287,7 @@ def get_deployment(
         appId=deployment.appId,
         userId=deployment.userId,
         releaseTag=deployment.releaseTag,
+        commit_sha=deployment.commit_sha,
         userInputVar=user_input_var_parsed,
         status=status_value,
         created_at=created_at,
@@ -339,23 +342,27 @@ def create_deployment(
     # endpoint when visibility is denied.
     ensure_view_app(current_user, target_app, db=db)
 
-    # Load the app author's variable declarations so we can enforce
+    # The deployment runs the commit the tag points to now, and every job
+    # of it runs exactly that commit (.github#7 G). A public app needs an
+    # approval of exactly this commit; a private app is its owner's test
+    # bench (only the owner and admins get past ``ensure_view_app``).
+    # Unknown tag 404, unreadable repository 502.
+    from app.routers.apps import load_variable_definitions, resolve_version_commit
+    commit_sha = resolve_version_commit(target_app, deployment.releaseTag)
+    if not target_app.is_private and not crud_approvals.has_approved_version(
+        db, target_app.appId, deployment.releaseTag, commit_sha
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "version_not_approved", "version": deployment.releaseTag},
+        )
+
+    # The app author's variable declarations at that commit, to enforce
     # per-variable contracts (``varScope``, ``fileExtensions``) below.
-    # We only do this when the request actually carries variables /
-    # files — for a no-input deploy the round-trip into Git would be
-    # waste. Same parser as ``GET /apps/{id}/variables`` so client and
-    # server agree on which variable is scoped/file/free-text.
-    variable_definitions: list[dict] = []
-    if deployment.userInputVar or deployment.files:
-        from app.routers.apps import load_variable_definitions
-        release_tag = deployment.releaseTag or "main"
-        try:
-            variable_definitions = load_variable_definitions(target_app, release_tag)
-        except HTTPException as exc:
-            if exc.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY:
-                raise
-            # 400 (no git_link) or 500 (git unreachable) — skip validation,
-            # proceed without variable definitions.
+    # Fails closed: without the declarations nothing is deployed. Same
+    # parser as ``GET /apps/{id}/variables`` so client and server agree on
+    # which variable is scoped/file/free-text; cached per commit.
+    variable_definitions = load_variable_definitions(target_app, deployment.releaseTag, commit_sha)
 
     # Fold the wizard's parallel ``files`` upload into
     # ``userInputVar.terraform`` before the row gets persisted, so the
@@ -381,7 +388,7 @@ def create_deployment(
         )
 
     db_deployment = crud_deployments.create_deployment(
-        db, deployment, current_user.userId
+        db, deployment, current_user.userId, commit_sha
     )
 
     user_ids_in_deployment = set()
@@ -413,7 +420,9 @@ def create_deployment(
     except Exception:
         user_vars = {}
 
-    # Format teams for Terraform (team_name: [user_emails])
+    # The roster the worker gets: per team the members' e-mail (what the
+    # apps' ``users`` variable carries), user id and username. The id lets
+    # access data be matched to exactly one person (.github#7 H).
     teams_dict = {}
     if deployment.teams:
         for team in deployment.teams:
@@ -421,7 +430,7 @@ def create_deployment(
             for user_id in team.userIds:
                 user = crud_users.get_user(db, user_id)
                 if user:
-                    team_users.append({"email": user.email})
+                    team_users.append(_member_entry(user))
             teams_dict[team.name] = team_users
 
     # Per-user OpenStack credentials are required to deploy. The envelope
@@ -444,15 +453,7 @@ def create_deployment(
         deployment_id=db_deployment.deploymentId,
         task_type=TaskType.DEPLOY,
         celery_task_name="tasks.deploy_application",
-        celery_args=[
-            str(db_deployment.deploymentId),
-            str(db_deployment.appId),
-            db_deployment.app.git_link,
-            db_deployment.releaseTag,
-            user_vars,
-            teams_dict,
-            openstack_envelope,
-        ],
+        celery_kwargs=_job_kwargs(db_deployment, user_vars, teams_dict, openstack_envelope),
         dispatch_error_label="Could not dispatch deployment task — please retry",
         rollback_on_conflict=True,
     )
@@ -473,6 +474,7 @@ def create_deployment(
         appId=db_deployment.appId,
         userId=db_deployment.userId,
         releaseTag=db_deployment.releaseTag,
+        commit_sha=db_deployment.commit_sha,
         userInputVar=user_input_var_parsed,
         status=status_value,
         created_at=created_at,
@@ -583,13 +585,55 @@ def _fetch_dispatch_envelope(db: Session, user_id, *, rollback_on_missing: bool)
         )
 
 
+def _member_entry(user: User) -> dict:
+    """One team member as the worker gets it: e-mail, user id, username."""
+    return {"email": user.email, "user_id": str(user.userId), "username": user.username}
+
+
+def _job_kwargs(deployment, user_vars: dict, teams: dict, openstack_envelope: dict, **extra) -> dict:
+    """The keyword arguments every job of ``deployment`` receives.
+
+    ``commit_sha`` is the commit the deployment was created with; the
+    worker fetches exactly it and never resolves a tag (.github#7 G).
+    """
+    return {
+        "deployment_id": str(deployment.deploymentId),
+        "app_id": str(deployment.appId),
+        "app_git_link": deployment.app.git_link,
+        "release": deployment.releaseTag,
+        "commit_sha": deployment.commit_sha,
+        "user_vars": user_vars,
+        "teams": teams,
+        "openstack_envelope": openstack_envelope,
+        **extra,
+    }
+
+
+def _pin_legacy_commit(db: Session, deployment) -> None:
+    """Pin a deployment created before commits were pinned (.github#7 G).
+
+    Its jobs used to clone the tag by name. The commit the tag points to
+    on the first lifecycle action after the upgrade is recorded and used
+    from then on, so the code cannot change under it again. Not committed
+    here; the task insert commits it.
+    """
+    if deployment.commit_sha:
+        return
+    from app.routers.apps import resolve_version_commit
+    deployment.commit_sha = resolve_version_commit(deployment.app, deployment.releaseTag or "")
+    logger.warning(
+        "Deployment %s had no pinned commit; pinned %s (tag %s as it is now)",
+        deployment.deploymentId, deployment.commit_sha[:8], deployment.releaseTag,
+    )
+
+
 def _commit_and_dispatch(
     db: Session,
     *,
     deployment_id,
     task_type: TaskType,
     celery_task_name: str,
-    celery_args: list,
+    celery_kwargs: dict,
     dispatch_error_label: str,
     rollback_on_conflict: bool,
     after_task_id=None,
@@ -632,7 +676,7 @@ def _commit_and_dispatch(
             db,
             task=task,
             celery_task_name=celery_task_name,
-            celery_args=celery_args,
+            celery_kwargs=celery_kwargs,
             after_task_id=after_task_id,
         )
     except Exception:
@@ -666,7 +710,7 @@ def _dispatch_lifecycle_task(
     task_type: TaskType,
     celery_task_name: str,
     response_status: str,
-    extra_args: list | None = None,
+    extra_kwargs: dict | None = None,
     after_task_id=None,
 ):
     """Enqueue any post-deploy lifecycle worker task for a deployment.
@@ -691,10 +735,9 @@ def _dispatch_lifecycle_task(
                              frontend in the 202 body — frontend uses
                              this to immediately switch the UI into the
                              live-stream view without re-fetching.
-        extra_args:          additional positional args appended to the
-                             Celery payload after the standard seven.
-                             Used by ``tasks.redeploy_resource`` to pass
-                             the targeted resource address.
+        extra_kwargs:        task-specific keyword arguments on top of the
+                             common payload (``_job_kwargs``), e.g. the
+                             ``resource_address`` of a redeploy.
         after_task_id:       park the task until that task's worker let
                              go of it (destroy after cancel).
     """
@@ -748,27 +791,19 @@ def _dispatch_lifecycle_task(
         # the ORM. ``get_team_members`` does the join for us.
         for team in deployment.teams:
             members = crud_deployments.get_team_members(db, team.teamId)
-            teams_dict[team.name] = [{"email": m.email} for m in members]
+            teams_dict[team.name] = [_member_entry(m) for m in members]
 
     openstack_envelope = _fetch_dispatch_envelope(
         db, current_user.userId, rollback_on_missing=False
     )
+    _pin_legacy_commit(db, deployment)
 
     task = _commit_and_dispatch(
         db,
         deployment_id=deployment.deploymentId,
         task_type=task_type,
         celery_task_name=celery_task_name,
-        celery_args=[
-            str(deployment.deploymentId),
-            str(deployment.appId),
-            deployment.app.git_link,
-            deployment.releaseTag,
-            user_vars,
-            teams_dict,
-            openstack_envelope,
-            *(extra_args or []),
-        ],
+        celery_kwargs=_job_kwargs(deployment, user_vars, teams_dict, openstack_envelope, **(extra_kwargs or {})),
         dispatch_error_label=f"Could not dispatch {task_type.value} task — please retry",
         rollback_on_conflict=False,
         after_task_id=after_task_id,
@@ -1018,7 +1053,7 @@ def redeploy_deployment_resource(
         task_type=TaskType.REDEPLOY,
         celery_task_name="tasks.redeploy_resource",
         response_status="redeploying",
-        extra_args=[address],
+        extra_kwargs={"resource_address": address},
     )
 
 
@@ -1131,8 +1166,7 @@ def cancel_deployment(
         task_type=TaskType.DESTROY,
         celery_task_name="tasks.destroy_deployment",
         response_status="destroying",
-        # Positional tail of the worker signature: sweep_build_artifacts.
-        extra_args=[True],
+        extra_kwargs={"sweep_build_artifacts": True},
         after_task_id=blocking_task_id,
     )
 

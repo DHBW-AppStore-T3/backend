@@ -167,6 +167,7 @@ markers = [
     "unit: fast tests with no external dependencies",
     "integration: tests requiring database or broker",
     "api: end-to-end API tests",
+    "real_git: uses the real git_service instead of the fake remote from conftest",
 ]
 filterwarnings = [
     "error",

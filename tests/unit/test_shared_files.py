@@ -1,8 +1,9 @@
 """Code shared with the worker stays identical (.github#5).
 
-``app/pgq.py`` (the Kombu transport) and ``app/task_contract.py`` (event
-types, payloads, sealed results) exist in ``backend`` and ``worker`` until
-a shared package is decided. The same test in both repositories pins their
+``app/pgq.py`` (the Kombu transport), ``app/task_contract.py`` (event
+types, payloads, sealed results) and ``app/git_urls.py`` (the Git host
+allowlist, .github#7 B) exist in ``backend`` and ``worker`` until a shared
+package is decided. The same test in both repositories pins their
 content: change a file in one repository, copy it to the other and update
 the hash in both tests.
 """
@@ -15,6 +16,7 @@ import pytest
 APP = Path(__file__).resolve().parents[2] / "app"
 
 SHARED = {
+    "git_urls.py": "5d1ce51a809dcf4d17afa2e7e79b23f138a4637e9ba49162d4c053d95dcb7948",
     "pgq.py": "57f323480984fbad424662810cfec1ebc39256fa2ec7b77680863b1f416b62e4",
     "task_contract.py": "4c77d4e3d5e986ab61bf3eb497a34f34c27c97881522660d2871b1faf58a7ad1",
 }

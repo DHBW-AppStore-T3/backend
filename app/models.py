@@ -168,6 +168,9 @@ class Deployment(Base):
     deploymentId = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String, nullable=False)
     releaseTag = Column(String, nullable=True)
+    # The commit ``releaseTag`` pointed to when the deployment was created.
+    # Every job of the deployment runs exactly this commit (.github#7 G).
+    commit_sha = Column(String(40), nullable=True)
     userInputVar = Column(Text, nullable=True)  # could also be JSON
     userId = Column(UUID(as_uuid=True), ForeignKey("users.userId"), nullable=False, index=True)
     appId = Column(UUID(as_uuid=True), ForeignKey("apps.appId"), nullable=False, index=True)
@@ -446,6 +449,11 @@ class AppVersionApproval(Base):
         index=True,
     )
     version_tag = Column(String, nullable=False)
+    # The commit the tag pointed to at submission. The review covers this
+    # commit only: once the tag points elsewhere the version counts as
+    # unapproved until it is submitted and reviewed again (.github#7 G).
+    # NULL for approvals from before the pinning; they never count.
+    commit_sha = Column(String(40), nullable=True)
     status = Column(
         Enum(AppVersionApprovalStatus),
         nullable=False,

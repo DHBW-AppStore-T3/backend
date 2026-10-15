@@ -103,7 +103,7 @@ def dispatch_to_celery(
     db: Session,
     task: Task,
     celery_task_name: str,
-    celery_args: list,
+    celery_kwargs: dict,
     *,
     after_task_id: uuid.UUID | None = None,
 ) -> tuple[Task, str]:
@@ -123,7 +123,7 @@ def dispatch_to_celery(
     try:
         result = celery_app.send_task(
             celery_task_name,
-            args=celery_args,
+            kwargs=celery_kwargs,
             task_id=str(task.taskId),
             headers=headers,
         )

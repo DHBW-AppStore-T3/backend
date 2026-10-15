@@ -1,9 +1,12 @@
-import contextlib
+import copy
 import logging
 import os
+import threading
+from collections import OrderedDict
 from typing import Any
 from uuid import UUID
 
+import git
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
@@ -11,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.crud import app_version_approvals as crud_approvals
 from app.crud import apps as crud_apps
 from app.database import get_db
+from app.git_urls import GitHostNotAllowed
 from app.models import User, UserRole
 from app.schemas import (
     AppCreate,
@@ -20,7 +24,7 @@ from app.schemas import (
     AppVersionApprovalSubmit,
     AppWithVersions,
 )
-from app.services.git_service import git_service
+from app.services.git_service import CommitNotServed, checked_url, git_service
 from app.services.hcl_variables import (
     parse_packer_variables,
     parse_terraform_variables,
@@ -62,14 +66,63 @@ def _serialize_app(app):
 def _version_tag(version) -> str:
     """Extract the tag string from a git version entry.
 
-    ``git_service.get_versions`` yields either a plain tag string or a
-    dict carrying the tag under one of ``version`` / ``releaseTag`` /
-    ``tag``. Returns ``""`` when nothing matches, so callers can treat
-    the result uniformly (empty string is falsy and never a valid tag).
+    ``git_service.get_versions`` yields dicts carrying the tag under
+    ``version``; plain strings are tolerated. Returns ``""`` when nothing
+    matches, so callers can treat the result uniformly (empty string is
+    falsy and never a valid tag).
     """
     if isinstance(version, str):
         return version
     return version.get("version") or version.get("releaseTag") or version.get("tag", "")
+
+
+def ensure_allowed_git_link(git_link: str) -> str:
+    """The normalised HTTPS URL of ``git_link``; 422 if its host is not allowed.
+
+    App repositories are public and read anonymously from the hosts in
+    ``APP_GIT_ALLOWED_HOSTS`` only (.github#7 B).
+    """
+    try:
+        return checked_url(git_link)
+    except GitHostNotAllowed as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "git_host_not_allowed", "message": str(e)},
+        ) from e
+
+
+def resolve_version_commit(app, version_tag: str) -> str:
+    """The commit ``version_tag`` of ``app`` points to now, as a full SHA.
+
+    What gets approved and deployed is this commit, not the tag name
+    (.github#7 G). 400 without a repository, 404 for an unknown tag, 502
+    when the repository cannot be read.
+    """
+    if not app.git_link:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="App has no git repository configured",
+        )
+    ensure_allowed_git_link(app.git_link)
+    if not version_tag:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "version_required", "message": "A version (tag) is required"},
+        )
+    try:
+        sha = git_service.resolve_tag(app.git_link, version_tag)
+    except git.GitCommandError as e:
+        logger.warning("could not list the tags of %s: %s", app.git_link, (e.stderr or "").strip())
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"reason": "git_unreachable", "message": "The app repository cannot be read right now"},
+        ) from e
+    if sha is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"reason": "version_not_found", "message": f"The repository has no tag {version_tag!r}"},
+        )
+    return sha
 
 
 router = APIRouter()
@@ -162,6 +215,10 @@ def get_app(
     that still reference them can render their app name, git link,
     etc. They just don't show up in the apps list / deploy wizard
     (those use the default-filtered ``get_apps``).
+
+    The owner and admins see every tag. Everyone else sees the approved
+    versions whose tag still points to the approved commit; a moved tag
+    disappears until it is submitted and approved again.
     """
     app = crud_apps.get_app(db, app_id, include_deleted=True)
     if not app:
@@ -190,22 +247,16 @@ def get_app(
         try:
             all_versions = git_service.get_versions(app.git_link)
             if is_owner_or_admin:
-                # Owner/Admin see all Git tags
                 app.versions = all_versions
             else:
-                # Everyone else only sees approved version tags
-                approved_tags = {
-                    a.version_tag
-                    for a in crud_approvals.get_approvals_for_app(db, app.appId)
-                    if a.status == "approved"
-                }
+                approved = crud_approvals.approved_commits(db, app.appId)
                 app.versions = [
                     v for v in all_versions
-                    if _version_tag(v) in approved_tags
+                    if approved.get(_version_tag(v)) == v.get("sha")
                 ]
         except Exception as e:
             app.versions = []
-            logger.warning(f"Could not fetch versions: {str(e)}")
+            logger.warning("Could not fetch the versions of app %s: %s", app.appId, e)
     else:
         app.versions = []
 
@@ -215,28 +266,45 @@ def get_app(
 # ----------------------------------------------------------------
 # GET APP VARIABLES
 # ----------------------------------------------------------------
-def load_variable_definitions(app, version: str) -> list[dict[str, Any]]:
-    """Clone the app's release-vars and parse all Terraform/Packer
-    variables into the same shape ``GET /apps/{id}/variables`` returns.
+# Parsed variables per (repository, commit). A commit never changes, so an
+# entry never goes stale; bounded so a busy catalogue cannot grow it without
+# limit. Per process, which is enough: a miss only costs a sparse clone.
+_VARIABLES_CACHE: OrderedDict[tuple[str, str], list[dict[str, Any]]] = OrderedDict()
+_VARIABLES_CACHE_MAX = 256
+_variables_cache_lock = threading.Lock()
 
+
+def clear_variable_cache() -> None:
+    """Forget every cached variable scan (tests)."""
+    with _variables_cache_lock:
+        _VARIABLES_CACHE.clear()
+
+
+def load_variable_definitions(app, version: str, commit_sha: str | None = None) -> list[dict[str, Any]]:
+    """Parse all Terraform/Packer variables of one app version into the
+    shape ``GET /apps/{id}/variables`` returns.
+
+    Reads ``commit_sha`` — the commit a submission, approval or deployment
+    is about — or, without one, the commit ``version`` points to now.
     Reusable from ``POST /deployments`` so the deployment endpoint can
     enforce per-variable contracts (``varScope``, ``fileExtensions``)
-    using the App-Autor's declarations as source-of-truth. Cleans up
-    the temporary clone on its own — callers don't manage paths.
+    using the app author's declarations as source of truth.
 
-    Raises ``HTTPException(400)`` if the app has no Git link and
-    bubbles unexpected errors as ``HTTPException(500)``.
+    Fails closed: 404 for an unknown tag, 502 when the repository cannot
+    be read, 422 for an invalid Packer layout; callers never proceed
+    without the declarations.
     """
-    if not app.git_link:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="App has no Git repository configured",
-        )
+    sha = commit_sha or resolve_version_commit(app, version)
+    cache_key = (app.git_link or "", sha)
+    with _variables_cache_lock:
+        cached = _VARIABLES_CACHE.get(cache_key)
+        if cached is not None:
+            _VARIABLES_CACHE.move_to_end(cache_key)
+            return copy.deepcopy(cached)
 
-    deployment_id = f"vars_{app.appId}_{version}".replace("/", "_")
     repo_path = None
     try:
-        repo_path = git_service.clone_release_vars(app.git_link, version, deployment_id)
+        repo_path = git_service.clone_release_vars(app.git_link, version, sha)
         variables: list[dict[str, Any]] = []
         tf_vars_path = os.path.join(repo_path, "terraform", "variables.tf")
         if os.path.exists(tf_vars_path):
@@ -260,9 +328,19 @@ def load_variable_definitions(app, version: str) -> list[dict[str, Any]]:
                 variables.extend(
                     parse_packer_variables(tmpl.variables_path, template_key=tmpl.key)
                 )
-        return variables
     except HTTPException:
         raise
+    except CommitNotServed as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"reason": "version_moved", "message": str(e)},
+        ) from e
+    except (git.GitCommandError, GitHostNotAllowed) as e:
+        logger.warning("Could not read app %s at %s: %s", app.appId, sha[:8], e)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"reason": "git_unreachable", "message": "The app repository cannot be read right now"},
+        ) from e
     except Exception:
         logger.exception(
             "Failed to load variable definitions for app %s version %s",
@@ -280,6 +358,29 @@ def load_variable_definitions(app, version: str) -> list[dict[str, Any]]:
                 logger.error(
                     "Failed to cleanup repository: %s", str(cleanup_error)
                 )
+
+    with _variables_cache_lock:
+        _VARIABLES_CACHE[cache_key] = copy.deepcopy(variables)
+        _VARIABLES_CACHE.move_to_end(cache_key)
+        while len(_VARIABLES_CACHE) > _VARIABLES_CACHE_MAX:
+            _VARIABLES_CACHE.popitem(last=False)
+    return variables
+
+
+def ensure_no_marker_errors(variables: list[dict[str, Any]], action: str) -> None:
+    """422 with the list of bad ``@openstack`` markers, if there are any."""
+    marker_errors = [v.get("markerError") for v in variables if v.get("markerError")]
+    if marker_errors:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": (
+                    f"Version kann nicht {action} werden — fehlerhafte "
+                    "@openstack-Marker in den Variablen-Dateien"
+                ),
+                "marker_errors": marker_errors,
+            },
+        )
 
 
 @router.get("/{app_id}/variables", response_model=list[AppVariableResponse])
@@ -299,6 +400,9 @@ def get_app_variables(
     - description: Variable description
     - default: Default value (if any)
     - required: Whether variable is required
+
+    Reads the commit ``version`` points to now; 404 for an unknown tag,
+    502 when the repository cannot be read.
     """
     app = crud_apps.get_app(db, app_id)
     if not app:
@@ -340,38 +444,44 @@ def create_app(
 ):
     """
     Create a new app
-    - **All authenticated users** can create apps
-    - **Git repository access is verified** before creating the app
+    - The repository must be public and on an allowed host
+      (``APP_GIT_ALLOWED_HOSTS``); 422 otherwise, 403 if it cannot be read
+    - The stored ``git_link`` is the normalised, credential-free HTTPS URL
     """
     # Decode the optional image data-URL up front so a malformed
-    # payload fails before we hit Keycloak / Git / DB.
+    # payload fails before we hit Git / DB.
     image_bytes, image_mime = parse_image_data_url(app.image)
 
-    # Verify repository access if git_link is provided
     if app.git_link:
+        app.git_link = ensure_allowed_git_link(app.git_link)
         access_result = git_service.verify_repository_access(app.git_link)
         if not access_result['success']:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=access_result['message']
             )
-        logger.info(f"Repository access verified for {app.git_link}")
+        logger.info("Repository access verified for %s", app.git_link)
 
     db_app = crud_apps.create_app(db, app, current_user.userId)
     if image_bytes is not None:
         db_app = crud_apps.set_app_image(db, db_app.appId, image_bytes, image_mime)
 
-    # Auto-submit all tags for review if requested (public apps only)
+    # Auto-submit all tags for review if requested (public apps only),
+    # each at the commit it points to now.
     if app.submit_all_versions and not app.is_private and app.git_link:
         try:
             versions = git_service.get_versions(app.git_link)
-            for v in versions:
-                tag = _version_tag(v)
-                if tag:
-                    with contextlib.suppress(Exception):
-                        crud_approvals.submit_version(db, app_id=db_app.appId, version_tag=tag)
         except Exception as e:
-            logger.warning(f"Could not auto-submit versions for app {db_app.appId}: {e}")
+            versions = []
+            logger.warning("Could not auto-submit versions for app %s: %s", db_app.appId, e)
+        for v in versions:
+            tag, sha = _version_tag(v), v.get("sha")
+            if not tag or not sha:
+                continue
+            try:
+                crud_approvals.submit_version(db, app_id=db_app.appId, version_tag=tag, commit_sha=sha)
+            except HTTPException:
+                db.rollback()
 
     return _serialize_app(db_app)
 
@@ -429,10 +539,12 @@ def submit_version(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user_keycloak),
 ):
-    """Submit a specific version tag for admin review.
+    """Submit a version tag for admin review, at the commit it points to now.
 
-    Owner OR admin only. A REJECTED version can be resubmitted; PENDING
-    and APPROVED cannot.
+    Owner OR admin only. A REJECTED version, or one whose tag has moved
+    since its review, can be resubmitted; a PENDING or APPROVED one at the
+    same commit cannot (409). 422 for invalid ``@openstack`` markers, 404
+    for an unknown tag, 502 when the repository cannot be read.
     """
     app = crud_apps.get_app(db, app_id)
     if not app:
@@ -440,37 +552,16 @@ def submit_version(
 
     ensure_submit_app_version(current_user, app)
 
-    if not app.git_link:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="App has no git repository configured",
-        )
-
-    # Marker validation — blocks submit on invalid @openstack markers.
-    # Same logic as the approve endpoint; git errors (400/500) are
-    # skipped so submit still works when the repo is unreachable.
-    try:
-        variables = load_variable_definitions(app, version_tag)
-        marker_errors = [v.get("markerError") for v in variables if v.get("markerError")]
-        if marker_errors:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail={
-                    "message": (
-                        "Version kann nicht eingereicht werden — fehlerhafte "
-                        "@openstack-Marker in den Variablen-Dateien"
-                    ),
-                    "marker_errors": marker_errors,
-                },
-            )
-    except HTTPException as exc:
-        if exc.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY:
-            raise
-        # 400 (no git_link, handled above) or 500 (git unreachable) —
-        # allow submit anyway.
+    commit_sha = resolve_version_commit(app, version_tag)
+    ensure_no_marker_errors(load_variable_definitions(app, version_tag, commit_sha), "eingereicht")
 
     return crud_approvals.submit_version(
-        db, app_id=app_id, version_tag=version_tag, diff_url=body.diff_url, notes=body.notes
+        db,
+        app_id=app_id,
+        version_tag=version_tag,
+        commit_sha=commit_sha,
+        diff_url=body.diff_url,
+        notes=body.notes,
     )
 
 
