@@ -117,6 +117,18 @@ def _release_done(releases: set):
     return done
 
 
+def docs_urls(cfg) -> dict:
+    """Where the interactive docs and the schema are served: only in development.
+
+    In production they would list every route and parameter to anyone
+    (security review M-5). The frontend's types come from the exported
+    schema (``scripts/export_openapi.py``), not from the running service.
+    """
+    if cfg.is_development:
+        return {}
+    return {"docs_url": None, "redoc_url": None, "openapi_url": None}
+
+
 # ----------------------------------------------------------------
 # FASTAPI APP
 # ----------------------------------------------------------------
@@ -125,6 +137,7 @@ app = FastAPI(
     description="FastAPI Backend with Auth, Git & Celery Integration",
     version="1.0.0",
     lifespan=lifespan,
+    **docs_urls(settings),
 )
 
 # ----------------------------------------------------------------

@@ -92,3 +92,16 @@ def test_no_git_token_and_no_handoff_secret():
     assert "HANDOFF_SESSION_SECRET" not in fields
     assert "DEV_MODE" not in fields
     assert not any(name.startswith("SMTP_") for name in fields)
+
+
+def test_api_docs_and_schema_are_served_only_in_development():
+    from app.main import docs_urls
+
+    assert docs_urls(_settings()) == {}
+    assert docs_urls(_production()) == {"docs_url": None, "redoc_url": None, "openapi_url": None}
+
+
+def test_a_same_origin_installation_needs_no_cors_origins():
+    # Behind the frontend's /api gateway (Kubernetes) the browser never makes
+    # a cross-origin call to the API.
+    assert _production(CORS_ORIGINS=[]).CORS_ORIGINS == []

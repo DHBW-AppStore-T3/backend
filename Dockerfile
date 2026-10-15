@@ -15,7 +15,9 @@ ENV PYTHONUNBUFFERED=1 \
     POETRY_VIRTUALENVS_IN_PROJECT=true \
     POETRY_NO_INTERACTION=1
 
-WORKDIR /build
+# The venv is built at the path it runs from (/app/.venv): its console
+# scripts (uvicorn, alembic) name their interpreter by absolute path.
+WORKDIR /app
 
 # Install system build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -47,8 +49,10 @@ LABEL maintainer="your.email@example.com" \
       version="1.0.0" \
       description="FastAPI Backend with Auth, Git & Celery"
 
-# Create non-root user for security
-RUN groupadd -r appuser && useradd -r -g appuser appuser
+# Non-root user with a fixed UID: Kubernetes can only verify runAsNonRoot
+# for a numeric user (USER below), and git needs a passwd entry for it.
+RUN useradd --uid 10001 --user-group --home-dir /nonexistent --no-create-home \
+    --shell /usr/sbin/nologin appuser
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
@@ -82,18 +86,16 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 WORKDIR $APP_HOME
 
 # Copy virtual environment from builder
-COPY --from=builder /build/.venv /app/.venv
+COPY --from=builder /app/.venv /app/.venv
 
-# Copy application code
-COPY --chown=appuser:appuser . .
-
-# Create necessary directories with proper permissions
-RUN mkdir -p /tmp/repos && \
-    chown -R appuser:appuser /tmp/repos && \
-    chown -R appuser:appuser $APP_HOME
+# Application code, owned by root: the service reads it, it cannot change
+# it. It writes only below /tmp (sparse clones of app repositories; an
+# emptyDir in Kubernetes, where the root filesystem is read-only).
+COPY . .
+RUN mkdir -p /tmp/repos && chown 10001:10001 /tmp/repos
 
 # Switch to non-root user
-USER appuser
+USER 10001:10001
 
 # Expose application port
 EXPOSE 8000
