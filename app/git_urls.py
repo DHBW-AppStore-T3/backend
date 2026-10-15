@@ -44,7 +44,7 @@ def to_https_url(git_url: str) -> str:
     """
     url = git_url.strip()
     if url.startswith("git@"):
-        url = url[len("git@"):].replace(":", "/", 1)
+        url = url[len("git@") :].replace(":", "/", 1)
     url = re.sub(r"^https?://", "", url, flags=re.IGNORECASE)
     host_and_path = url.split("/", 1)
     if "@" in host_and_path[0]:
@@ -66,7 +66,7 @@ def checked_https_url(git_url: str, allowed_hosts: Iterable[str]) -> str:
     if not isinstance(git_url, str) or not git_url.strip():
         raise GitHostNotAllowed("no repository URL")
     url = to_https_url(git_url)
-    host, _, path = url[len("https://"):].partition("/")
+    host, _, path = url[len("https://") :].partition("/")
     host = host.lower()
     if not _HOST_RE.match(host) or ".." in path or not _PATH_RE.match(path):
         raise GitHostNotAllowed(f"not a repository URL: {git_url!r}")

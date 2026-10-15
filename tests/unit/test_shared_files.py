@@ -17,7 +17,7 @@ import pytest
 APP = Path(__file__).resolve().parents[2] / "app"
 
 SHARED = {
-    "git_urls.py": "5d1ce51a809dcf4d17afa2e7e79b23f138a4637e9ba49162d4c053d95dcb7948",
+    "git_urls.py": "c9b06a9fd9fc28b226e365eb4f90aa002a0205c11d2ba2abcda99b2e95258583",
     "keystone_urls.py": "a1f8533680323af3e943a98a3fe27812b2e2501484a30516309bb00d2d2a254f",
     "pgq.py": "57f323480984fbad424662810cfec1ebc39256fa2ec7b77680863b1f416b62e4",
     "task_contract.py": "4c77d4e3d5e986ab61bf3eb497a34f34c27c97881522660d2871b1faf58a7ad1",
