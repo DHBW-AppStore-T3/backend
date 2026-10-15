@@ -183,3 +183,55 @@ def test_registry_prefixes_always_end_in_a_slash():
     )
     assert "workload.containers[0].image" in errors_of(evil, limits)
     assert (limits.max_cpu_millicores, limits.max_memory_mib, limits.max_storage_mib) == (2000, 4096, 20480)
+
+
+# The ingress controller builds its routing rule from the ingress path
+# (Traefik: PathPrefix(`<path>`)); a backtick could append a rule matching
+# any host. Mount paths go into the pod spec.
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/x`) || HostRegexp(`.+`) || PathPrefix(`/",
+        "/a b",
+        "/a/../b",
+        "/a/./b",
+        "//a",
+        "/a//b",
+        "/a%2fb",
+        "relative",
+        "/" + "a" * 300,
+    ],
+)
+def test_ingress_path_must_be_plain_segments(path):
+    data = spec_with(lambda d: d["workload"]["containers"][0]["expose"].update(path=path))
+    assert "workload.containers[0].expose" in errors_of(data)
+
+
+@pytest.mark.parametrize("path", ["/", "/ide", "/ide/", "/a-b/c_d/e.f"])
+def test_plain_ingress_paths_are_accepted(path):
+    data = spec_with(lambda d: d["workload"]["containers"][0]["expose"].update(path=path))
+    assert parse_spec(data).workload.containers[0].expose.path == path
+
+
+@pytest.mark.parametrize("path", ["/", "/tmp/", "/tmp/../etc", "/a`b", "tmp"])
+def test_mount_paths_must_be_plain_and_not_root(path):
+    writable = spec_with(lambda d: d["workload"]["containers"][0].update(writablePaths=[path]))
+    assert "workload.containers[0]" in errors_of(writable)
+    storage = spec_with(lambda d: d["workload"]["storage"].update(mountPath=path))
+    assert "workload.storage" in errors_of(storage)
+    file_var = spec_with(lambda d: d["variables"][0].update(mountPath=path))
+    assert "variables[0]" in errors_of(file_var)
+
+
+def test_mounts_at_the_same_path_are_rejected():
+    twice = spec_with(lambda d: d["workload"]["containers"][0].update(writablePaths=["/tmp", "/tmp"]))
+    assert any("unique" in m for m in errors_of(twice).values())
+    over_storage = spec_with(lambda d: d["workload"]["containers"][0].update(writablePaths=["/home/coder"]))
+    assert any("storage.mountPath" in m for m in errors_of(over_storage).values())
+    file_over_tmp = spec_with(lambda d: d["variables"][0].update(mountPath="/tmp"))
+    assert any("mountPath" in m for m in errors_of(file_over_tmp).values())
+
+    def two_files(d):
+        d["variables"].append({**d["variables"][0], "name": "second_zip"})
+
+    assert any("distinct" in m for m in errors_of(spec_with(two_files)).values())

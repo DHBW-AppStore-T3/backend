@@ -35,6 +35,12 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CPU_RE = re.compile(r"^(\d+)m$|^(\d+(\.\d+)?)$")
 _MEM_RE = re.compile(r"^(\d+)(Mi|Gi)$")
 _SIZE_RE = re.compile(r"^(\d+)(Ki|Mi|Gi)$")
+# One segment of a path the spec names (ingress path, mount paths). Plain
+# names only: the ingress controller builds its routing rule from the ingress
+# path (Traefik writes PathPrefix(`<path>`)), so a backtick, bracket or
+# operator could add a rule of its own and capture other hosts' traffic.
+_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+MAX_PATH_LENGTH = 255
 
 ACCESS_URL_PLACEHOLDERS = {"workload", "deployment", "zone", "domain"}
 ACCESS_USERNAME_PLACEHOLDERS = {"user", "team"}
@@ -84,6 +90,28 @@ def parse_size_bytes(value: str) -> int:
     return int(m.group(1)) * {"Ki": 1024, "Mi": 1024**2, "Gi": 1024**3}[m.group(2)]
 
 
+def check_path(path: str, what: str, *, ingress: bool = False) -> None:
+    """Raise ValueError unless ``path`` is absolute and made of plain segments.
+
+    No ``.``/``..`` segments, no empty segments, nothing but letters, digits,
+    ``.``, ``_`` and ``-`` in a segment. ``ingress``: the path of an ingress
+    rule, which may be ``/`` and may end in ``/``; a mount path may do
+    neither.
+    """
+    if not path.startswith("/") or len(path) > MAX_PATH_LENGTH:
+        raise ValueError(f"{what} must be an absolute path of at most {MAX_PATH_LENGTH} characters")
+    if path == "/":
+        if ingress:
+            return
+        raise ValueError(f"{what} must not be '/'")
+    segments = path[1:].split("/")
+    if ingress and segments[-1] == "":
+        segments = segments[:-1]
+    for segment in segments:
+        if segment in (".", "..") or not _PATH_SEGMENT_RE.match(segment):
+            raise ValueError(f"{what} {path!r} may only contain plain segments (letters, digits, '.', '_', '-')")
+
+
 class SpecValidationError(ValueError):
     """Spec is invalid; ``errors`` carries one entry per problem with a field path."""
 
@@ -124,8 +152,7 @@ class Expose(_Strict):
 
     @model_validator(mode="after")
     def _path(self) -> Expose:
-        if not self.path.startswith("/"):
-            raise ValueError("path must start with '/'")
+        check_path(self.path, "path", ingress=True)
         return self
 
 
@@ -192,8 +219,9 @@ class Container(_Strict):
         if not _IMAGE_DIGEST_RE.match(self.image):
             raise ValueError("image must be pinned by digest: <registry>/<repo>@sha256:<64 hex> (tags are not allowed)")
         for p in self.writable_paths:
-            if not p.startswith("/"):
-                raise ValueError(f"writablePaths entry {p!r} must be absolute")
+            check_path(p, "writablePaths entry")
+        if len(set(self.writable_paths)) != len(self.writable_paths):
+            raise ValueError("writablePaths must be unique")
         return self
 
 
@@ -204,8 +232,7 @@ class Storage(_Strict):
     @model_validator(mode="after")
     def _check(self) -> Storage:
         _storage_mib(self.size)
-        if not self.mount_path.startswith("/"):
-            raise ValueError("mountPath must be absolute")
+        check_path(self.mount_path, "mountPath")
         return self
 
 
@@ -227,6 +254,8 @@ class Workload(_Strict):
             raise ValueError("container names must be unique")
         if sum(c.expose is not None for c in self.containers) != 1:
             raise ValueError("exactly one container must set 'expose'")
+        if self.storage is not None and any(self.storage.mount_path in c.writable_paths for c in self.containers):
+            raise ValueError("storage.mountPath must not also be a writablePaths entry")
         return self
 
 
@@ -245,8 +274,9 @@ class Variable(_Strict):
         if not _NAME_RE.match(self.name.replace("_", "-")):
             raise ValueError(f"invalid variable name {self.name!r}")
         if self.type == "file":
-            if not self.mount_path or not self.mount_path.startswith("/"):
+            if not self.mount_path:
                 raise ValueError("file variables need an absolute mountPath")
+            check_path(self.mount_path, "mountPath")
             if self.max_size is not None and parse_size_bytes(self.max_size) > MAX_FILE_VARIABLE_BYTES:
                 raise ValueError("maxSize above 1Mi is not supported yet (Secret mount limit)")
         if self.type == "enum":
@@ -307,6 +337,18 @@ class AppSpec(_Strict):
         names = [v.name for v in self.variables]
         if len(set(names)) != len(names):
             raise ValueError("variable names must be unique")
+        # File variables are mounted into the exposed container, next to its
+        # other mounts; two mounts at one path are refused by the cluster.
+        files = [v.mount_path for v in self.variables if v.type == "file" and v.mount_path]
+        if len(set(files)) != len(files):
+            raise ValueError("file variables need distinct mountPaths")
+        if self.workload is not None:
+            exposed = next((c for c in self.workload.containers if c.expose), None)
+            taken = set(exposed.writable_paths if exposed else ())
+            if self.workload.storage is not None:
+                taken.add(self.workload.storage.mount_path)
+            if taken.intersection(files):
+                raise ValueError("a file variable's mountPath is already used by writablePaths or storage")
         return self
 
 
