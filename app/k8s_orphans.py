@@ -14,6 +14,7 @@ only this one's namespaces count (``K8S_ENVIRONMENT``).
 
 from __future__ import annotations
 
+import logging
 import sys
 import uuid
 
@@ -22,6 +23,8 @@ from app.database import SessionLocal
 from app.k8s.kube import KubeApi, managed_selector
 from app.k8s.render import DEPLOYMENT_LABEL
 from app.models import RUNTIME_K8S, Deployment, Task, TaskStatus, TaskType
+
+logger = logging.getLogger(__name__)
 
 
 def _live(db, deployment_id: str, namespace: str) -> bool:
@@ -41,10 +44,20 @@ def _live(db, deployment_id: str, namespace: str) -> bool:
 
 
 def find_orphans(kube, db, environment: str = "") -> list[tuple[str, str]]:
-    """``[(namespace, deployment id label)]`` of managed namespaces without a live deployment."""
+    """``[(namespace, deployment id label)]`` of managed namespaces without a live deployment.
+
+    A namespace this account cannot read (a deploy that failed before it
+    granted the API read access) is reported too, as ``unreadable``: nobody
+    can see from the AppStore what runs there.
+    """
     orphans = []
     for namespace in sorted(kube.namespaces(managed_selector(environment))):
-        snap = kube.snapshot(namespace)
+        try:
+            snap = kube.snapshot(namespace)
+        except Exception as exc:  # noqa: BLE001 - one bad namespace must not hide the others
+            logger.warning("cannot read namespace %s: %s", namespace, exc)
+            orphans.append((namespace, "unreadable"))
+            continue
         if not snap.exists or snap.terminating:
             continue
         deployment_id = snap.labels.get(DEPLOYMENT_LABEL, "")

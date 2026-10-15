@@ -590,6 +590,27 @@ def test_the_orphan_check_ignores_namespaces_of_other_installations(db, mock_use
     assert [ns for ns, _ in find_orphans(kube, db, "appstore-prod")] == ["dep-0000000b"]
 
 
+def test_a_namespace_the_api_cannot_read_is_reported_and_the_others_still_checked(db):
+    """A deploy that failed before it granted the API read access leaves a
+    namespace the API may list but not look into (403)."""
+    from app.k8s_orphans import find_orphans
+
+    kube = FakeKube()
+    for name in ("dep-0000000c", "dep-0000000d"):
+        kube.apply({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": name, "labels": {
+            "app.kubernetes.io/managed-by": "appstore", "appstore.dhbw/deployment-id": str(uuid.uuid4())}}})
+    real_snapshot = kube.snapshot
+
+    def snapshot(namespace):
+        if namespace == "dep-0000000c":
+            raise RuntimeError("Forbidden: cannot list statefulsets")
+        return real_snapshot(namespace)
+
+    kube.snapshot = snapshot
+
+    assert dict(find_orphans(kube, db)) == {"dep-0000000c": "unreadable", "dep-0000000d": kube.deployment_label("dep-0000000d")}
+
+
 # ----------------------------------------------------------------
 # registration with ``submit_all_versions``
 # ----------------------------------------------------------------
