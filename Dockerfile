@@ -102,12 +102,16 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Default environment variables (can be overridden)
+# Default environment variables (can be overridden). HOST "::" on an
+# IPv6-only or dual-stack cluster. FORWARDED_ALLOW_IPS: whose X-Forwarded-*
+# headers count (the reverse proxy in front; "*" only where nothing but the
+# proxy can reach this port). The default trusts nobody but localhost.
 ENV DEBUG=False \
     PORT=8000 \
     HOST=0.0.0.0 \
     WORKERS=4 \
+    FORWARDED_ALLOW_IPS=127.0.0.1 \
     LOG_LEVEL=info
 
 # Run uvicorn directly
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--proxy-headers", "--forwarded-allow-ips", "*"]
+CMD ["sh", "-c", "exec uvicorn app.main:app --host \"$HOST\" --port \"$PORT\" --workers \"$WORKERS\" --proxy-headers --forwarded-allow-ips \"$FORWARDED_ALLOW_IPS\""]

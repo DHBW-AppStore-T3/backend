@@ -190,6 +190,23 @@ def test_runtime_of_a_vm_app(client, db, mock_user, fake_git):
     }
 
 
+def test_a_vm_app_can_declare_one_vm_per_person(client, db, mock_user, pod_repo, fake_git):
+    pod_repo({"apiVersion": "appstore/v2", "name": "windows", "runtime": "openstack-vm", "scope": "user"})
+    fake_git.files["terraform/variables.tf"] = (
+        'variable "users" {\n  type = map(list(object({ email = string })))\n}\n'
+        'variable "flavor" {\n  type = string\n  default = "m1.large"\n}\n'
+    )
+    app = _app(db, mock_user)
+
+    runtime = client.get(f"/apps/{app.appId}/runtime", params={"version": "v1.0"}).json()
+    variables = client.get(f"/apps/{app.appId}/variables", params={"version": "v1.0"}).json()
+    submitted = client.post(f"/apps/{app.appId}/versions/v1.0/submit", json={}).json()
+
+    assert (runtime["runtime"], runtime["scope"]) == ("openstack-vm", "user")
+    assert [v["name"] for v in variables] == ["flavor"]  # its Terraform variables, as before
+    assert (submitted["runtime"], submitted["spec_sha256"]) == ("openstack-vm", None)
+
+
 def test_approving_checks_the_spec_is_the_submitted_one(client, db, mock_user, admin_client, pod_repo):
     app = _app(db, mock_user)
     assert client.post(f"/apps/{app.appId}/versions/v1.0/submit", json={}).status_code == 201

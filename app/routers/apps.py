@@ -507,16 +507,22 @@ def get_app_runtime(
     """Whether ``version`` runs as pods (``kubernetes``) or VMs (``openstack-vm``).
 
     The wizard skips the OpenStack steps for pods and takes the group mode
-    from ``scope``. Same visibility and errors as the variables; 422 (with
-    field paths in ``errors``) for an invalid appstore.yaml.
+    from ``scope`` (a VM app without an appstore.yaml has none). Same
+    visibility and errors as the variables; 422 (with field paths in
+    ``errors``) for an invalid appstore.yaml.
     """
     app = crud_apps.get_app(db, app_id)
     if not app:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="App not found")
     ensure_view_app(current_user, app, db=db)
     loaded = load_version_spec(app, version)
-    if loaded is None or loaded.runtime != RUNTIME_K8S:
+    if loaded is None:
         return AppRuntimeResponse(runtime=RUNTIME_VM)
+    if loaded.runtime != RUNTIME_K8S:
+        # A VM app may declare how members are grouped; ``user`` (the
+        # Windows app: one VM per person) makes the wizard put everyone in
+        # a team of their own.
+        return AppRuntimeResponse(runtime=RUNTIME_VM, scope=loaded.spec.scope)
     return AppRuntimeResponse(
         runtime=RUNTIME_K8S,
         scope=loaded.spec.scope,
