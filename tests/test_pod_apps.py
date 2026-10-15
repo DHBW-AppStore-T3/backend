@@ -573,6 +573,23 @@ def test_namespaces_without_a_live_deployment_are_reported(db, mock_user):
     assert orphans["dep-ffffffff"] == ""
 
 
+def test_the_orphan_check_ignores_namespaces_of_other_installations(db, mock_user):
+    """Staging and prod share the cluster: each one's deployments live in its own database,
+    so a namespace of the other installation is not an orphan of this one."""
+    from app.k8s_orphans import find_orphans
+
+    kube = FakeKube()
+    for name, environment in (("dep-0000000a", "appstore-staging"), ("dep-0000000b", "appstore-prod")):
+        kube.apply({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": name, "labels": {
+            "app.kubernetes.io/managed-by": "appstore",
+            "appstore.dhbw/deployment-id": str(uuid.uuid4()),
+            "appstore.dhbw/environment": environment,
+        }}})
+
+    assert [ns for ns, _ in find_orphans(kube, db, "appstore-staging")] == ["dep-0000000a"]
+    assert [ns for ns, _ in find_orphans(kube, db, "appstore-prod")] == ["dep-0000000b"]
+
+
 # ----------------------------------------------------------------
 # registration with ``submit_all_versions``
 # ----------------------------------------------------------------

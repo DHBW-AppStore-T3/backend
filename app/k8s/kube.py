@@ -15,7 +15,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from app.k8s.render import DEPLOYMENT_LABEL, FIELD_MANAGER, MANAGED_BY_LABEL, TEAM_LABEL, USER_LABEL, WORKLOAD_LABEL
+from app.k8s.render import (
+    DEPLOYMENT_LABEL,
+    ENVIRONMENT_LABEL,
+    FIELD_MANAGER,
+    MANAGED_BY_LABEL,
+    TEAM_LABEL,
+    USER_LABEL,
+    WORKLOAD_LABEL,
+    label_value,
+)
 
 
 @dataclass
@@ -201,6 +210,9 @@ def deployment_selector(deployment_id: str) -> str:
     return f"{DEPLOYMENT_LABEL}={deployment_id}"
 
 
-def managed_selector() -> str:
-    """Every namespace this platform created."""
-    return f"{MANAGED_BY_LABEL}={FIELD_MANAGER}"
+def managed_selector(environment: str = "") -> str:
+    """Every namespace this platform created; with ``environment``, only that installation's."""
+    selector = f"{MANAGED_BY_LABEL}={FIELD_MANAGER}"
+    if environment:
+        selector += f",{ENVIRONMENT_LABEL}={label_value(environment)}"
+    return selector

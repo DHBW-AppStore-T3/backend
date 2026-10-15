@@ -67,8 +67,9 @@ class FakeKube:
 
     # --- reads ---------------------------------------------------------
     def namespaces(self, label_selector: str) -> list[str]:
-        key, _, value = label_selector.partition("=")
-        return [n for n, labels in self.namespace_labels.items() if labels.get(key) == value]
+        """Equality selectors only (``k=v[,k=v...]``), as the platform uses them."""
+        wanted = [part.partition("=")[::2] for part in label_selector.split(",") if part]
+        return [n for n, labels in self.namespace_labels.items() if all(labels.get(k) == v for k, v in wanted)]
 
     def kinds(self, namespace: str | None = None) -> list[str]:
         return sorted(k for k, _n, ns, _v in self.objects if namespace is None or ns == namespace)

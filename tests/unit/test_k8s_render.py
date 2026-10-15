@@ -1,6 +1,7 @@
 """Tests for the pure Kubernetes renderer (shared app/k8s/render.py): golden file + invariants."""
 
 import copy
+import dataclasses
 import json
 import os
 import uuid
@@ -8,8 +9,10 @@ from pathlib import Path
 
 import pytest
 
+from app.k8s.kube import managed_selector
 from app.k8s.render import (
     DEPLOYMENT_LABEL,
+    ENVIRONMENT_LABEL,
     USER_LABEL,
     DeploymentCtx,
     Member,
@@ -86,6 +89,25 @@ def test_every_object_carries_deployment_label_and_namespace():
 def test_namespace_enforces_restricted_pod_security():
     ns = of_kind(build()[1], "Namespace")[0]
     assert ns["metadata"]["labels"]["pod-security.kubernetes.io/enforce"] == "restricted"
+
+
+def test_namespace_names_its_installation_only_when_one_is_configured():
+    # Several installations share a cluster: the admission policy confines
+    # each pod deployer to the namespaces labelled with its own one.
+    assert ENVIRONMENT_LABEL not in of_kind(build()[1], "Namespace")[0]["metadata"]["labels"]
+
+    objs = build(settings=dataclasses.replace(SETTINGS, environment="appstore-staging"))[1]
+
+    assert of_kind(objs, "Namespace")[0]["metadata"]["labels"][ENVIRONMENT_LABEL] == "appstore-staging"
+    # Only the namespace: the policy reads it from there for everything inside.
+    assert all(ENVIRONMENT_LABEL not in o["metadata"]["labels"] for o in objs if o["kind"] != "Namespace")
+
+
+def test_managed_selector_narrows_to_one_installation():
+    assert managed_selector() == "app.kubernetes.io/managed-by=appstore"
+    assert managed_selector("appstore-prod") == (
+        "app.kubernetes.io/managed-by=appstore,appstore.dhbw/environment=appstore-prod"
+    )
 
 
 def test_pods_are_hardened_and_cannot_be_weakened_by_spec():

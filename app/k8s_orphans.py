@@ -8,7 +8,8 @@ change). This lists them, with exit code 1 if there are any; deleting them
 stays a decision for an operator.
 
 Needs a Kubernetes identity that may list namespaces (in-cluster service
-account or ``KUBECONFIG``).
+account or ``KUBECONFIG``). Where several installations share a cluster,
+only this one's namespaces count (``K8S_ENVIRONMENT``).
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from __future__ import annotations
 import sys
 import uuid
 
+from app.config import settings
 from app.database import SessionLocal
 from app.k8s.kube import KubeApi, managed_selector
 from app.k8s.render import DEPLOYMENT_LABEL
@@ -38,10 +40,10 @@ def _live(db, deployment_id: str, namespace: str) -> bool:
     return destroyed is None
 
 
-def find_orphans(kube, db) -> list[tuple[str, str]]:
+def find_orphans(kube, db, environment: str = "") -> list[tuple[str, str]]:
     """``[(namespace, deployment id label)]`` of managed namespaces without a live deployment."""
     orphans = []
-    for namespace in sorted(kube.namespaces(managed_selector())):
+    for namespace in sorted(kube.namespaces(managed_selector(environment))):
         snap = kube.snapshot(namespace)
         if not snap.exists or snap.terminating:
             continue
@@ -53,7 +55,7 @@ def find_orphans(kube, db) -> list[tuple[str, str]]:
 
 def main() -> int:
     with SessionLocal() as db:
-        orphans = find_orphans(KubeApi(), db)
+        orphans = find_orphans(KubeApi(), db, settings.K8S_ENVIRONMENT)
     for namespace, deployment_id in orphans:
         print(f"{namespace}: no live deployment (label {deployment_id or 'missing'})")
     print(f"{len(orphans)} namespace(s) without a live deployment")

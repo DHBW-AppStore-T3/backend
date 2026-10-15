@@ -35,6 +35,10 @@ WORKLOAD_LABEL = f"{LABEL_PREFIX}/workload"
 TEAM_LABEL = f"{LABEL_PREFIX}/team"
 USER_LABEL = f"{LABEL_PREFIX}/user"
 MANAGED_BY_LABEL = "app.kubernetes.io/managed-by"
+# The AppStore installation a namespace belongs to, where several share one
+# cluster (staging and prod): the admission policy confines each one's pod
+# deployer to its own namespaces by it, and the orphan check looks only there.
+ENVIRONMENT_LABEL = f"{LABEL_PREFIX}/environment"
 FIELD_MANAGER = "appstore"
 PASSWORD_KEY = "password"
 
@@ -92,6 +96,8 @@ class RenderSettings:
     # emptyDir grows until the node's disk is full and the kubelet starts
     # evicting everything on it; beyond it only this pod is evicted.
     scratch_size_limit: str = "1Gi"
+    # The installation the namespaces belong to (ENVIRONMENT_LABEL); empty: none.
+    environment: str = ""
 
     @property
     def app_domain(self) -> str:
@@ -209,13 +215,15 @@ def _storage_mib(spec: AppSpec) -> int:
     return parse_storage_mib(spec.workload.storage.size)
 
 
-def _namespace(dep: DeploymentCtx) -> dict[str, Any]:
+def _namespace(dep: DeploymentCtx, settings: RenderSettings) -> dict[str, Any]:
     meta = _meta(dep.namespace, dep, namespaced=False)
     meta["labels"] = {
         **meta["labels"],
         "pod-security.kubernetes.io/enforce": "restricted",
         "pod-security.kubernetes.io/enforce-version": "latest",
     }
+    if settings.environment:
+        meta["labels"][ENVIRONMENT_LABEL] = label_value(settings.environment)
     return {"apiVersion": "v1", "kind": "Namespace", "metadata": meta}
 
 
@@ -579,7 +587,11 @@ def render(
     if missing:
         raise ValueError(f"missing passwords for workloads: {', '.join(missing)}")
 
-    objects = [_namespace(dep), *_quota_and_limits(spec, dep, len(refs)), *_network_policies(spec, dep, settings)]
+    objects = [
+        _namespace(dep, settings),
+        *_quota_and_limits(spec, dep, len(refs)),
+        *_network_policies(spec, dep, settings),
+    ]
     for ref in refs:
         objects.extend(_workload_objects(spec, dep, ref, passwords[ref.name], settings, files, variable_values))
     return objects

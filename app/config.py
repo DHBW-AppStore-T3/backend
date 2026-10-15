@@ -98,6 +98,10 @@ class Settings(BaseSettings):
     # App hosts are <workload>-<deployment>.<K8S_APP_DOMAIN or apps.<K8S_ZONE>>.
     K8S_ZONE: str = ""
     K8S_APP_DOMAIN: str = ""
+    # The installation this API belongs to, where several share one cluster
+    # (the pod deployer labels its namespaces with it): the orphan check
+    # looks only at this installation's namespaces.
+    K8S_ENVIRONMENT: str = ""
 
     # Public URL of the frontend; the LTI launch redirects there. No
     # trailing slash.
