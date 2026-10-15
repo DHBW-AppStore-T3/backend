@@ -24,7 +24,7 @@ from uuid import UUID
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
-from app.models import Deployment, UserOpenStackCredential
+from app.models import RUNTIME_VM, Deployment, UserOpenStackCredential
 from app.schemas import OpenStackCredentialUpsert
 from app.utils import crypto
 from app.utils.time import utcnow
@@ -143,6 +143,7 @@ def stamp_validation(
                 update(Deployment)
                 .where(
                     Deployment.userId == row.userId,
+                    Deployment.runtime == RUNTIME_VM,
                     Deployment.os_project_id.is_(None),
                     Deployment.deleted_at.is_(None),
                 )

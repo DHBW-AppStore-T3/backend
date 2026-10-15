@@ -6,11 +6,12 @@ from sqlalchemy.orm import Session
 from app.crud import app_version_approvals as crud_approvals
 from app.crud import apps as crud_apps
 from app.database import get_db
-from app.models import User
+from app.models import RUNTIME_K8S, User
 from app.routers.apps import (
     _serialize_app,
     ensure_no_marker_errors,
     load_variable_definitions,
+    load_version_spec,
     resolve_version_commit,
 )
 from app.schemas import (
@@ -81,6 +82,16 @@ def approve_version(
         )
     if submitted.commit_sha:
         ensure_no_marker_errors(load_variable_definitions(app, version_tag, commit_sha), "approved")
+        # A pod version is approved only with the spec and images that were
+        # submitted (.github#4): a commit cannot change, but the platform
+        # limits can, and then the scan above already failed with 422.
+        loaded = load_version_spec(app, version_tag, commit_sha)
+        spec_sha256 = loaded.sha256 if loaded is not None and loaded.runtime == RUNTIME_K8S else None
+        if spec_sha256 != submitted.spec_sha256:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"reason": "spec_changed", "message": "The version's appstore.yaml is not the submitted one"},
+            )
 
     return crud_approvals.approve(db, app_id, version_tag, current_user.userId)
 

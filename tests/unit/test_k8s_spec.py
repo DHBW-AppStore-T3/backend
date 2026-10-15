@@ -1,0 +1,185 @@
+"""Tests for app contract v2 (appstore.yaml) parsing and validation (shared app/k8s/spec.py)."""
+
+import copy
+
+import pytest
+
+from app.k8s.spec import PlatformLimits, SpecValidationError, parse_spec
+
+pytestmark = pytest.mark.unit
+
+DIGEST = "sha256:" + "a" * 64
+
+VALID = {
+    "apiVersion": "appstore/v2",
+    "name": "online-ide",
+    "runtime": "kubernetes",
+    "scope": "user",
+    "workload": {
+        "containers": [
+            {
+                "name": "ide",
+                "image": f"ghcr.io/dhbw-appstore-t3/apps/code-server@{DIGEST}",
+                "expose": {"port": 8080, "path": "/"},
+                "resources": {"cpu": "500m", "memory": "1Gi"},
+                "env": [{"name": "PASSWORD", "from": "generated-password"}, {"name": "TEAM", "from": "team-name"}],
+                "writablePaths": ["/tmp"],
+            }
+        ],
+        "storage": {"size": "5Gi", "mountPath": "/home/coder"},
+    },
+    "egress": "internet",
+    "variables": [
+        {
+            "name": "assignment_zip",
+            "type": "file",
+            "scope": "team",
+            "ext": ["zip"],
+            "maxSize": "512Ki",
+            "mountPath": "/data/assignment.zip",
+        },
+        {"name": "cpu_class", "type": "enum", "values": ["small", "medium"], "default": "small"},
+    ],
+    "access": [
+        {"type": "url", "template": "https://{workload}-{deployment}.apps.{zone}"},
+        {"type": "password", "from": "generated-password", "username": "{user}"},
+    ],
+}
+
+
+def spec_with(mutate):
+    data = copy.deepcopy(VALID)
+    mutate(data)
+    return data
+
+
+def errors_of(data, limits=None):
+    with pytest.raises(SpecValidationError) as exc:
+        parse_spec(data, limits)
+    return {e["loc"]: e["msg"] for e in exc.value.errors}
+
+
+def test_valid_spec_parses_from_yaml_and_dict():
+    import yaml
+
+    assert parse_spec(VALID).name == "online-ide"
+    assert parse_spec(yaml.safe_dump(VALID)).workload.containers[0].expose.port == 8080
+
+
+def test_tag_instead_of_digest_is_rejected_with_field_path():
+    data = spec_with(lambda d: d["workload"]["containers"][0].update(image="ghcr.io/dhbw-appstore-t3/apps/x:latest"))
+    errs = errors_of(data)
+    assert "workload.containers[0]" in errs or "workload.containers[0].image" in errs
+    assert any("digest" in m for m in errs.values())
+
+
+def test_foreign_registry_is_rejected():
+    data = spec_with(lambda d: d["workload"]["containers"][0].update(image=f"docker.io/evil/img@{DIGEST}"))
+    assert "workload.containers[0].image" in errors_of(data)
+
+
+def test_registry_prefix_must_match_allowlist_exactly():
+    data = spec_with(
+        lambda d: d["workload"]["containers"][0].update(image=f"ghcr.io/dhbw-appstore-t3-evil/img@{DIGEST}")
+    )
+    assert "workload.containers[0].image" in errors_of(data)
+
+
+def test_resources_above_platform_limits_are_rejected():
+    def mutate(d):
+        d["workload"]["containers"][0]["resources"] = {"cpu": "8", "memory": "64Gi"}
+        d["workload"]["storage"]["size"] = "500Gi"
+
+    errs = errors_of(spec_with(mutate))
+    assert {
+        "workload.containers[0].resources.cpu",
+        "workload.containers[0].resources.memory",
+        "workload.storage.size",
+    } <= set(errs)
+
+
+def test_custom_limits_apply():
+    limits = PlatformLimits(max_cpu_millicores=100)
+    assert "workload.containers[0].resources.cpu" in errors_of(VALID, limits)
+
+
+def test_unknown_fields_are_rejected():
+    data = spec_with(lambda d: d["workload"]["containers"][0].update(securityContext={"privileged": True}))
+    assert "workload.containers[0].securityContext" in errors_of(data)
+    assert "hostNetwork" in errors_of(spec_with(lambda d: d.update(hostNetwork=True)))
+
+
+def test_multiple_expose_rejected():
+    def mutate(d):
+        second = copy.deepcopy(d["workload"]["containers"][0])
+        second["name"] = "sidecar"
+        d["workload"]["containers"].append(second)
+
+    assert any("exactly one" in m for m in errors_of(spec_with(mutate)).values())
+
+
+def test_no_expose_rejected():
+    data = spec_with(lambda d: d["workload"]["containers"][0].pop("expose"))
+    assert any("exactly one" in m for m in errors_of(data).values())
+
+
+def test_more_than_three_containers_rejected():
+    def mutate(d):
+        c = d["workload"]["containers"][0]
+        d["workload"]["containers"] = [c] + [
+            {k: v for k, v in c.items() if k != "expose"} | {"name": f"s{i}"} for i in range(3)
+        ]
+
+    assert "workload.containers" in errors_of(spec_with(mutate))
+
+
+def test_privileged_port_rejected():
+    data = spec_with(lambda d: d["workload"]["containers"][0]["expose"].update(port=80))
+    assert "workload.containers[0].expose.port" in errors_of(data)
+
+
+def test_kubernetes_requires_workload_and_vm_forbids_it():
+    assert any("requires 'workload'" in m for m in errors_of(spec_with(lambda d: d.pop("workload"))).values())
+    assert any("not allowed" in m for m in errors_of(spec_with(lambda d: d.update(runtime="openstack-vm"))).values())
+
+
+def test_openstack_vm_spec_without_workload_is_valid():
+    assert parse_spec({"apiVersion": "appstore/v2", "name": "win", "runtime": "openstack-vm"}).workload is None
+
+
+def test_large_file_variable_rejected():
+    data = spec_with(lambda d: d["variables"][0].update(maxSize="5Mi"))
+    assert "variables[0]" in errors_of(data)
+
+
+def test_access_unknown_placeholder_rejected():
+    data = spec_with(lambda d: d["access"][0].update(template="https://{evil}.example"))
+    assert any("unknown placeholder" in m for m in errors_of(data).values())
+
+
+def test_env_needs_exactly_one_source():
+    data = spec_with(lambda d: d["workload"]["containers"][0]["env"].append({"name": "X"}))
+    assert any("exactly one" in m for m in errors_of(data).values())
+
+
+@pytest.mark.parametrize("text", ["", "- a\n- b", "key: [unclosed"])
+def test_non_mapping_or_broken_yaml_rejected(text):
+    with pytest.raises(SpecValidationError):
+        parse_spec(text)
+
+
+def test_access_urls_must_be_https():
+    data = spec_with(lambda d: d["access"][0].update(template="javascript://{workload}-{deployment}.{domain}/%0a"))
+    assert any("https" in m for m in errors_of(data).values())
+
+
+def test_registry_prefixes_always_end_in_a_slash():
+    from app.k8s.spec import limits_from, registry_prefixes
+
+    assert registry_prefixes(" ghcr.io/dhbw-appstore-t3 , ghcr.io/other/,") == ("ghcr.io/dhbw-appstore-t3/", "ghcr.io/other/")
+    limits = limits_from("ghcr.io/dhbw-appstore-t3", "2", "4Gi", "20Gi")
+    evil = spec_with(
+        lambda d: d["workload"]["containers"][0].update(image=f"ghcr.io/dhbw-appstore-t3-evil/img@{DIGEST}")
+    )
+    assert "workload.containers[0].image" in errors_of(evil, limits)
+    assert (limits.max_cpu_millicores, limits.max_memory_mib, limits.max_storage_mib) == (2000, 4096, 20480)

@@ -79,6 +79,26 @@ class Settings(BaseSettings):
     # Empty: in development any https URL, in production none.
     OPENSTACK_ALLOWED_AUTH_URLS: str = ""
 
+    # Pod apps (.github#4) -------------------------------------------------
+    # Images in an appstore.yaml must come from these registries (prefixes,
+    # D10: our own registry only) and every container stay within these
+    # limits; the worker checks the same settings again.
+    APP_IMAGE_REGISTRY_ALLOWLIST: str = "ghcr.io/dhbw-appstore-t3/"
+    APP_MAX_CPU: str = "2"
+    APP_MAX_MEMORY: str = "4Gi"
+    APP_MAX_STORAGE: str = "20Gi"
+    # At most this many workloads (one per team, or per person) in one
+    # deployment, and optionally per owner across their live pod
+    # deployments (0: no budget).
+    K8S_MAX_WORKLOADS_PER_DEPLOYMENT: int = 60
+    K8S_MAX_WORKLOADS_PER_OWNER: int = 0
+    # Read the live status of pod deployments from the cluster (the API's
+    # service account may read the dep-* namespaces, nothing else).
+    K8S_STATUS_ENABLED: bool = False
+    # App hosts are <workload>-<deployment>.<K8S_APP_DOMAIN or apps.<K8S_ZONE>>.
+    K8S_ZONE: str = ""
+    K8S_APP_DOMAIN: str = ""
+
     # Public URL of the frontend; the LTI launch redirects there. No
     # trailing slash.
     APP_BASE_URL: str = "http://localhost:5173"

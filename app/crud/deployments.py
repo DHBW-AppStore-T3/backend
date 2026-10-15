@@ -1,4 +1,5 @@
 import json
+import uuid
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -6,7 +7,10 @@ from uuid import UUID
 from sqlalchemy import and_, asc, desc, exists, func, or_
 from sqlalchemy.orm import Session, joinedload
 
+from app.k8s.render import DeploymentCtx
 from app.models import (
+    RUNTIME_K8S,
+    RUNTIME_VM,
     Deployment,
     Task,
     TaskStatus,
@@ -56,7 +60,7 @@ def count_active_user_deployments(
     if project_id is not None:
         query = query.filter(Deployment.os_project_id == project_id)
     elif unplaced:
-        query = query.filter(Deployment.os_project_id.is_(None))
+        query = query.filter(Deployment.os_project_id.is_(None), Deployment.runtime == RUNTIME_VM)
     return query.count()
 
 
@@ -461,6 +465,43 @@ def get_deployments(
     return query.offset(skip).limit(limit).all()
 
 
+def k8s_namespace_for(deployment_id: UUID) -> str:
+    """The namespace of a pod deployment: ``dep-`` and the first 8 hex digits of its id."""
+    return DeploymentCtx(id=str(deployment_id)).namespace
+
+
+# Where new deployment ids come from (tests replace it to force collisions).
+_new_id = uuid.uuid4
+
+
+def _free_pod_identity(db: Session) -> tuple[UUID, str]:
+    """A new deployment id whose namespace no deployment ever had.
+
+    Namespaces carry only 32 bits of the id; a collision would let one
+    deployment's destroy reach another's namespace, so it is avoided here
+    (and the column is unique, deleted deployments included).
+    """
+    for _ in range(20):
+        deployment_id = _new_id()
+        namespace = k8s_namespace_for(deployment_id)
+        if db.query(Deployment.deploymentId).filter(Deployment.k8s_namespace == namespace).first() is None:
+            return deployment_id, namespace
+    raise RuntimeError("no free namespace for a new pod deployment")
+
+
+def count_live_workloads(db: Session, user_id: UUID) -> int:
+    """Workloads of ``user_id``'s live pod deployments (the owner's budget)."""
+    total = (
+        db.query(func.coalesce(func.sum(Deployment.k8s_workloads), 0))
+        .filter(Deployment.userId == user_id)
+        .filter(Deployment.runtime == RUNTIME_K8S)
+        .filter(Deployment.deleted_at.is_(None))
+        .filter(~_is_destroyed_subq())
+        .scalar()
+    )
+    return int(total or 0)
+
+
 def create_deployment(
     db: Session,
     deployment: DeploymentCreate,
@@ -468,6 +509,8 @@ def create_deployment(
     commit_sha: str,
     *,
     os_project_id: str | None = None,
+    runtime: str = RUNTIME_VM,
+    k8s_workloads: int | None = None,
 ) -> Deployment:
     """Insert a deployment row in the current transaction.
 
@@ -475,20 +518,26 @@ def create_deployment(
     in the same TX and commit once at the end. This is necessary so the
     advisory lock acquired at the start of the request stays held across
     all related inserts. ``os_project_id``: the OpenStack project of the
-    credential a VM deployment is made with.
+    credential a VM deployment is made with. A pod deployment (``runtime``
+    ``kubernetes``) gets its namespace and the number of its workloads.
     """
     # Convert userInputVar dict to JSON string for database storage
     user_input_var_json = None
     if deployment.userInputVar is not None:
         user_input_var_json = json.dumps(deployment.userInputVar)
 
+    deployment_id, namespace = _free_pod_identity(db) if runtime == RUNTIME_K8S else (uuid.uuid4(), None)
     db_deployment = Deployment(
+        deploymentId=deployment_id,
         name=deployment.name,
         appId=deployment.appId,
         userId=user_id,
         releaseTag=deployment.releaseTag,
         commit_sha=commit_sha,
         os_project_id=os_project_id,
+        runtime=runtime,
+        k8s_namespace=namespace,
+        k8s_workloads=k8s_workloads,
         userInputVar=user_input_var_json,
     )
     db.add(db_deployment)

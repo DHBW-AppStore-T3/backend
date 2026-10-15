@@ -23,6 +23,12 @@ from sqlalchemy.orm import relationship
 from app.database import Base
 from app.utils.time import utcnow
 
+# How a deployment runs: OpenTofu/Packer on OpenStack VMs (Windows apps), or
+# pods in the cluster rendered from the app's appstore.yaml (.github#4). The
+# values are the ``runtime`` names of the appstore.yaml contract.
+RUNTIME_VM = "openstack-vm"
+RUNTIME_K8S = "kubernetes"
+
 
 # ----------------------------------------------------------------
 # ENUMS
@@ -178,6 +184,13 @@ class Deployment(Base):
     # deployments made before projects were verified until their owner's
     # old credential is re-checked (``crud.openstack_credentials``).
     os_project_id = Column(String, nullable=True, index=True)
+    runtime = Column(String(16), nullable=False, default=RUNTIME_VM, server_default=RUNTIME_VM)
+    # Pod deployments: their namespace (``dep-<first 8 hex of the id>``),
+    # unique across all deployments, deleted ones included, so a destroy can
+    # never reach another deployment's namespace; and how many workloads
+    # (one per team or per person) they run, for the owner's budget.
+    k8s_namespace = Column(String(63), nullable=True)
+    k8s_workloads = Column(Integer, nullable=True)
     userInputVar = Column(Text, nullable=True)  # could also be JSON
     userId = Column(UUID(as_uuid=True), ForeignKey("users.userId"), nullable=False, index=True)
     appId = Column(UUID(as_uuid=True), ForeignKey("apps.appId"), nullable=False, index=True)
@@ -190,6 +203,12 @@ class Deployment(Base):
     __table_args__ = (
         # Default queries hide soft-deleted deployments.
         Index("ix_deployments_live", "deploymentId", postgresql_where=text("deleted_at IS NULL")),
+        Index(
+            "uq_deployments_k8s_namespace",
+            "k8s_namespace",
+            unique=True,
+            postgresql_where=text("k8s_namespace IS NOT NULL"),
+        ),
     )
 
     # Relationships
@@ -528,6 +547,12 @@ class AppVersionApproval(Base):
     )
     reviewed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=utcnow, nullable=False)
+    # What the review covered besides the commit (.github#4): how the version
+    # runs and, for pods, the SHA-256 of its appstore.yaml and the image
+    # digests it names (JSON list). A deploy refuses a spec that differs.
+    runtime = Column(String(16), nullable=False, default=RUNTIME_VM, server_default=RUNTIME_VM)
+    spec_sha256 = Column(String(64), nullable=True)
+    image_digests = Column(Text, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("appId", "version_tag", name="uq_app_version_approval"),

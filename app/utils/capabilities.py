@@ -27,7 +27,16 @@ from sqlalchemy.orm import Session
 
 from app.crud import app_version_approvals as crud_approvals
 from app.crud import openstack_credentials as crud_openstack_credentials
-from app.models import App, Course, CourseTeacher, Deployment, User, UserRole
+from app.models import (
+    RUNTIME_K8S,
+    RUNTIME_VM,
+    App,
+    Course,
+    CourseTeacher,
+    Deployment,
+    User,
+    UserRole,
+)
 from app.utils.permissions import (
     STAFF_ROLES,
     has_deployment_access,
@@ -247,13 +256,16 @@ def ensure_view_deployment_owner(user: User, dep: Deployment, db: Session) -> No
 
 
 def can_operate_deployment(user: User, dep: Deployment, db: Session) -> bool:
-    """Pause / Resume / Destroy / Redeploy / Cancel: the owner or a project peer.
+    """Pause / Resume / Destroy / Redeploy / Cancel.
 
-    Every action runs with the caller's own credential for the
-    deployment's project, never with the owner's, so admins are read-only
-    on VM deployments unless they hold a credential for the project
-    themselves (dhbw-appstore's model).
+    VM deployments: the owner or a project peer. Every action runs with the
+    caller's own credential for the deployment's project, never with the
+    owner's, so admins are read-only there unless they hold a credential
+    for the project themselves (dhbw-appstore's model). Pod deployments
+    need no credential: the owner or an admin.
     """
+    if getattr(dep, "runtime", RUNTIME_VM) == RUNTIME_K8S:
+        return _is_owner(user, dep.userId) or _is_admin(user)
     return _is_owner(user, dep.userId) or is_project_peer(user, dep, db)
 
 

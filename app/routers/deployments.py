@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import desc, or_, select, text
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.crud import app_version_approvals as crud_approvals
 from app.crud import apps as crud_apps
 from app.crud import deployments as crud_deployments
@@ -23,8 +24,10 @@ from app.crud import openstack_credentials as crud_openstack_credentials
 from app.crud import teams as crud_teams
 from app.crud import users as crud_users
 from app.database import SessionLocal, get_db
+from app.k8s.render import Member, workload_refs
+from app.k8s.render import Team as RenderTeam
+from app.models import RUNTIME_K8S, RUNTIME_VM, TaskStatus, TaskType, User, UserRole
 from app.models import Task as TaskModel  # for ad-hoc state queries
-from app.models import TaskStatus, TaskType, User, UserRole
 from app.schemas import (
     DeploymentCreate,
     DeploymentDetail,
@@ -35,10 +38,12 @@ from app.schemas import (
     DeploymentTeamMember,
     DeploymentTeamResponse,
     MyAccessResponse,
+    PodWorkloadSchema,
     TaskSummary,
 )
 from app.services import (
     access,
+    k8s_status,
     openstack_client,
     task_events,
     task_finalizer,
@@ -176,6 +181,7 @@ def list_deployments(
             releaseTag=deployment.releaseTag,
             commit_sha=deployment.commit_sha,
             os_project_id=deployment.os_project_id,
+            runtime=deployment.runtime,
             userInputVar=user_input_var_parsed,
             status=status_value,
             created_at=first_created_at,
@@ -303,6 +309,7 @@ def get_deployment(
         releaseTag=deployment.releaseTag,
         commit_sha=deployment.commit_sha,
         os_project_id=deployment.os_project_id,
+        runtime=deployment.runtime,
         userInputVar=user_input_var_parsed,
         status=status_value,
         created_at=created_at,
@@ -345,13 +352,6 @@ def create_deployment(
     # from this user. Held until the next COMMIT/ROLLBACK on this connection.
     crud_locks.acquire_user_xact_lock(db, current_user.userId)
 
-    # The deployment lives in the project of the credential the caller
-    # picked; it must be theirs and its project confirmed by Keystone,
-    # because the project decides who the deployment's peers are. Read
-    # inside the locked TX, so a concurrent change of the credential is
-    # serialized behind us.
-    credential = openstack_client.deploy_credential(db, current_user, deployment.credentialId)
-
     # Refuse the create if the target app is soft-deleted.
     target_app = crud_apps.get_app(db, deployment.appId)
     if target_app is None:
@@ -374,7 +374,11 @@ def create_deployment(
     # approval of exactly this commit; a private app is its owner's test
     # bench (only the owner and admins get past ``ensure_view_app``).
     # Unknown tag 404, unreadable repository 502.
-    from app.routers.apps import load_variable_definitions, resolve_version_commit
+    from app.routers.apps import (
+        load_variable_definitions,
+        load_version_spec,
+        resolve_version_commit,
+    )
     commit_sha = resolve_version_commit(target_app, deployment.releaseTag)
     if not target_app.is_private and not crud_approvals.has_approved_version(
         db, target_app.appId, deployment.releaseTag, commit_sha
@@ -383,6 +387,29 @@ def create_deployment(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "version_not_approved", "version": deployment.releaseTag},
         )
+
+    # Pod app (appstore.yaml at the pinned commit) or VM app. Pods run in the
+    # cluster and never use an OpenStack credential, even a supplied one; the
+    # review of a public pod app covers exactly this spec (.github#4).
+    loaded_spec = load_version_spec(target_app, deployment.releaseTag, commit_sha)
+    is_pods = loaded_spec is not None and loaded_spec.runtime == RUNTIME_K8S
+    credential = None
+    if is_pods:
+        approval = crud_approvals.get_approval(db, target_app.appId, deployment.releaseTag)
+        if not target_app.is_private and (
+            approval is None or approval.runtime != RUNTIME_K8S or approval.spec_sha256 != loaded_spec.sha256
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "version_not_approved", "version": deployment.releaseTag},
+            )
+    else:
+        # The deployment lives in the project of the credential the caller
+        # picked; it must be theirs and its project confirmed by Keystone,
+        # because the project decides who the deployment's peers are. Read
+        # inside the locked TX, so a concurrent change of the credential is
+        # serialized behind us.
+        credential = openstack_client.deploy_credential(db, current_user, deployment.credentialId)
 
     # The app author's variable declarations at that commit, to enforce
     # per-variable contracts (``varScope``, ``fileExtensions``) below.
@@ -414,8 +441,16 @@ def create_deployment(
             deployment.teams or [],
         )
 
+    workloads = _check_pod_workloads(db, current_user, loaded_spec, deployment.teams or []) if is_pods else None
+
     db_deployment = crud_deployments.create_deployment(
-        db, deployment, current_user.userId, commit_sha, os_project_id=credential.project_id
+        db,
+        deployment,
+        current_user.userId,
+        commit_sha,
+        os_project_id=credential.project_id if credential is not None else None,
+        runtime=RUNTIME_K8S if is_pods else RUNTIME_VM,
+        k8s_workloads=workloads,
     )
 
     user_ids_in_deployment = set()
@@ -461,7 +496,13 @@ def create_deployment(
             teams_dict[team.name] = team_users
 
     # The envelope carries ciphertext only — the worker decrypts in-process.
-    openstack_envelope = _dispatch_envelope(db, credential, rollback=True)
+    # Pods have none; their job carries the validated spec instead.
+    if is_pods:
+        openstack_envelope: dict = {}
+        extra = {"spec": loaded_spec.payload(), "owner": str(current_user.userId)}
+    else:
+        openstack_envelope = _dispatch_envelope(db, credential, rollback=True)
+        extra = {}
 
     # Insert PENDING task row in the SAME transaction as the deployment,
     # commit atomically (deployment + teams + user_to_deployments + task),
@@ -473,10 +514,11 @@ def create_deployment(
         db,
         deployment_id=db_deployment.deploymentId,
         task_type=TaskType.DEPLOY,
-        celery_task_name="tasks.deploy_application",
-        celery_kwargs=_job_kwargs(db_deployment, user_vars, teams_dict, openstack_envelope),
+        celery_task_name=_task_name(db_deployment.runtime, TaskType.DEPLOY),
+        celery_kwargs=_job_kwargs(db_deployment, user_vars, teams_dict, openstack_envelope, **extra),
         dispatch_error_label="Could not dispatch deployment task — please retry",
         rollback_on_conflict=True,
+        state_token=not is_pods,
     )
 
     db.refresh(db_deployment)
@@ -497,6 +539,7 @@ def create_deployment(
         releaseTag=db_deployment.releaseTag,
         commit_sha=db_deployment.commit_sha,
         os_project_id=db_deployment.os_project_id,
+        runtime=db_deployment.runtime,
         userInputVar=user_input_var_parsed,
         status=status_value,
         created_at=created_at,
@@ -575,6 +618,11 @@ def delete_deployment(
     # deployment itself didn't break, only the lifecycle pass.
     if current_status in ("success", "failed", "paused", "pause_failed", "resume_failed", "redeploy_failed"):
         return _dispatch_destroy(db, deployment, current_user)
+    # A pod deployment always goes through a destroy: even a cancelled one
+    # may have created its namespace before the cancel arrived, and hiding
+    # the row would leave the namespace running with nobody to see it.
+    if deployment.runtime == RUNTIME_K8S:
+        return _dispatch_destroy(db, deployment, current_user)
 
     # No resources to clean up (cancelled, or anything else terminal):
     # straight soft-delete.
@@ -616,6 +664,78 @@ def _fetch_dispatch_envelope(db: Session, user: User, deployment) -> dict:
     """
     row = openstack_client.project_credential(db, user, deployment.os_project_id)
     return _dispatch_envelope(db, row)
+
+
+# The job each (runtime, task type) runs. VM jobs go to the ``vm`` queue
+# (OpenTofu/Packer executor, no cluster rights), pod jobs to ``pods`` (the pod
+# deployer, no OpenTofu, no root); see ``app.celery_app``.
+_TASK_NAMES = {
+    (RUNTIME_VM, TaskType.DEPLOY): "tasks.deploy_application",
+    (RUNTIME_VM, TaskType.DESTROY): "tasks.destroy_deployment",
+    (RUNTIME_VM, TaskType.PAUSE): "tasks.pause_deployment",
+    (RUNTIME_VM, TaskType.RESUME): "tasks.resume_deployment",
+    (RUNTIME_VM, TaskType.REDEPLOY): "tasks.redeploy_resource",
+    (RUNTIME_K8S, TaskType.DEPLOY): "pods.deploy_application",
+    (RUNTIME_K8S, TaskType.DESTROY): "pods.destroy_deployment",
+    (RUNTIME_K8S, TaskType.PAUSE): "pods.pause_deployment",
+    (RUNTIME_K8S, TaskType.RESUME): "pods.resume_deployment",
+    (RUNTIME_K8S, TaskType.REDEPLOY): "pods.redeploy_resource",
+}
+
+
+def _task_name(runtime: str, task_type: TaskType) -> str:
+    return _TASK_NAMES[(runtime or RUNTIME_VM, task_type)]
+
+
+def _render_teams(db: Session, teams) -> list[RenderTeam]:
+    """The request's teams as the pod renderer sees them: members by user id and user name."""
+    out = []
+    for team in teams:
+        members = []
+        for raw in team.userIds:
+            user = crud_users.get_user(db, UUID(str(raw)))
+            if user is not None:
+                members.append(Member(user_id=str(user.userId), name=user.username or user.email))
+        out.append(RenderTeam(team.name, tuple(members)))
+    return out
+
+
+def _check_pod_workloads(db: Session, owner: User, loaded_spec, teams) -> int:
+    """The number of workloads a pod deployment will run; refuses what the platform does not allow.
+
+    422 ``team_names_collide`` when two team names normalise to the same
+    workload name, 422 ``no_workloads`` without members to run anything for,
+    422 ``too_many_workloads`` above ``K8S_MAX_WORKLOADS_PER_DEPLOYMENT``, 409
+    ``workload_budget_exceeded`` when the owner's live pod deployments would
+    exceed ``K8S_MAX_WORKLOADS_PER_OWNER``.
+    """
+    try:
+        refs = workload_refs(loaded_spec.spec, _render_teams(db, teams))
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "team_names_collide", "message": str(e)},
+        ) from None
+    if not refs:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "no_workloads", "message": "Add teams (and members, for per-person apps)"},
+        )
+    limit = settings.K8S_MAX_WORKLOADS_PER_DEPLOYMENT
+    if len(refs) > limit:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "too_many_workloads", "workloads": len(refs), "limit": limit},
+        )
+    budget = settings.K8S_MAX_WORKLOADS_PER_OWNER
+    if budget:
+        used = crud_deployments.count_live_workloads(db, owner.userId)
+        if used + len(refs) > budget:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"reason": "workload_budget_exceeded", "in_use": used, "requested": len(refs), "budget": budget},
+            )
+    return len(refs)
 
 
 def _validate_teams(db: Session, teams) -> None:
@@ -703,6 +823,7 @@ def _commit_and_dispatch(
     dispatch_error_label: str,
     rollback_on_conflict: bool,
     after_task_id=None,
+    state_token: bool = True,
 ):
     """Insert the PENDING task in-TX, commit, then dispatch to Celery.
 
@@ -718,9 +839,10 @@ def _commit_and_dispatch(
     ``after_task_id`` parks the message until that task's worker has let
     go of it (cancel → destroy).
 
-    Every task gets a fresh state token for OpenTofu's HTTP backend
+    Every VM task gets a fresh state token for OpenTofu's HTTP backend
     (``services/tf_state_store``): the row keeps its hash, the job message
-    carries it Fernet-sealed as ``state_token_enc``.
+    carries it Fernet-sealed as ``state_token_enc``. Pod tasks have no
+    OpenTofu state (``state_token=False``).
 
     Returns the committed, dispatched ``Task``.
     """
@@ -737,7 +859,8 @@ def _commit_and_dispatch(
             status_code=status.HTTP_409_CONFLICT,
             detail="Deployment already has an active task",
         )
-    state_token = tf_state_store.issue_token(task)
+    if state_token:
+        celery_kwargs = {**celery_kwargs, "state_token_enc": crypto.encrypt_b64(tf_state_store.issue_token(task))}
 
     db.commit()
     db.refresh(task)
@@ -747,7 +870,7 @@ def _commit_and_dispatch(
             db,
             task=task,
             celery_task_name=celery_task_name,
-            celery_kwargs={**celery_kwargs, "state_token_enc": crypto.encrypt_b64(state_token)},
+            celery_kwargs=celery_kwargs,
             after_task_id=after_task_id,
         )
     except Exception:
@@ -769,7 +892,6 @@ def _dispatch_destroy(db: Session, deployment, current_user: User):
         deployment,
         current_user,
         task_type=TaskType.DESTROY,
-        celery_task_name="tasks.destroy_deployment",
         response_status="destroying",
     )
 
@@ -779,7 +901,6 @@ def _dispatch_lifecycle_task(
     deployment,
     current_user: User,
     task_type: TaskType,
-    celery_task_name: str,
     response_status: str,
     extra_kwargs: dict | None = None,
     after_task_id=None,
@@ -800,8 +921,6 @@ def _dispatch_lifecycle_task(
                              the task row's ``type`` column and the
                              status the partial-unique index prevents
                              from coexisting.
-        celery_task_name:    name registered on the worker side (e.g.
-                             ``tasks.pause_deployment``).
         response_status:     synthetic deployment status returned to the
                              frontend in the 202 body — frontend uses
                              this to immediately switch the UI into the
@@ -864,18 +983,21 @@ def _dispatch_lifecycle_task(
             members = crud_deployments.get_team_members(db, team.teamId)
             teams_dict[team.name] = [_member_entry(m) for m in members]
 
-    openstack_envelope = _fetch_dispatch_envelope(db, current_user, deployment)
+    is_pods = deployment.runtime == RUNTIME_K8S
+    # Pods use no OpenStack credential; VM jobs the caller's own for the project.
+    openstack_envelope = {} if is_pods else _fetch_dispatch_envelope(db, current_user, deployment)
     _pin_legacy_commit(db, deployment)
 
     task = _commit_and_dispatch(
         db,
         deployment_id=deployment.deploymentId,
         task_type=task_type,
-        celery_task_name=celery_task_name,
+        celery_task_name=_task_name(deployment.runtime, task_type),
         celery_kwargs=_job_kwargs(deployment, user_vars, teams_dict, openstack_envelope, **(extra_kwargs or {})),
         dispatch_error_label=f"Could not dispatch {task_type.value} task — please retry",
         rollback_on_conflict=False,
         after_task_id=after_task_id,
+        state_token=not is_pods,
     )
 
     return JSONResponse(
@@ -987,6 +1109,16 @@ def list_deployment_resources(
     # operate rights; this endpoint is read-only.
     ensure_view_deployment_owner(current_user, deployment, db)
 
+    if deployment.runtime == RUNTIME_K8S:
+        # The namespace is the state; nothing of it is cached here.
+        rows = k8s_status.workload_views(deployment_id, deployment.k8s_namespace or "")
+        return DeploymentResourceListResponse(
+            resources=[],
+            runtime=RUNTIME_K8S,
+            workloads=[PodWorkloadSchema.model_validate(r) for r in rows or []],
+            live=rows is not None,
+        )
+
     state_json = _latest_tf_state_for(deployment_id, db)
     # Live data is fetched with the caller's own credential for the project,
     # never the owner's. Without one (an admin or a course teacher reading)
@@ -1038,6 +1170,7 @@ def get_deployment_resource_detail(
     # Inspect-only view — course-teachers may read the per-resource
     # detail; the per-VM redeploy below is operate-gated.
     ensure_view_deployment_owner(current_user, deployment, db)
+    _refuse_pods(deployment)
 
     if not _TF_ADDRESS_RE.match(address):
         raise HTTPException(
@@ -1097,6 +1230,7 @@ def redeploy_deployment_resource(
     # (owner-or-admin). Course-teachers may inspect the resource via
     # the GET endpoints above but not bounce it.
     ensure_operate_deployment(current_user, deployment, db)
+    _refuse_pods(deployment)
     crud_locks.acquire_deployment_xact_lock(db, deployment_id)
     lifecycle_service.ensure_action_allowed(
         db, deployment, lifecycle_service.DeploymentAction.REDEPLOY,
@@ -1135,10 +1269,85 @@ def redeploy_deployment_resource(
         deployment=deployment,
         current_user=current_user,
         task_type=TaskType.REDEPLOY,
-        celery_task_name="tasks.redeploy_resource",
         response_status="redeploying",
         extra_kwargs={"resource_address": address},
     )
+
+
+def _refuse_pods(deployment) -> None:
+    """422 for the OpenStack resource endpoints on a pod deployment (they have workloads)."""
+    if deployment.runtime == RUNTIME_K8S:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "pod_deployment", "message": "Pod deployments have workloads, see /workloads"},
+        )
+
+
+# A workload name as the pod renderer makes them (DNS-1123 label).
+_WORKLOAD_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def _dispatch_workload_action(db: Session, deployment_id: UUID, workload: str, current_user: User, *, reset: bool):
+    """Restart or reset one workload of a pod deployment (202 ``redeploying``).
+
+    Operate right; only from ``success`` or ``redeploy_failed`` (lifecycle,
+    under the deployment lock). 422 for a VM deployment or a malformed name,
+    404 ``workload_not_found`` when the cluster knows no such workload of
+    this deployment (the worker checks again when the cluster cannot be
+    asked here).
+    """
+    deployment = crud_deployments.get_deployment_with_details(db, deployment_id)
+    if not deployment:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deployment not found")
+    ensure_operate_deployment(current_user, deployment, db)
+    if deployment.runtime != RUNTIME_K8S:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "vm_deployment", "message": "VM deployments redeploy per resource, see /resources"},
+        )
+    if not _WORKLOAD_RE.match(workload):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "invalid_workload"},
+        )
+    crud_locks.acquire_deployment_xact_lock(db, deployment_id)
+    lifecycle_service.ensure_action_allowed(db, deployment, lifecycle_service.DeploymentAction.REDEPLOY)
+    known = k8s_status.workload_views(deployment_id, deployment.k8s_namespace or "")
+    if known is not None and workload not in {r["workload"] for r in known}:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"reason": "workload_not_found", "workload": workload},
+        )
+    return _dispatch_lifecycle_task(
+        db=db,
+        deployment=deployment,
+        current_user=current_user,
+        task_type=TaskType.REDEPLOY,
+        response_status="redeploying",
+        extra_kwargs={"resource_address": f"reset:{workload}" if reset else workload},
+    )
+
+
+@router.post("/{deployment_id}/workloads/{workload}/restart", status_code=status.HTTP_202_ACCEPTED)
+def restart_workload(
+    deployment_id: UUID,
+    workload: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_keycloak),
+):
+    """Restart one team's or person's workload (a new pod); its data stays."""
+    return _dispatch_workload_action(db, deployment_id, workload, current_user, reset=False)
+
+
+@router.post("/{deployment_id}/workloads/{workload}/reset", status_code=status.HTTP_202_ACCEPTED)
+def reset_workload(
+    deployment_id: UUID,
+    workload: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_keycloak),
+):
+    """Reset one workload: its volume is deleted, it starts from scratch."""
+    return _dispatch_workload_action(db, deployment_id, workload, current_user, reset=True)
 
 
 def _view_asdict(view) -> dict:
@@ -1248,9 +1457,10 @@ def cancel_deployment(
         deployment,
         current_user,
         task_type=TaskType.DESTROY,
-        celery_task_name="tasks.destroy_deployment",
         response_status="destroying",
-        extra_kwargs={"sweep_build_artifacts": True},
+        # VM: reap the Packer build the cancel interrupted. Pods: the destroy
+        # removes the namespace with everything the deploy created.
+        extra_kwargs={"sweep_build_artifacts": True} if deployment.runtime != RUNTIME_K8S else None,
         after_task_id=blocking_task_id,
     )
 
@@ -1293,7 +1503,6 @@ def pause_deployment(
         deployment,
         current_user,
         task_type=TaskType.PAUSE,
-        celery_task_name="tasks.pause_deployment",
         response_status="pausing",
     )
 
@@ -1335,7 +1544,6 @@ def resume_deployment(
         deployment,
         current_user,
         task_type=TaskType.RESUME,
-        celery_task_name="tasks.resume_deployment",
         response_status="resuming",
     )
 

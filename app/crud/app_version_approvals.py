@@ -11,7 +11,7 @@ from uuid import UUID
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.models import App, AppVersionApproval, AppVersionApprovalStatus
+from app.models import RUNTIME_VM, App, AppVersionApproval, AppVersionApprovalStatus
 from app.utils.time import utcnow
 
 
@@ -22,8 +22,14 @@ def submit_version(
     commit_sha: str,
     diff_url: str | None = None,
     notes: str | None = None,
+    runtime: str = RUNTIME_VM,
+    spec_sha256: str | None = None,
+    image_digests: str | None = None,
 ) -> AppVersionApproval:
     """Submit ``version_tag`` at ``commit_sha`` for admin review.
+
+    ``runtime``, ``spec_sha256`` and ``image_digests`` (JSON list) record
+    what the review covers besides the commit (.github#4).
 
     Raises 409 if this commit is already pending or approved. A rejected
     version, or one whose review was for a commit the tag no longer points
@@ -53,6 +59,9 @@ def submit_version(
         commit_sha=commit_sha,
         diff_url=diff_url,
         notes=notes,
+        runtime=runtime,
+        spec_sha256=spec_sha256,
+        image_digests=image_digests,
         status=AppVersionApprovalStatus.PENDING,
         created_at=utcnow(),
     )

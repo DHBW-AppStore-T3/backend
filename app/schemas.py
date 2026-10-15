@@ -1,8 +1,9 @@
+import json
 from datetime import datetime
 from typing import Any, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from app.models import AppVersionApprovalStatus, OpenStackAuthType, TaskStatus, TaskType, UserRole
 
@@ -164,6 +165,11 @@ class AppVersionApprovalResponse(BaseModel):
     # The reviewed commit; the approval does not cover the tag once it
     # moves (.github#7 G). None for reviews from before the pinning.
     commit_sha: str | None = None
+    # How the version runs and, for pods, the reviewed appstore.yaml (its
+    # SHA-256) and image digests (.github#4).
+    runtime: str = "openstack-vm"
+    spec_sha256: str | None = None
+    image_digests: list[str] | None = None
     status: AppVersionApprovalStatus
     diff_url: str | None = None
     notes: str | None = None
@@ -173,6 +179,14 @@ class AppVersionApprovalResponse(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("image_digests", mode="before")
+    @classmethod
+    def _digests_from_json(cls, value):
+        """Stored as a JSON list on the row."""
+        if isinstance(value, str):
+            return json.loads(value)
+        return value
 
 
 class AppVersionApprovalWithApp(AppVersionApprovalResponse):
@@ -238,6 +252,8 @@ class DeploymentResponse(DeploymentBase):
     commit_sha: str | None = None
     # VM deployments: the OpenStack project they live in.
     os_project_id: str | None = None
+    # ``openstack-vm`` or ``kubernetes`` (pods, .github#4).
+    runtime: str = "openstack-vm"
     userInputVar: dict[str, Any] | None = None
     status: str | None = None  # From latest task
     created_at: datetime | None = None
@@ -420,14 +436,31 @@ class DeploymentResourceSchema(BaseModel):
     metadata: dict[str, str] | None = None
 
 
+class PodWorkloadSchema(BaseModel):
+    """One workload of a pod deployment, read live from the cluster (.github#4)."""
+    workload: str
+    team: str | None = None
+    # ``scope: user``: whose workload it is.
+    user_id: str | None = None
+    ready: bool = False
+    restarts: int = 0
+    phase: str
+    url: str | None = None
+    lastEvent: str | None = None
+
+
 class DeploymentResourceListResponse(BaseModel):
     """Wrap the list in an object so we can add cursor/refresh-stamp
     metadata later without a breaking API change."""
     resources: list[DeploymentResourceSchema]
     # True when the response was fetched with live OpenStack join.
     # False means the caller passed ``?refresh=false`` and the
-    # response reflects only cached TF state.
+    # response reflects only cached TF state. For pods: whether the
+    # cluster could be asked.
     live: bool
+    runtime: str = "openstack-vm"
+    # Pod deployments: their workloads instead of ``resources``.
+    workloads: list[PodWorkloadSchema] = []
 
 
 # ----------------------------------------------------------------

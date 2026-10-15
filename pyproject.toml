@@ -50,6 +50,8 @@ requests = ">=2.31.0"
 openstacksdk = "^3.3.0"
 cryptography = ">=42.0.0"
 PyYAML = ">=6.0"
+# Pod apps (.github#4): live status of their namespaces (app/k8s/kube.py).
+kubernetes = ">=31.0.0"
 # Transitive via pbr. Pinned to >=83.0.0 to close PYSEC-2026-3447
 # (CVE-2026-59890): MANIFEST.in exclusions bypassed on macOS APFS/HFS+
 # via NFD filenames. Fixed in 83.0.0.
@@ -123,6 +125,11 @@ ignore = [
 fixable = ["ALL"]
 unfixable = []
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.per-file-ignores]
+# Identical copies of the worker's files (tests/unit/test_shared_files.py):
+# the worker's black/isort (line length 120) decide how their imports wrap.
+"app/k8s/*.py" = ["I001"]
 
 [tool.ruff.format]
 quote-style = "double"

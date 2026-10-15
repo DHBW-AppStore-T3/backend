@@ -3,6 +3,7 @@ import logging
 import os
 import threading
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
@@ -15,7 +16,7 @@ from app.crud import app_version_approvals as crud_approvals
 from app.crud import apps as crud_apps
 from app.database import get_db
 from app.git_urls import GitHostNotAllowed
-from app.models import User, UserRole
+from app.models import RUNTIME_K8S, RUNTIME_VM, User, UserRole
 from app.schemas import (
     AppCreate,
     AppResponse,
@@ -24,6 +25,7 @@ from app.schemas import (
     AppVersionApprovalSubmit,
     AppWithVersions,
 )
+from app.services import app_spec
 from app.services.git_service import CommitNotServed, checked_url, git_service
 from app.services.hcl_variables import (
     parse_packer_variables,
@@ -267,33 +269,73 @@ def get_app(
 # ----------------------------------------------------------------
 # GET APP VARIABLES
 # ----------------------------------------------------------------
-# Parsed variables per (repository, commit). A commit never changes, so an
-# entry never goes stale; bounded so a busy catalogue cannot grow it without
-# limit. Per process, which is enough: a miss only costs a sparse clone.
-_VARIABLES_CACHE: OrderedDict[tuple[str, str], list[dict[str, Any]]] = OrderedDict()
+# What a version declares, per (repository, commit): its variables and, for
+# a pod app, its validated appstore.yaml. A commit never changes, so an entry
+# never goes stale; bounded so a busy catalogue cannot grow it without limit.
+# Per process, which is enough: a miss only costs a sparse clone.
+@dataclass(frozen=True)
+class _VersionScan:
+    variables: list[dict[str, Any]]
+    spec: app_spec.LoadedSpec | None
+    # The 422 detail of an invalid appstore.yaml; nothing of the version is
+    # usable then.
+    spec_error: dict[str, Any] | None = None
+
+
+_VARIABLES_CACHE: OrderedDict[tuple[str, str], _VersionScan] = OrderedDict()
 _VARIABLES_CACHE_MAX = 256
 _variables_cache_lock = threading.Lock()
 
 
 def clear_variable_cache() -> None:
-    """Forget every cached variable scan (tests)."""
+    """Forget every cached version scan (tests)."""
     with _variables_cache_lock:
         _VARIABLES_CACHE.clear()
 
 
-def load_variable_definitions(app, version: str, commit_sha: str | None = None) -> list[dict[str, Any]]:
-    """Parse all Terraform/Packer variables of one app version into the
-    shape ``GET /apps/{id}/variables`` returns.
+def _read_version(repo_path: str) -> _VersionScan:
+    """Variables and spec of a cloned commit.
 
-    Reads ``commit_sha`` — the commit a submission, approval or deployment
-    is about — or, without one, the commit ``version`` points to now.
-    Reusable from ``POST /deployments`` so the deployment endpoint can
-    enforce per-variable contracts (``varScope``, ``fileExtensions``)
-    using the app author's declarations as source of truth.
+    A pod app (``appstore.yaml`` with ``runtime: kubernetes``) declares its
+    variables in the spec; Terraform and Packer files are not looked at.
+    Everything else is a VM app.
+    """
+    try:
+        loaded = app_spec.read_spec_from_repo(repo_path)
+    except HTTPException as exc:
+        return _VersionScan(variables=[], spec=None, spec_error=exc.detail)
+    if loaded is not None and loaded.runtime == RUNTIME_K8S:
+        return _VersionScan(variables=app_spec.spec_variables(loaded.spec), spec=loaded)
 
-    Fails closed: 404 for an unknown tag, 502 when the repository cannot
-    be read, 422 for an invalid Packer layout; callers never proceed
-    without the declarations.
+    variables: list[dict[str, Any]] = []
+    tf_vars_path = os.path.join(repo_path, "terraform", "variables.tf")
+    if os.path.exists(tf_vars_path):
+        variables.extend(parse_terraform_variables(tf_vars_path))
+    # Discover all Packer templates (legacy single-file layout OR
+    # per-key subdirectories) and parse each one's variables. The
+    # ``template_key`` is recorded on every Packer variable so the
+    # wizard can group inputs per image. Discovery raises if the
+    # repo has an ambiguous or unsafe layout — surface that as
+    # HTTP 422 so the app author can fix the repo before any
+    # deploy attempt.
+    try:
+        templates = discover_packer_templates(repo_path)
+    except PackerTemplateDiscoveryError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        )
+    for tmpl in templates:
+        if os.path.isfile(tmpl.variables_path):
+            variables.extend(parse_packer_variables(tmpl.variables_path, template_key=tmpl.key))
+    return _VersionScan(variables=variables, spec=loaded)
+
+
+def _scan_version(app, version: str, commit_sha: str | None) -> _VersionScan:
+    """What ``version`` declares at ``commit_sha`` (or where the tag points now); cached per commit.
+
+    Fails closed: 404 for an unknown tag, 409 ``version_moved``, 502 when the
+    repository cannot be read, 422 for an invalid Packer layout.
     """
     sha = commit_sha or resolve_version_commit(app, version)
     cache_key = (app.git_link or "", sha)
@@ -301,34 +343,12 @@ def load_variable_definitions(app, version: str, commit_sha: str | None = None) 
         cached = _VARIABLES_CACHE.get(cache_key)
         if cached is not None:
             _VARIABLES_CACHE.move_to_end(cache_key)
-            return copy.deepcopy(cached)
+            return cached
 
     repo_path = None
     try:
         repo_path = git_service.clone_release_vars(app.git_link, version, sha)
-        variables: list[dict[str, Any]] = []
-        tf_vars_path = os.path.join(repo_path, "terraform", "variables.tf")
-        if os.path.exists(tf_vars_path):
-            variables.extend(parse_terraform_variables(tf_vars_path))
-        # Discover all Packer templates (legacy single-file layout OR
-        # per-key subdirectories) and parse each one's variables. The
-        # ``template_key`` is recorded on every Packer variable so the
-        # wizard can group inputs per image. Discovery raises if the
-        # repo has an ambiguous or unsafe layout — surface that as
-        # HTTP 422 so the app author can fix the repo before any
-        # deploy attempt.
-        try:
-            templates = discover_packer_templates(repo_path)
-        except PackerTemplateDiscoveryError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=str(exc),
-            )
-        for tmpl in templates:
-            if os.path.isfile(tmpl.variables_path):
-                variables.extend(
-                    parse_packer_variables(tmpl.variables_path, template_key=tmpl.key)
-                )
+        scan = _read_version(repo_path)
     except HTTPException:
         raise
     except CommitNotServed as e:
@@ -361,11 +381,43 @@ def load_variable_definitions(app, version: str, commit_sha: str | None = None) 
                 )
 
     with _variables_cache_lock:
-        _VARIABLES_CACHE[cache_key] = copy.deepcopy(variables)
+        _VARIABLES_CACHE[cache_key] = scan
         _VARIABLES_CACHE.move_to_end(cache_key)
         while len(_VARIABLES_CACHE) > _VARIABLES_CACHE_MAX:
             _VARIABLES_CACHE.popitem(last=False)
-    return variables
+    return scan
+
+
+def _usable(scan: _VersionScan) -> _VersionScan:
+    if scan.spec_error is not None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=scan.spec_error)
+    return scan
+
+
+def load_variable_definitions(app, version: str, commit_sha: str | None = None) -> list[dict[str, Any]]:
+    """Parse all variables of one app version into the shape ``GET /apps/{id}/variables`` returns.
+
+    Reads ``commit_sha`` — the commit a submission, approval or deployment
+    is about — or, without one, the commit ``version`` points to now: the
+    ``appstore.yaml`` variables of a pod app, the Terraform/Packer variables
+    of a VM app. Reusable from ``POST /deployments`` so the deployment
+    endpoint can enforce per-variable contracts (``varScope``,
+    ``fileExtensions``) using the app author's declarations as source of
+    truth.
+
+    Fails closed: 404 for an unknown tag, 502 when the repository cannot
+    be read, 422 for an invalid Packer layout or appstore.yaml; callers
+    never proceed without the declarations.
+    """
+    return copy.deepcopy(_usable(_scan_version(app, version, commit_sha)).variables)
+
+
+def load_version_spec(app, version: str, commit_sha: str | None = None) -> app_spec.LoadedSpec | None:
+    """The validated ``appstore.yaml`` of the version at ``commit_sha``, or None without one.
+
+    Same errors as :func:`load_variable_definitions` (one clone serves both).
+    """
+    return _usable(_scan_version(app, version, commit_sha)).spec
 
 
 def ensure_no_marker_errors(variables: list[dict[str, Any]], action: str) -> None:
@@ -432,6 +484,45 @@ def get_app_variables(
         )
 
     return variables
+
+
+class AppRuntimeResponse(BaseModel):
+    """How one version runs, for the deploy wizard."""
+
+    runtime: str
+    # Pods only: one workload per team or per person, internet access, and
+    # what members get to log in.
+    scope: str | None = None
+    egress: str | None = None
+    access: list[dict[str, Any]] = []
+
+
+@router.get("/{app_id}/runtime", response_model=AppRuntimeResponse)
+def get_app_runtime(
+    app_id: UUID,
+    version: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_keycloak),
+):
+    """Whether ``version`` runs as pods (``kubernetes``) or VMs (``openstack-vm``).
+
+    The wizard skips the OpenStack steps for pods and takes the group mode
+    from ``scope``. Same visibility and errors as the variables; 422 (with
+    field paths in ``errors``) for an invalid appstore.yaml.
+    """
+    app = crud_apps.get_app(db, app_id)
+    if not app:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="App not found")
+    ensure_view_app(current_user, app, db=db)
+    loaded = load_version_spec(app, version)
+    if loaded is None or loaded.runtime != RUNTIME_K8S:
+        return AppRuntimeResponse(runtime=RUNTIME_VM)
+    return AppRuntimeResponse(
+        runtime=RUNTIME_K8S,
+        scope=loaded.spec.scope,
+        egress=loaded.spec.egress,
+        access=[a.model_dump(by_alias=True, exclude_none=True) for a in loaded.spec.access],
+    )
 
 
 # ----------------------------------------------------------------
@@ -557,6 +648,10 @@ def submit_version(
 
     commit_sha = resolve_version_commit(app, version_tag)
     ensure_no_marker_errors(load_variable_definitions(app, version_tag, commit_sha), "eingereicht")
+    # The review covers the runtime and, for pods, exactly this spec and
+    # these images (.github#4); served from the scan above.
+    loaded = load_version_spec(app, version_tag, commit_sha)
+    is_pods = loaded is not None and loaded.runtime == RUNTIME_K8S
 
     return crud_approvals.submit_version(
         db,
@@ -565,6 +660,9 @@ def submit_version(
         commit_sha=commit_sha,
         diff_url=body.diff_url,
         notes=body.notes,
+        runtime=RUNTIME_K8S if is_pods else RUNTIME_VM,
+        spec_sha256=loaded.sha256 if is_pods else None,
+        image_digests=app_spec.digests_json(loaded) if is_pods else None,
     )
 
 
