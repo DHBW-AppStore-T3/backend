@@ -14,7 +14,8 @@ PostgreSQL, SQLAlchemy 2.0, Alembic für Migrationen (`alembic/versions/`,
 - `Task` — der Auftrag und seine einzige Wahrheit (`TaskType`,
   `TaskStatus`-Enums). Seit .github#5 zusätzlich Lease (`claimed_by`,
   `lease_until`), `cancel_requested_at`, `finalized_at` (Folgearbeit
-  erledigt) und `outputs_enc` (Fernet über Outputs + State). Höchstens
+  erledigt) und `outputs_enc` (Fernet über Outputs + State, Schlüssel
+  `RESULTS_ENCRYPTION_KEY`; ohne ihn `CREDENTIAL_ENCRYPTION_KEY`). Höchstens
   ein PENDING/RUNNING-Task je Deployment (`uq_tasks_active_per_deployment`)
 - `CeleryQueueMessage` (`celery_queue`) — die Celery-Queue selbst
   (Transport `pgq`); `after_task` parkt einen Destroy hinter einem

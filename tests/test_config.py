@@ -54,6 +54,8 @@ def test_a_safe_production_configuration_starts():
     ("overrides", "message"),
     [
         ({"CREDENTIAL_ENCRYPTION_KEY": CI_KEY}, "published test key"),
+        ({"RESULTS_ENCRYPTION_KEY": CI_KEY}, "RESULTS_ENCRYPTION_KEY is a published test key"),
+        ({"RESULTS_ENCRYPTION_KEY": GOOD_KEY}, "RESULTS_ENCRYPTION_KEY is the credential key"),
         ({"KEYCLOAK_ISSUER": ""}, "KEYCLOAK_ISSUER"),
         ({"KEYCLOAK_ISSUER": "http://keycloak:8080/realms/dhbw"}, "KEYCLOAK_ISSUER"),
         ({"CORS_ORIGINS": ["*"]}, "CORS_ORIGINS"),
@@ -74,9 +76,15 @@ def test_lti_with_a_real_secret_is_fine():
 
 
 @pytest.mark.parametrize("key", ["test-key", "not base64 !!", "c2hvcnQ="])
-def test_a_malformed_fernet_key_is_refused_everywhere(key):
-    with pytest.raises(ValidationError, match="CREDENTIAL_ENCRYPTION_KEY"):
-        _settings(CREDENTIAL_ENCRYPTION_KEY=key)
+@pytest.mark.parametrize("name", ["CREDENTIAL_ENCRYPTION_KEY", "RESULTS_ENCRYPTION_KEY"])
+def test_a_malformed_fernet_key_is_refused_everywhere(key, name):
+    with pytest.raises(ValidationError, match=name):
+        _settings(**{name: key})
+
+
+def test_production_with_a_results_key_of_its_own_starts():
+    settings = _production(RESULTS_ENCRYPTION_KEY="3Hm8cJ0b0yG8kq2l7oQkqzXy3nS1v5Wd9rT6uE4pA2M=")
+    assert settings.RESULTS_ENCRYPTION_KEY != settings.CREDENTIAL_ENCRYPTION_KEY
 
 
 def test_development_accepts_the_test_key_and_http():

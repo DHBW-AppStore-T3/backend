@@ -72,6 +72,13 @@ class Settings(BaseSettings):
     # credentials at rest and to seal the envelope shipped through Celery.
     # Generate: python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
     CREDENTIAL_ENCRYPTION_KEY: str
+    # Fernet key of task results (``tasks.outputs_enc``), shared with the
+    # worker. A key of its own, so the pod deployer, which seals results but
+    # has nothing to do with OpenStack, never holds the credential key (it
+    # can read the job queue, where the VM jobs' credential envelopes
+    # travel). Empty: the credential key, as before. Results sealed with
+    # the credential key open either way.
+    RESULTS_ENCRYPTION_KEY: str = ""
 
     # Keystone URLs OpenStack credentials may point to, comma-separated
     # (e.g. ``https://keystone.example.org:5000/v3``; a trailing ``/v3`` is
@@ -132,14 +139,18 @@ class Settings(BaseSettings):
         wildcard; and once LTI is configured, a real session secret of at
         least 32 characters.
         """
-        problem = _fernet_key_problem(self.CREDENTIAL_ENCRYPTION_KEY)
-        if problem:
-            raise ValueError(f"CREDENTIAL_ENCRYPTION_KEY {problem}")
+        keys = {"CREDENTIAL_ENCRYPTION_KEY": self.CREDENTIAL_ENCRYPTION_KEY}
+        if self.RESULTS_ENCRYPTION_KEY:
+            keys["RESULTS_ENCRYPTION_KEY"] = self.RESULTS_ENCRYPTION_KEY
+        for name, key in keys.items():
+            problem = _fernet_key_problem(key)
+            if problem:
+                raise ValueError(f"{name} {problem}")
         if self.is_development:
             return self
-        problems = []
-        if self.CREDENTIAL_ENCRYPTION_KEY in _PUBLIC_FERNET_KEYS:
-            problems.append("CREDENTIAL_ENCRYPTION_KEY is a published test key")
+        problems = [f"{name} is a published test key" for name, key in keys.items() if key in _PUBLIC_FERNET_KEYS]
+        if self.RESULTS_ENCRYPTION_KEY == self.CREDENTIAL_ENCRYPTION_KEY:
+            problems.append("RESULTS_ENCRYPTION_KEY is the credential key")
         if not self.KEYCLOAK_ISSUER.startswith("https://"):
             problems.append("KEYCLOAK_ISSUER must be set to the public https URL of the realm")
         if not self.oidc_allowed_clients:

@@ -50,7 +50,7 @@ def test_owner_view_shows_no_credentials(client, db, mock_user):
     from app.task_contract import seal_results
 
     dep, _ = _deployment_with_task(
-        db, mock_user, outputs_enc=seal_results(crypto.cipher, terraform_outputs=OUTPUTS, tf_state=None)
+        db, mock_user, outputs_enc=seal_results(crypto.results_cipher, terraform_outputs=OUTPUTS, tf_state=None)
     )
     body = client.get(f"/deployments/{dep.deploymentId}").json()
     raw = json.dumps(body)
@@ -80,7 +80,7 @@ def test_legacy_rows_are_sealed_and_scrubbed(db, mock_user, capsys):
     db.expire_all()
     row = db.get(Task, task.taskId)
     assert row.outputs is None and row.tf_state is None
-    assert open_results(crypto.cipher, row.outputs_enc) == {"terraform_outputs": OUTPUTS, "tf_state": state}
+    assert open_results(crypto.results_cipher, row.outputs_enc) == {"terraform_outputs": OUTPUTS, "tf_state": state}
     logs = json.loads(row.logs)
     assert logs[0] == plain
     assert logs[1]["output_names"] == ["ip", "user_accounts"]

@@ -31,7 +31,7 @@ from sqlalchemy import or_, select, text
 from app.database import SessionLocal
 from app.models import Task, TaskEvent
 from app.task_contract import seal_results
-from app.utils.crypto import cipher
+from app.utils.crypto import results_cipher
 
 LEAKY_MESSAGE = "Terraform deployment output"
 KEPT_FIELDS = ("timestamp", "level", "category", "message", "correlation_id", "deployment_id", "type")
@@ -77,7 +77,7 @@ def seal_task(task: Task) -> bool:
             outputs = json.loads(task.outputs) if isinstance(task.outputs, str) else task.outputs
         except ValueError:
             outputs = None
-        task.outputs_enc = seal_results(cipher, terraform_outputs=outputs, tf_state=task.tf_state)
+        task.outputs_enc = seal_results(results_cipher, terraform_outputs=outputs, tf_state=task.tf_state)
     task.outputs = None
     task.tf_state = None
     return True

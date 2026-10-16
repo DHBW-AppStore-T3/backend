@@ -15,7 +15,7 @@ from cryptography.fernet import InvalidToken
 
 from app.models import Task
 from app.task_contract import open_results
-from app.utils.crypto import cipher
+from app.utils.crypto import results_cipher
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ def _sealed(task: Task) -> dict[str, Any] | None:
     if not token:
         return None
     try:
-        return open_results(cipher, token)
+        return open_results(results_cipher, token)
     except (InvalidToken, ValueError) as e:
         # A key rotation without re-encryption, or a corrupt row: treat the
         # results as missing rather than failing the whole request.

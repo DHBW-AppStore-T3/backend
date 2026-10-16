@@ -312,7 +312,7 @@ def test_follow_up_runs_once_with_parallel_finalizers(db, mock_user):
 def test_a_successful_deploy_is_finalized_without_side_effects(db, mock_user):
     """No access mails any more (.github#7 I): finalizing a deploy only marks it."""
     deployment, task = _seed(db, mock_user, task_type=TaskType.DEPLOY, task_status=TaskStatus.SUCCESS,
-                             outputs_enc=seal_results(crypto.cipher, terraform_outputs={"x": {"value": 1}},
+                             outputs_enc=seal_results(crypto.results_cipher, terraform_outputs={"x": {"value": 1}},
                                                       tf_state=None))
     with TestingSessionLocal() as s:
         assert task_finalizer.finalize_task(s, task.taskId) is True
@@ -391,7 +391,7 @@ def test_task_api_never_returns_outputs_or_state(client, db, mock_user):
     """Sealed in the row, and not in the task API either (.github#7 E)."""
     state = json.dumps({"version": 4, "resources": []})
     _, task = _seed(db, mock_user, task_status=TaskStatus.SUCCESS,
-                    outputs_enc=seal_results(crypto.cipher, terraform_outputs={"ip": {"value": "::1"}},
+                    outputs_enc=seal_results(crypto.results_cipher, terraform_outputs={"ip": {"value": "::1"}},
                                              tf_state=state))
     body = client.get(f"/tasks/{task.taskId}").json()
     assert "outputs" not in body and "tf_state" not in body
