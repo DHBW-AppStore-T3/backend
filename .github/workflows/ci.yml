@@ -9,6 +9,9 @@ on:
     tags: ['v*.*.*']
   pull_request:
     branches: [main, dev]
+  # Runs the pipeline again for a branch (on spike/dev it also publishes and
+  # rolls out, as a push does).
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -487,10 +490,14 @@ jobs:
     name: "📦 Push"
     runs-on: ubuntu-latest
     needs: [build, image-scan]
-    if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/spike/dev') && github.event_name == 'push'
+    if: >-
+      ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') && github.event_name == 'push') ||
+      (github.ref == 'refs/heads/spike/dev' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch'))
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.push-image.outputs.digest }}
 
     steps:
       - name: Checkout repository
@@ -523,6 +530,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Build and push Docker image
+        id: push-image
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -580,12 +588,13 @@ jobs:
     name: "☸️ Roll out on k8s staging"
     runs-on: ubuntu-latest
     needs: [push]
-    if: github.ref == 'refs/heads/spike/dev' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/spike/dev' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
 
     steps:
       - name: Pin the new image in the deployment repo
         run: |
           gh workflow run k8s-bump.yml --repo DHBW-AppStore-T3/deployment --ref spike/dev \
-            -f component=backend -f tag="sha-${GITHUB_SHA::7}"
+            -f component=backend -f tag="sha-${GITHUB_SHA::7}" -f digest="$DIGEST"
         env:
           GH_TOKEN: ${{ secrets.DEPLOYMENT_PAT }}
+          DIGEST: ${{ needs.push.outputs.digest }}
