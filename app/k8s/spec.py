@@ -29,9 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 API_VERSION = "appstore/v2"
 
 # registry[:port]/repo/path@sha256:<64 hex>. Tags are mutable, so only digests.
-_IMAGE_DIGEST_RE = re.compile(
-    r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9._-]+)+@sha256:[0-9a-f]{64}$"
-)
+_IMAGE_DIGEST_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9._-]+)+@sha256:[0-9a-f]{64}$")
 _NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CPU_RE = re.compile(r"^(\d+)m$|^(\d+(\.\d+)?)$")
@@ -111,9 +109,7 @@ def check_path(path: str, what: str, *, ingress: bool = False) -> None:
         segments = segments[:-1]
     for segment in segments:
         if segment in (".", "..") or not _PATH_SEGMENT_RE.match(segment):
-            raise ValueError(
-                f"{what} {path!r} may only contain plain segments (letters, digits, '.', '_', '-')"
-            )
+            raise ValueError(f"{what} {path!r} may only contain plain segments (letters, digits, '.', '_', '-')")
 
 
 class SpecValidationError(ValueError):
@@ -136,9 +132,7 @@ class PlatformLimits:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
-def limits_from(
-    registry_allowlist: str, max_cpu: str, max_memory: str, max_storage: str
-) -> PlatformLimits:
+def limits_from(registry_allowlist: str, max_cpu: str, max_memory: str, max_storage: str) -> PlatformLimits:
     """Platform limits from their settings (``APP_IMAGE_REGISTRY_ALLOWLIST``, ``APP_MAX_*``)."""
     return PlatformLimits(
         image_registry_allowlist=registry_prefixes(registry_allowlist),
@@ -224,9 +218,7 @@ class ResourceBounds(_Strict):
 
 class EnvVar(_Strict):
     name: str
-    source: Literal["generated-password", "team-name", "user-name"] | None = Field(
-        default=None, alias="from"
-    )
+    source: Literal["generated-password", "team-name", "user-name"] | None = Field(default=None, alias="from")
     value: str | None = None
 
     @model_validator(mode="after")
@@ -250,13 +242,9 @@ class Container(_Strict):
     @model_validator(mode="after")
     def _check(self) -> Container:
         if not _NAME_RE.match(self.name):
-            raise ValueError(
-                f"invalid container name {self.name!r} (lowercase letters, digits, '-')"
-            )
+            raise ValueError(f"invalid container name {self.name!r} (lowercase letters, digits, '-')")
         if not _IMAGE_DIGEST_RE.match(self.image):
-            raise ValueError(
-                "image must be pinned by digest: <registry>/<repo>@sha256:<64 hex> (tags are not allowed)"
-            )
+            raise ValueError("image must be pinned by digest: <registry>/<repo>@sha256:<64 hex> (tags are not allowed)")
         b = self.resource_bounds
         if b is not None:
             cpu, mem = (
@@ -266,9 +254,7 @@ class Container(_Strict):
             if not parse_cpu_millicores(b.cpu.min) <= cpu <= parse_cpu_millicores(b.cpu.max):
                 raise ValueError("resources.cpu (the default) must lie within resourceBounds.cpu")
             if not parse_memory_mib(b.memory.min) <= mem <= parse_memory_mib(b.memory.max):
-                raise ValueError(
-                    "resources.memory (the default) must lie within resourceBounds.memory"
-                )
+                raise ValueError("resources.memory (the default) must lie within resourceBounds.memory")
         for p in self.writable_paths:
             check_path(p, "writablePaths entry")
         if len(set(self.writable_paths)) != len(self.writable_paths):
@@ -305,9 +291,7 @@ class Workload(_Strict):
             raise ValueError("container names must be unique")
         if sum(c.expose is not None for c in self.containers) != 1:
             raise ValueError("exactly one container must set 'expose'")
-        if self.storage is not None and any(
-            self.storage.mount_path in c.writable_paths for c in self.containers
-        ):
+        if self.storage is not None and any(self.storage.mount_path in c.writable_paths for c in self.containers):
             raise ValueError("storage.mountPath must not also be a writablePaths entry")
         return self
 
@@ -330,10 +314,7 @@ class Variable(_Strict):
             if not self.mount_path:
                 raise ValueError("file variables need an absolute mountPath")
             check_path(self.mount_path, "mountPath")
-            if (
-                self.max_size is not None
-                and parse_size_bytes(self.max_size) > MAX_FILE_VARIABLE_BYTES
-            ):
+            if self.max_size is not None and parse_size_bytes(self.max_size) > MAX_FILE_VARIABLE_BYTES:
                 raise ValueError("maxSize above 1Mi is not supported yet (Secret mount limit)")
         if self.type == "enum":
             if not self.values:
@@ -369,9 +350,7 @@ class Access(_Strict):
 def _check_placeholders(template: str, allowed: set[str]) -> None:
     for _, field_name, _, _ in string.Formatter().parse(template):
         if field_name is not None and field_name not in allowed:
-            raise ValueError(
-                f"unknown placeholder {{{field_name}}} (allowed: {', '.join(sorted(allowed))})"
-            )
+            raise ValueError(f"unknown placeholder {{{field_name}}} (allowed: {', '.join(sorted(allowed))})")
 
 
 class AppSpec(_Strict):
@@ -391,9 +370,7 @@ class AppSpec(_Strict):
         if self.runtime == "kubernetes" and self.workload is None:
             raise ValueError("runtime 'kubernetes' requires 'workload'")
         if self.runtime == "openstack-vm" and self.workload is not None:
-            raise ValueError(
-                "runtime 'openstack-vm' uses terraform/ + packer/, 'workload' is not allowed"
-            )
+            raise ValueError("runtime 'openstack-vm' uses terraform/ + packer/, 'workload' is not allowed")
         names = [v.name for v in self.variables]
         if len(set(names)) != len(names):
             raise ValueError("variable names must be unique")
@@ -408,9 +385,7 @@ class AppSpec(_Strict):
             if self.workload.storage is not None:
                 taken.add(self.workload.storage.mount_path)
             if taken.intersection(files):
-                raise ValueError(
-                    "a file variable's mountPath is already used by writablePaths or storage"
-                )
+                raise ValueError("a file variable's mountPath is already used by writablePaths or storage")
         return self
 
 
@@ -426,9 +401,7 @@ def _limit_errors(spec: AppSpec, limits: PlatformLimits) -> list[dict[str, str]]
     if spec.workload is None:
         return errors
     if len(spec.workload.containers) > limits.max_containers:
-        errors.append(
-            {"loc": "workload.containers", "msg": f"at most {limits.max_containers} containers"}
-        )
+        errors.append({"loc": "workload.containers", "msg": f"at most {limits.max_containers} containers"})
     for i, c in enumerate(spec.workload.containers):
         base = f"workload.containers[{i}]"
         if not c.image.startswith(limits.image_registry_allowlist):
@@ -502,10 +475,7 @@ def parse_spec(text: str | bytes | dict[str, Any], limits: PlatformLimits | None
         spec = AppSpec.model_validate(data)
     except ValidationError as exc:
         raise SpecValidationError(
-            [
-                {"loc": _loc(e["loc"]), "msg": e["msg"].removeprefix("Value error, ")}
-                for e in exc.errors()
-            ]
+            [{"loc": _loc(e["loc"]), "msg": e["msg"].removeprefix("Value error, ")} for e in exc.errors()]
         ) from exc
     return validate_spec(spec, limits)
 
@@ -518,9 +488,7 @@ def _format_memory(mib: int) -> str:
     return f"{mib // 1024}Gi" if mib % 1024 == 0 else f"{mib}Mi"
 
 
-def apply_resource_overrides(
-    spec: AppSpec, overrides: Any, limits: PlatformLimits | None = None
-) -> AppSpec:
+def apply_resource_overrides(spec: AppSpec, overrides: Any, limits: PlatformLimits | None = None) -> AppSpec:
     """A copy of ``spec`` with the ``cpu``/``memory`` a person chose per container.
 
     ``overrides`` maps a container name to ``{"cpu": ..., "memory": ...}`` (either
@@ -534,9 +502,7 @@ def apply_resource_overrides(
     limits = limits or PlatformLimits()
     errors: list[dict[str, str]] = []
     if not isinstance(overrides, dict) or spec.workload is None:
-        raise SpecValidationError(
-            [{"loc": "resources", "msg": "must map container names to cpu/memory"}]
-        )
+        raise SpecValidationError([{"loc": "resources", "msg": "must map container names to cpu/memory"}])
     by_name = {c.name: c for c in spec.workload.containers}
     result = spec.model_copy(deep=True)
     new_by_name = {c.name: c for c in result.workload.containers}  # type: ignore[union-attr]
