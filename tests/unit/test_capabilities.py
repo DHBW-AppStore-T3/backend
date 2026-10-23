@@ -225,7 +225,7 @@ def test_ensure_approve_app_version_raises(teacher):
 
 
 # ================================================================
-# DEPLOYMENTS — view_member / view_owner / operate / resend
+# DEPLOYMENTS — view_member / view_owner / operate
 # ================================================================
 class TestCanViewDeploymentMember:
     """Mirrors ``has_deployment_access`` — owner, staff, team, direct."""
@@ -293,7 +293,7 @@ class TestCanViewDeploymentOwner:
         dep = SimpleNamespace(
             deploymentId=uuid.uuid4(),
             userId=uuid.uuid4(),
-            user=SimpleNamespace(courseId=course_id),
+            user=SimpleNamespace(courseId=course_id, role=UserRole.STUDENT),
         )
         db = MagicMock()
         # First filter().first() call returns a truthy row → match.
@@ -301,6 +301,35 @@ class TestCanViewDeploymentOwner:
             SimpleNamespace(courseId=course_id, userId=teacher.userId)
         )
         assert caps.can_view_deployment_owner(teacher, dep, db) is True
+
+    @pytest.mark.parametrize("owner_role", [UserRole.TEACHER, UserRole.ADMIN])
+    def test_course_teacher_cannot_view_staff_deployments(self, teacher, owner_role):
+        # .github#7 F: putting a colleague into one's own course must not
+        # open their deployments' logs and files.
+        course_id = uuid.uuid4()
+        dep = SimpleNamespace(
+            deploymentId=uuid.uuid4(),
+            userId=uuid.uuid4(),
+            user=SimpleNamespace(courseId=course_id, role=owner_role),
+        )
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = (
+            SimpleNamespace(courseId=course_id, userId=teacher.userId)
+        )
+        assert caps.can_view_deployment_owner(teacher, dep, db) is False
+
+    def test_teacher_no_longer_member_views_everything(self, teacher):
+        dep = SimpleNamespace(deploymentId=uuid.uuid4(), userId=uuid.uuid4(), user=None)
+        db = MagicMock()
+        db.query.return_value.join.return_value.filter.return_value.first.return_value = None
+        db.query.return_value.filter.return_value.first.return_value = None
+        assert caps.can_view_deployment_member(teacher, dep, db) is False
+        assert caps.can_view_deployment(teacher, dep, db) is False
+
+    def test_register_and_deploy_need_staff(self, teacher):
+        student = _user(UserRole.STUDENT)
+        assert caps.can_register_app(teacher) and caps.can_deploy(teacher)
+        assert not caps.can_register_app(student) and not caps.can_deploy(student)
 
     def test_teacher_without_course_context_rejected(self, teacher):
         # Deployment owner has no course assigned → course-teacher path
@@ -315,8 +344,9 @@ class TestCanViewDeploymentOwner:
 
 
 class TestCanOperateDeployment:
-    """Phase 2: operate is owner-or-admin only. Teachers no longer get
-    a blanket operate right via the staff bypass."""
+    """Operate is for the owner and project peers. Teachers get no blanket
+    right via the staff bypass, and admins are read-only on VM deployments:
+    every action runs with the caller's own credential for the project."""
 
     def test_owner_can_operate(self, student, db_mock):
         dep = _deployment(student.userId)
@@ -328,37 +358,30 @@ class TestCanOperateDeployment:
         dep = _deployment(uuid.uuid4())
         assert caps.can_operate_deployment(teacher, dep, db_mock) is False
 
-    def test_admin_can_operate(self, admin, db_mock):
+    def test_admin_cannot_operate_a_vm_deployment(self, admin, db_mock):
         dep = _deployment(uuid.uuid4())
-        assert caps.can_operate_deployment(admin, dep, db_mock) is True
+        assert caps.can_operate_deployment(admin, dep, db_mock) is False
+
+    def test_project_peer_can_operate_and_inspect(self, teacher, db_mock, monkeypatch):
+        dep = SimpleNamespace(deploymentId=uuid.uuid4(), userId=uuid.uuid4(), os_project_id="p-1")
+        holds = MagicMock(side_effect=lambda _db, _user_id, project_id: project_id == "p-1")
+        monkeypatch.setattr(caps.crud_openstack_credentials, "holds_project", holds)
+
+        assert caps.can_operate_deployment(teacher, dep, db_mock) is True
+        assert caps.can_view_deployment_owner(teacher, dep, db_mock) is True
+        holds.assert_called_with(db_mock, teacher.userId, "p-1")
+
+    def test_no_project_makes_no_peer(self, teacher, db_mock, monkeypatch):
+        holds = MagicMock(return_value=True)
+        monkeypatch.setattr(caps.crud_openstack_credentials, "holds_project", holds)
+        dep = SimpleNamespace(deploymentId=uuid.uuid4(), userId=uuid.uuid4(), os_project_id=None)
+
+        assert caps.can_operate_deployment(teacher, dep, db_mock) is False
+        holds.assert_not_called()
 
     def test_unrelated_student_cannot_operate(self, student, db_mock):
         dep = _deployment(uuid.uuid4())
         assert caps.can_operate_deployment(student, dep, db_mock) is False
-
-
-class TestCanResendAccess:
-    def test_self_resend_when_member(self, student, db_mock):
-        dep = _deployment(student.userId)
-        assert caps.can_resend_access(student, dep, student.userId, db_mock) is True
-
-    def test_admin_can_resend_for_anyone(self, admin, db_mock):
-        dep = _deployment(uuid.uuid4())
-        other = uuid.uuid4()
-        assert caps.can_resend_access(admin, dep, other, db_mock) is True
-
-    def test_student_cannot_resend_for_other(self, student, db_mock):
-        # Student is owner of dep (member-view), but cannot dispatch
-        # credentials to someone else — that's the owner-view gate.
-        dep = _deployment(student.userId)
-        other = uuid.uuid4()
-        # Owner of the deployment counts as owner-view → True.
-        assert caps.can_resend_access(student, dep, other, db_mock) is True
-
-    def test_unrelated_student_cannot_resend_for_other(self, student, db_mock):
-        dep = _deployment(uuid.uuid4())  # student is not owner
-        other = uuid.uuid4()
-        assert caps.can_resend_access(student, dep, other, db_mock) is False
 
 
 # ================================================================

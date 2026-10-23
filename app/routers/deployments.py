@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import binascii
+import contextlib
 import json
 import logging
 import re
@@ -11,32 +12,46 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy import desc
+from sqlalchemy import desc, or_, select, text
 from sqlalchemy.orm import Session
 
-from app.celery_app import celery_app
+from app.config import settings
+from app.crud import app_version_approvals as crud_approvals
 from app.crud import apps as crud_apps
 from app.crud import deployments as crud_deployments
 from app.crud import locks as crud_locks
 from app.crud import openstack_credentials as crud_openstack_credentials
 from app.crud import teams as crud_teams
 from app.crud import users as crud_users
-from app.database import get_db
+from app.database import SessionLocal, get_db
+from app.k8s.render import Member, workload_refs
+from app.k8s.render import Team as RenderTeam
+from app.k8s.spec import MAX_FILE_VARIABLE_BYTES, parse_size_bytes
+from app.models import RUNTIME_K8S, RUNTIME_VM, TaskStatus, TaskType, User, UserRole
 from app.models import Task as TaskModel  # for ad-hoc state queries
-from app.models import TaskStatus, TaskType, User, UserRole
 from app.schemas import (
     DeploymentCreate,
     DeploymentDetail,
     DeploymentOutputs,
+    DeploymentPermissions,
     DeploymentResourceListResponse,
     DeploymentResourceSchema,
     DeploymentResponse,
     DeploymentTeamMember,
     DeploymentTeamResponse,
     MyAccessResponse,
+    PodWorkloadSchema,
     TaskSummary,
 )
-from app.services import deployment_notifier, email_service
+from app.services import (
+    access,
+    k8s_status,
+    openstack_client,
+    task_events,
+    task_finalizer,
+    task_results,
+    tf_state_store,
+)
 from app.services import lifecycle as lifecycle_service
 from app.services import task_service as task_service_module
 from app.services.deployment_input import (
@@ -45,21 +60,34 @@ from app.services.deployment_input import (
     parse_and_strip_user_input,
     validate_scoped_user_input,
 )
-from app.services.deployment_pubsub import pubsub
 from app.services.deployment_status import (
     build_resource_detail,
     build_resource_views,
 )
+from app.services.openstack_validator import auth_url_allowed
 from app.services.tf_state_parser import parse_tf_state
+from app.task_contract import (
+    EVENT_FAILED,
+    EVENT_REVOKED,
+    EVENT_SUCCEEDED,
+    NOTIFY_TASK_CANCEL,
+    TERMINAL_EVENTS,
+    terminal_payload,
+)
+from app.utils import crypto
 from app.utils.capabilities import (
+    can_operate_deployment,
     can_view_deployment_owner,
+    ensure_deploy,
     ensure_operate_deployment,
-    ensure_resend_access,
     ensure_view_app,
+    ensure_view_deployment,
+    ensure_view_deployment_member,
     ensure_view_deployment_owner,
 )
+from app.utils.filenames import content_disposition
 from app.utils.keycloak_auth import get_current_user_keycloak
-from app.utils.permissions import ensure_deployment_access
+from app.utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -87,6 +115,8 @@ def list_deployments(
       * **Students** (and any non-staff role): deployments they own
         OR are a member of — either via a team mapping or a direct
         ``UserToDeployment`` row.
+      * Either way also every VM deployment in an OpenStack project the
+        caller holds a verified credential for (project peers).
 
     A ``?scope=course`` branch used to sit here, listing every
     deployment whose owner was in a course the caller teaches. It had
@@ -97,6 +127,7 @@ def list_deployments(
     endpoint with a working filter and tests, not this.
     """
     is_staff = current_user.role in (UserRole.TEACHER, UserRole.ADMIN)
+    peer_project_ids = crud_openstack_credentials.project_ids_of(db, current_user.userId)
 
     if is_staff:
         deployments = crud_deployments.get_deployments(
@@ -104,6 +135,7 @@ def list_deployments(
             skip=skip,
             limit=limit,
             user_id=current_user.userId,
+            peer_project_ids=peer_project_ids,
             app_id=app_id,
             status=status_filter,
         )
@@ -113,6 +145,7 @@ def list_deployments(
             skip=skip,
             limit=limit,
             member_user_id=current_user.userId,
+            peer_project_ids=peer_project_ids,
             app_id=app_id,
             status=status_filter,
         )
@@ -150,6 +183,9 @@ def list_deployments(
             appId=deployment.appId,
             userId=deployment.userId,
             releaseTag=deployment.releaseTag,
+            commit_sha=deployment.commit_sha,
+            os_project_id=deployment.os_project_id,
+            runtime=deployment.runtime,
             userInputVar=user_input_var_parsed,
             status=status_value,
             created_at=first_created_at,
@@ -183,8 +219,9 @@ def get_deployment(
             detail="Deployment not found"
         )
 
-    # Check access permission
-    ensure_deployment_access(deployment, current_user, db)
+    # Member view or owner view (a course-teacher inspecting a student's
+    # deployment); 403 otherwise. No blanket teacher access (.github#7 F).
+    ensure_view_deployment(current_user, deployment, db)
 
     # Get latest task
     latest_task = crud_deployments.get_latest_task(db, deployment_id)
@@ -213,6 +250,9 @@ def get_deployment(
     # + outputs alongside owners and admins.
     is_owner_view = can_view_deployment_owner(current_user, deployment, db)
     teams_data = crud_deployments.get_deployment_teams_with_members(db, deployment_id)
+    is_member = any(
+        str(m["userId"]) == str(current_user.userId) for t in teams_data for m in t["members"]
+    )
     if not is_owner_view:
         teams_data = [
             t for t in teams_data
@@ -236,10 +276,13 @@ def get_deployment(
 
     # Outputs / state / logs are owner-only — members don't get to
     # browse the credentials of teammates or the raw infrastructure
-    # state. They have their own resend-access action for their own
-    # credentials.
+    # state. They fetch their own credentials through ``my-access``.
     if is_owner_view:
-        outputs_data = crud_deployments.get_deployment_outputs(db, deployment_id)
+        # Sensitive outputs (and every member's account) are blanked out;
+        # each member fetches their own through ``my-access`` (.github#7 E).
+        outputs_data = task_results.redact_sensitive_outputs(
+            crud_deployments.get_deployment_outputs(db, deployment_id)
+        )
         outputs = DeploymentOutputs(raw=outputs_data) if outputs_data else None
     else:
         outputs = None
@@ -265,12 +308,22 @@ def get_deployment(
     from app.routers.apps import _serialize_app  # local: avoid import cycle
     serialised_app = _serialize_app(deployment.app)
 
+    # The UI renders buttons from these instead of guessing from the role.
+    may_operate = can_operate_deployment(current_user, deployment, db)
+    permissions = DeploymentPermissions(owner_view=is_owner_view, operate=may_operate, member=is_member)
+    actions = (
+        sorted(a.value for a in lifecycle_service.allowed_actions(db, deployment)) if may_operate else []
+    )
+
     return DeploymentDetail(
         deploymentId=deployment.deploymentId,
         name=deployment.name,
         appId=deployment.appId,
         userId=deployment.userId,
         releaseTag=deployment.releaseTag,
+        commit_sha=deployment.commit_sha,
+        os_project_id=deployment.os_project_id,
+        runtime=deployment.runtime,
         userInputVar=user_input_var_parsed,
         status=status_value,
         created_at=created_at,
@@ -280,6 +333,8 @@ def get_deployment(
         latest_task=task_summary,
         outputs=outputs,
         logs=logs,
+        permissions=permissions,
+        actions=actions,
     )
 
 
@@ -299,13 +354,18 @@ def create_deployment(
     with deployment dispatch. The deployment row, teams, user mappings,
     and the initial PENDING task row are all inserted in a single
     transaction, so the user can never end up with a deployment row
-    that has no matching task. Celery dispatch happens AFTER commit;
+    that has no matching task. The queue dispatch happens AFTER commit;
     if it fails, the task row is flipped to FAILED so the deployment
     surfaces an honest error instead of hanging in PENDING forever.
     """
-    # Per-user lock — serializes against PUT /me/openstack-credentials
-    # and any other concurrent POST /deployments from this user. Held
-    # until the next COMMIT/ROLLBACK on this connection.
+    # Teachers and admins deploy; students use deployments (.github#7 F).
+    ensure_deploy(current_user)
+    # Teams are lists of existing users, each in at most one team.
+    _validate_teams(db, deployment.teams or [])
+
+    # Per-user lock — serializes against POST/DELETE
+    # /me/openstack-credentials and any other concurrent POST /deployments
+    # from this user. Held until the next COMMIT/ROLLBACK on this connection.
     crud_locks.acquire_user_xact_lock(db, current_user.userId)
 
     # Refuse the create if the target app is soft-deleted.
@@ -325,23 +385,54 @@ def create_deployment(
     # endpoint when visibility is denied.
     ensure_view_app(current_user, target_app, db=db)
 
-    # Load the app author's variable declarations so we can enforce
+    # The deployment runs the commit the tag points to now, and every job
+    # of it runs exactly that commit (.github#7 G). A public app needs an
+    # approval of exactly this commit; a private app is its owner's test
+    # bench (only the owner and admins get past ``ensure_view_app``).
+    # Unknown tag 404, unreadable repository 502.
+    from app.routers.apps import (
+        load_variable_definitions,
+        load_version_spec,
+        resolve_version_commit,
+    )
+    commit_sha = resolve_version_commit(target_app, deployment.releaseTag)
+    if not target_app.is_private and not crud_approvals.has_approved_version(
+        db, target_app.appId, deployment.releaseTag, commit_sha
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "version_not_approved", "version": deployment.releaseTag},
+        )
+
+    # Pod app (appstore.yaml at the pinned commit) or VM app. Pods run in the
+    # cluster and never use an OpenStack credential, even a supplied one; the
+    # review of a public pod app covers exactly this spec (.github#4).
+    loaded_spec = load_version_spec(target_app, deployment.releaseTag, commit_sha)
+    is_pods = loaded_spec is not None and loaded_spec.runtime == RUNTIME_K8S
+    credential = None
+    if is_pods:
+        approval = crud_approvals.get_approval(db, target_app.appId, deployment.releaseTag)
+        if not target_app.is_private and (
+            approval is None or approval.runtime != RUNTIME_K8S or approval.spec_sha256 != loaded_spec.sha256
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "version_not_approved", "version": deployment.releaseTag},
+            )
+    else:
+        # The deployment lives in the project of the credential the caller
+        # picked; it must be theirs and its project confirmed by Keystone,
+        # because the project decides who the deployment's peers are. Read
+        # inside the locked TX, so a concurrent change of the credential is
+        # serialized behind us.
+        credential = openstack_client.deploy_credential(db, current_user, deployment.credentialId)
+
+    # The app author's variable declarations at that commit, to enforce
     # per-variable contracts (``varScope``, ``fileExtensions``) below.
-    # We only do this when the request actually carries variables /
-    # files — for a no-input deploy the round-trip into Git would be
-    # waste. Same parser as ``GET /apps/{id}/variables`` so client and
-    # server agree on which variable is scoped/file/free-text.
-    variable_definitions: list[dict] = []
-    if deployment.userInputVar or deployment.files:
-        from app.routers.apps import load_variable_definitions
-        release_tag = deployment.releaseTag or "main"
-        try:
-            variable_definitions = load_variable_definitions(target_app, release_tag)
-        except HTTPException as exc:
-            if exc.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY:
-                raise
-            # 400 (no git_link) or 500 (git unreachable) — skip validation,
-            # proceed without variable definitions.
+    # Fails closed: without the declarations nothing is deployed. Same
+    # parser as ``GET /apps/{id}/variables`` so client and server agree on
+    # which variable is scoped/file/free-text; cached per commit.
+    variable_definitions = load_variable_definitions(target_app, deployment.releaseTag, commit_sha)
 
     # Fold the wizard's parallel ``files`` upload into
     # ``userInputVar.terraform`` before the row gets persisted, so the
@@ -366,8 +457,19 @@ def create_deployment(
             deployment.teams or [],
         )
 
+    workloads = None
+    if is_pods:
+        _check_pod_files(loaded_spec, deployment.userInputVar)
+        workloads = _check_pod_workloads(db, current_user, loaded_spec, deployment.teams or [])
+
     db_deployment = crud_deployments.create_deployment(
-        db, deployment, current_user.userId
+        db,
+        deployment,
+        current_user.userId,
+        commit_sha,
+        os_project_id=credential.project_id if credential is not None else None,
+        runtime=RUNTIME_K8S if is_pods else RUNTIME_VM,
+        k8s_workloads=workloads,
     )
 
     user_ids_in_deployment = set()
@@ -399,7 +501,9 @@ def create_deployment(
     except Exception:
         user_vars = {}
 
-    # Format teams for Terraform (team_name: [user_emails])
+    # The roster the worker gets: per team the members' e-mail (what the
+    # apps' ``users`` variable carries), user id and username. The id lets
+    # access data be matched to exactly one person (.github#7 H).
     teams_dict = {}
     if deployment.teams:
         for team in deployment.teams:
@@ -407,17 +511,17 @@ def create_deployment(
             for user_id in team.userIds:
                 user = crud_users.get_user(db, user_id)
                 if user:
-                    team_users.append({"email": user.email})
+                    team_users.append(_member_entry(user))
             teams_dict[team.name] = team_users
 
-    # Per-user OpenStack credentials are required to deploy. The envelope
-    # carries ciphertext only — the worker decrypts in-process. Reading
-    # this inside the locked TX guarantees the envelope matches whatever
-    # credential row a concurrent PUT might have committed: PUT is
-    # serialized behind us by the same advisory lock.
-    openstack_envelope = _fetch_dispatch_envelope(
-        db, current_user.userId, rollback_on_missing=True
-    )
+    # The envelope carries ciphertext only — the worker decrypts in-process.
+    # Pods have none; their job carries the validated spec instead.
+    if is_pods:
+        openstack_envelope: dict = {}
+        extra = {"spec": loaded_spec.payload(), "owner": str(current_user.userId)}
+    else:
+        openstack_envelope = _dispatch_envelope(db, credential, rollback=True)
+        extra = {}
 
     # Insert PENDING task row in the SAME transaction as the deployment,
     # commit atomically (deployment + teams + user_to_deployments + task),
@@ -429,18 +533,11 @@ def create_deployment(
         db,
         deployment_id=db_deployment.deploymentId,
         task_type=TaskType.DEPLOY,
-        celery_task_name="tasks.deploy_application",
-        celery_args=[
-            str(db_deployment.deploymentId),
-            str(db_deployment.appId),
-            db_deployment.app.git_link,
-            db_deployment.releaseTag,
-            user_vars,
-            teams_dict,
-            openstack_envelope,
-        ],
+        celery_task_name=_task_name(db_deployment.runtime, TaskType.DEPLOY),
+        celery_kwargs=_job_kwargs(db_deployment, user_vars, teams_dict, openstack_envelope, **extra),
         dispatch_error_label="Could not dispatch deployment task — please retry",
         rollback_on_conflict=True,
+        state_token=not is_pods,
     )
 
     db.refresh(db_deployment)
@@ -459,6 +556,9 @@ def create_deployment(
         appId=db_deployment.appId,
         userId=db_deployment.userId,
         releaseTag=db_deployment.releaseTag,
+        commit_sha=db_deployment.commit_sha,
+        os_project_id=db_deployment.os_project_id,
+        runtime=db_deployment.runtime,
         userInputVar=user_input_var_parsed,
         status=status_value,
         created_at=created_at,
@@ -532,10 +632,15 @@ def delete_deployment(
     # auto-soft-delete the row when the destroy task succeeds. ``paused``
     # also lands here: SHUTOFF instances + volumes/networks are still
     # OpenStack resources that need to be torn down before the row can
-    # be hidden. ``pause_failed`` / ``resume_failed`` likewise still
-    # have running OpenStack resources behind them — the deployment
-    # itself didn't break, only the lifecycle pass.
-    if current_status in ("success", "failed", "paused", "pause_failed", "resume_failed"):
+    # be hidden. ``pause_failed`` / ``resume_failed`` / ``redeploy_failed``
+    # likewise still have running OpenStack resources behind them — the
+    # deployment itself didn't break, only the lifecycle pass.
+    if current_status in ("success", "failed", "paused", "pause_failed", "resume_failed", "redeploy_failed"):
+        return _dispatch_destroy(db, deployment, current_user)
+    # A pod deployment always goes through a destroy: even a cancelled one
+    # may have created its namespace before the cancel arrived, and hiding
+    # the row would leave the namespace running with nobody to see it.
+    if deployment.runtime == RUNTIME_K8S:
         return _dispatch_destroy(db, deployment, current_user)
 
     # No resources to clean up (cancelled, or anything else terminal):
@@ -549,24 +654,222 @@ def delete_deployment(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-def _fetch_dispatch_envelope(db: Session, user_id, *, rollback_on_missing: bool):
-    """Fetch the encrypted OpenStack credential envelope for a dispatch.
+def _dispatch_envelope(db: Session, credential, *, rollback: bool = False) -> dict:
+    """The encrypted envelope of ``credential`` for a job.
 
-    Raises ``HTTPException(412, openstack_credentials_missing)`` when the
-    user has no credentials. ``rollback_on_missing`` is used by the
-    create path, which holds an uncommitted deployment insert that must
-    be rolled back before the 412 escapes; lifecycle callers have no such
-    pending insert and pass ``False``.
+    422 ``auth_url_not_allowed`` when its Keystone URL is not (or no
+    longer) on the allowlist: the worker would send the login there
+    (.github#7 C). ``rollback`` is for the create path, which holds an
+    uncommitted deployment insert that must not survive the error.
     """
-    try:
-        return crud_openstack_credentials.get_dispatch_envelope(db, user_id)
-    except crud_openstack_credentials.NoCredentialError:
-        if rollback_on_missing:
+    if not auth_url_allowed(credential.auth_url):
+        if rollback:
             db.rollback()
         raise HTTPException(
-            status_code=status.HTTP_412_PRECONDITION_FAILED,
-            detail={"reason": "openstack_credentials_missing"},
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "auth_url_not_allowed"},
         )
+    return crud_openstack_credentials.dispatch_envelope(credential)
+
+
+def _fetch_dispatch_envelope(db: Session, user: User, deployment) -> dict:
+    """The caller's own credential envelope for the deployment's project.
+
+    Lifecycle actions run with the credential of whoever triggers them,
+    never with the owner's (dhbw-appstore's model): 403
+    ``openstack_credentials_missing_for_project`` without one, 409
+    ``deployment_project_unknown`` for an old deployment whose project is
+    not known yet (``openstack_client.project_credential``).
+    """
+    row = openstack_client.project_credential(db, user, deployment.os_project_id)
+    return _dispatch_envelope(db, row)
+
+
+# The job each (runtime, task type) runs. VM jobs go to the ``vm`` queue
+# (OpenTofu/Packer executor, no cluster rights), pod jobs to ``pods`` (the pod
+# deployer, no OpenTofu, no root); see ``app.celery_app``.
+_TASK_NAMES = {
+    (RUNTIME_VM, TaskType.DEPLOY): "tasks.deploy_application",
+    (RUNTIME_VM, TaskType.DESTROY): "tasks.destroy_deployment",
+    (RUNTIME_VM, TaskType.PAUSE): "tasks.pause_deployment",
+    (RUNTIME_VM, TaskType.RESUME): "tasks.resume_deployment",
+    (RUNTIME_VM, TaskType.REDEPLOY): "tasks.redeploy_resource",
+    (RUNTIME_K8S, TaskType.DEPLOY): "pods.deploy_application",
+    (RUNTIME_K8S, TaskType.DESTROY): "pods.destroy_deployment",
+    (RUNTIME_K8S, TaskType.PAUSE): "pods.pause_deployment",
+    (RUNTIME_K8S, TaskType.RESUME): "pods.resume_deployment",
+    (RUNTIME_K8S, TaskType.REDEPLOY): "pods.redeploy_resource",
+}
+
+
+def _task_name(runtime: str, task_type: TaskType) -> str:
+    return _TASK_NAMES[(runtime or RUNTIME_VM, task_type)]
+
+
+def _render_teams(db: Session, teams) -> list[RenderTeam]:
+    """The request's teams as the pod renderer sees them: members by user id and user name."""
+    out = []
+    for team in teams:
+        members = []
+        for raw in team.userIds:
+            user = crud_users.get_user(db, UUID(str(raw)))
+            if user is not None:
+                members.append(Member(user_id=str(user.userId), name=user.username or user.email))
+        out.append(RenderTeam(team.name, tuple(members)))
+    return out
+
+
+def _check_pod_workloads(db: Session, owner: User, loaded_spec, teams) -> int:
+    """The number of workloads a pod deployment will run; refuses what the platform does not allow.
+
+    422 ``team_names_collide`` when two team names normalise to the same
+    workload name, 422 ``no_workloads`` without members to run anything for,
+    422 ``too_many_workloads`` above ``K8S_MAX_WORKLOADS_PER_DEPLOYMENT``, 409
+    ``workload_budget_exceeded`` when the owner's live pod deployments would
+    exceed ``K8S_MAX_WORKLOADS_PER_OWNER``.
+    """
+    try:
+        refs = workload_refs(loaded_spec.spec, _render_teams(db, teams))
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "team_names_collide", "message": str(e)},
+        ) from None
+    if not refs:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "no_workloads", "message": "Add teams (and members, for per-person apps)"},
+        )
+    limit = settings.K8S_MAX_WORKLOADS_PER_DEPLOYMENT
+    if len(refs) > limit:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "too_many_workloads", "workloads": len(refs), "limit": limit},
+        )
+    budget = settings.K8S_MAX_WORKLOADS_PER_OWNER
+    if budget:
+        used = crud_deployments.count_live_workloads(db, owner.userId)
+        if used + len(refs) > budget:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"reason": "workload_budget_exceeded", "in_use": used, "requested": len(refs), "budget": budget},
+            )
+    return len(refs)
+
+
+def _check_pod_files(loaded_spec, user_input: dict | None) -> None:
+    """413 unless the uploaded files of a pod app fit where they go.
+
+    The pod worker puts every file a workload gets into one Kubernetes
+    Secret, which holds at most 1 MiB, and each file variable may declare a
+    smaller ``maxSize``. The deploy would otherwise fail late, in the
+    cluster, with an error nobody can act on. Conservative: the largest slot
+    of every file variable is counted once.
+    """
+    terraform_block = (user_input or {}).get("terraform") or {}
+    total = 0
+    for variable in loaded_spec.spec.variables:
+        if variable.type != "file":
+            continue
+        limit = parse_size_bytes(variable.max_size) if variable.max_size else MAX_FILE_VARIABLE_BYTES
+        largest = 0
+        for slot_key, entry in (terraform_block.get(variable.name) or {}).items():
+            if isinstance(entry, dict) and isinstance(entry.get("uploaded"), dict):
+                entry = entry["uploaded"]
+            size = int(entry.get("size") or 0) if isinstance(entry, dict) else 0
+            if size > limit:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail={
+                        "reason": "file_too_large",
+                        "variable": variable.name,
+                        "slot": slot_key,
+                        "limit_bytes": limit,
+                        "actual_bytes": size,
+                    },
+                )
+            largest = max(largest, size)
+        total += largest
+    if total > MAX_FILE_VARIABLE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={"reason": "deployment_files_too_large", "limit_bytes": MAX_FILE_VARIABLE_BYTES},
+        )
+
+
+def _validate_teams(db: Session, teams) -> None:
+    """422 unless every team has a unique, non-empty name and every member
+    exists and is in exactly one team (.github#7 F).
+
+    A user id that matched nobody used to be dropped silently, and a person
+    in two teams got two workloads (or two VM accounts).
+    """
+    names = [team.name.strip() for team in teams]
+    if any(not name for name in names) or len(set(names)) != len(names):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "invalid_teams", "message": "Team names must be unique and not empty"},
+        )
+    seen: set[str] = set()
+    for team in teams:
+        for raw in team.userIds:
+            try:
+                user_id = UUID(str(raw))
+            except ValueError:
+                user_id = None
+            if user_id is None or crud_users.get_user(db, user_id) is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={"reason": "unknown_team_member", "user_id": str(raw)},
+                )
+            if str(user_id) in seen:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={"reason": "member_in_several_teams", "user_id": str(user_id)},
+                )
+            seen.add(str(user_id))
+
+
+def _member_entry(user: User) -> dict:
+    """One team member as the worker gets it: e-mail, user id, username."""
+    return {"email": user.email, "user_id": str(user.userId), "username": user.username}
+
+
+def _job_kwargs(deployment, user_vars: dict, teams: dict, openstack_envelope: dict, **extra) -> dict:
+    """The keyword arguments every job of ``deployment`` receives.
+
+    ``commit_sha`` is the commit the deployment was created with; the
+    worker fetches exactly it and never resolves a tag (.github#7 G).
+    """
+    return {
+        "deployment_id": str(deployment.deploymentId),
+        "app_id": str(deployment.appId),
+        "app_git_link": deployment.app.git_link,
+        "release": deployment.releaseTag,
+        "commit_sha": deployment.commit_sha,
+        "user_vars": user_vars,
+        "teams": teams,
+        "openstack_envelope": openstack_envelope,
+        **extra,
+    }
+
+
+def _pin_legacy_commit(db: Session, deployment) -> None:
+    """Pin a deployment created before commits were pinned (.github#7 G).
+
+    Its jobs used to clone the tag by name. The commit the tag points to
+    on the first lifecycle action after the upgrade is recorded and used
+    from then on, so the code cannot change under it again. Not committed
+    here; the task insert commits it.
+    """
+    if deployment.commit_sha:
+        return
+    from app.routers.apps import resolve_version_commit
+    deployment.commit_sha = resolve_version_commit(deployment.app, deployment.releaseTag or "")
+    logger.warning(
+        "Deployment %s had no pinned commit; pinned %s (tag %s as it is now)",
+        deployment.deploymentId, deployment.commit_sha[:8], deployment.releaseTag,
+    )
 
 
 def _commit_and_dispatch(
@@ -575,9 +878,11 @@ def _commit_and_dispatch(
     deployment_id,
     task_type: TaskType,
     celery_task_name: str,
-    celery_args: list,
+    celery_kwargs: dict,
     dispatch_error_label: str,
     rollback_on_conflict: bool,
+    after_task_id=None,
+    state_token: bool = True,
 ):
     """Insert the PENDING task in-TX, commit, then dispatch to Celery.
 
@@ -589,6 +894,14 @@ def _commit_and_dispatch(
     * ``dispatch_to_celery`` → ``HTTPException(503, dispatch_error_label)``
       on a Celery send failure (the task row is flipped to FAILED inside
       ``dispatch_to_celery`` in a fresh TX).
+
+    ``after_task_id`` parks the message until that task's worker has let
+    go of it (cancel → destroy).
+
+    Every VM task gets a fresh state token for OpenTofu's HTTP backend
+    (``services/tf_state_store``): the row keeps its hash, the job message
+    carries it Fernet-sealed as ``state_token_enc``. Pod tasks have no
+    OpenTofu state (``state_token=False``).
 
     Returns the committed, dispatched ``Task``.
     """
@@ -605,6 +918,8 @@ def _commit_and_dispatch(
             status_code=status.HTTP_409_CONFLICT,
             detail="Deployment already has an active task",
         )
+    if state_token:
+        celery_kwargs = {**celery_kwargs, "state_token_enc": crypto.encrypt_b64(tf_state_store.issue_token(task))}
 
     db.commit()
     db.refresh(task)
@@ -614,7 +929,8 @@ def _commit_and_dispatch(
             db,
             task=task,
             celery_task_name=celery_task_name,
-            celery_args=celery_args,
+            celery_kwargs=celery_kwargs,
+            after_task_id=after_task_id,
         )
     except Exception:
         raise HTTPException(
@@ -635,7 +951,6 @@ def _dispatch_destroy(db: Session, deployment, current_user: User):
         deployment,
         current_user,
         task_type=TaskType.DESTROY,
-        celery_task_name="tasks.destroy_deployment",
         response_status="destroying",
     )
 
@@ -645,9 +960,9 @@ def _dispatch_lifecycle_task(
     deployment,
     current_user: User,
     task_type: TaskType,
-    celery_task_name: str,
     response_status: str,
-    extra_args: list | None = None,
+    extra_kwargs: dict | None = None,
+    after_task_id=None,
 ):
     """Enqueue any post-deploy lifecycle worker task for a deployment.
 
@@ -665,16 +980,15 @@ def _dispatch_lifecycle_task(
                              the task row's ``type`` column and the
                              status the partial-unique index prevents
                              from coexisting.
-        celery_task_name:    name registered on the worker side (e.g.
-                             ``tasks.pause_deployment``).
         response_status:     synthetic deployment status returned to the
                              frontend in the 202 body — frontend uses
                              this to immediately switch the UI into the
                              live-stream view without re-fetching.
-        extra_args:          additional positional args appended to the
-                             Celery payload after the standard seven.
-                             Used by ``tasks.redeploy_resource`` to pass
-                             the targeted resource address.
+        extra_kwargs:        task-specific keyword arguments on top of the
+                             common payload (``_job_kwargs``), e.g. the
+                             ``resource_address`` of a redeploy.
+        after_task_id:       park the task until that task's worker let
+                             go of it (destroy after cancel).
     """
     try:
         user_vars = json.loads(deployment.userInputVar) if deployment.userInputVar else {}
@@ -726,29 +1040,23 @@ def _dispatch_lifecycle_task(
         # the ORM. ``get_team_members`` does the join for us.
         for team in deployment.teams:
             members = crud_deployments.get_team_members(db, team.teamId)
-            teams_dict[team.name] = [{"email": m.email} for m in members]
+            teams_dict[team.name] = [_member_entry(m) for m in members]
 
-    openstack_envelope = _fetch_dispatch_envelope(
-        db, current_user.userId, rollback_on_missing=False
-    )
+    is_pods = deployment.runtime == RUNTIME_K8S
+    # Pods use no OpenStack credential; VM jobs the caller's own for the project.
+    openstack_envelope = {} if is_pods else _fetch_dispatch_envelope(db, current_user, deployment)
+    _pin_legacy_commit(db, deployment)
 
     task = _commit_and_dispatch(
         db,
         deployment_id=deployment.deploymentId,
         task_type=task_type,
-        celery_task_name=celery_task_name,
-        celery_args=[
-            str(deployment.deploymentId),
-            str(deployment.appId),
-            deployment.app.git_link,
-            deployment.releaseTag,
-            user_vars,
-            teams_dict,
-            openstack_envelope,
-            *(extra_args or []),
-        ],
+        celery_task_name=_task_name(deployment.runtime, task_type),
+        celery_kwargs=_job_kwargs(deployment, user_vars, teams_dict, openstack_envelope, **(extra_kwargs or {})),
         dispatch_error_label=f"Could not dispatch {task_type.value} task — please retry",
         rollback_on_conflict=False,
+        after_task_id=after_task_id,
+        state_token=not is_pods,
     )
 
     return JSONResponse(
@@ -809,24 +1117,28 @@ _TF_ADDRESS_RE = re.compile(
 
 
 def _latest_tf_state_for(deployment_id: UUID, db: Session) -> str | None:
-    """Return the JSON blob of the most recent task that captured a
-    Terraform state for this deployment, or None when no apply ever
-    succeeded yet.
+    """The deployment's OpenTofu state as JSON, or None before the first apply.
 
-    Note: we deliberately do NOT filter by ``task.type`` — the worker
-    captures state on deploy / destroy / pause / resume / redeploy
-    alike, and any of those produce a valid snapshot. The "most
-    recent" task wins, mirroring the existing ``get_deployment_outputs``
-    semantics in ``crud/deployments.py``.
+    Read from the state backend's own table (``services/tf_state_store``):
+    it is what OpenTofu last wrote, not a copy some task took along the
+    way. Deployments whose state was not moved there yet
+    (``app.import_pg_tfstate``) fall back to the copy of their most recent
+    task that captured one.
     """
-    task = (
+    state = tf_state_store.read(db, deployment_id)
+    if state is not None:
+        return state
+    candidates = (
         db.query(TaskModel)
         .filter(TaskModel.deploymentId == deployment_id)
-        .filter(TaskModel.tf_state.isnot(None))
+        .filter(or_(TaskModel.tf_state.isnot(None), TaskModel.outputs_enc.isnot(None)))
         .order_by(desc(TaskModel.created_at))
-        .first()
     )
-    return task.tf_state if task else None
+    for task in candidates:
+        state = task_results.tf_state(task)
+        if state:
+            return state
+    return None
 
 
 @router.get(
@@ -856,12 +1168,29 @@ def list_deployment_resources(
     # operate rights; this endpoint is read-only.
     ensure_view_deployment_owner(current_user, deployment, db)
 
+    if deployment.runtime == RUNTIME_K8S:
+        # The namespace is the state; nothing of it is cached here.
+        rows = k8s_status.workload_views(deployment_id, deployment.k8s_namespace or "")
+        return DeploymentResourceListResponse(
+            resources=[],
+            runtime=RUNTIME_K8S,
+            workloads=[PodWorkloadSchema.model_validate(r) for r in rows or []],
+            live=rows is not None,
+        )
+
     state_json = _latest_tf_state_for(deployment_id, db)
+    # Live data is fetched with the caller's own credential for the project,
+    # never the owner's. Without one (an admin or a course teacher reading)
+    # the cached state is shown.
+    live = refresh and crud_openstack_credentials.holds_project(
+        db, current_user.userId, deployment.os_project_id
+    )
     views = build_resource_views(
         db=db,
         user=current_user,
+        project_id=deployment.os_project_id,
         tf_state_json=state_json,
-        refresh=refresh,
+        refresh=live,
     )
     # Convert dataclasses → Pydantic models via dict-roundtrip. The
     # fields line up 1:1 by name, so ``model_validate`` works directly
@@ -870,7 +1199,7 @@ def list_deployment_resources(
         DeploymentResourceSchema.model_validate(_view_asdict(v))
         for v in views
     ]
-    return DeploymentResourceListResponse(resources=payload, live=refresh)
+    return DeploymentResourceListResponse(resources=payload, live=live)
 
 
 @router.get(
@@ -900,6 +1229,7 @@ def get_deployment_resource_detail(
     # Inspect-only view — course-teachers may read the per-resource
     # detail; the per-VM redeploy below is operate-gated.
     ensure_view_deployment_owner(current_user, deployment, db)
+    _refuse_pods(deployment)
 
     if not _TF_ADDRESS_RE.match(address):
         raise HTTPException(
@@ -908,9 +1238,11 @@ def get_deployment_resource_detail(
         )
 
     state_json = _latest_tf_state_for(deployment_id, db)
+    # Always live; 403 without an own credential for the project.
     view = build_resource_detail(
         db=db,
         user=current_user,
+        project_id=deployment.os_project_id,
         tf_state_json=state_json,
         address=address,
     )
@@ -940,12 +1272,13 @@ def redeploy_deployment_resource(
     down all the team VMs, which is not what a one-VM "fix it" action
     should do.
 
-    Concurrency: same per-user advisory lock as create/destroy/pause
-    so a parallel redeploy can't race a destroy. The lock is held
-    only for the row insert; Celery dispatch happens after commit.
+    Lifecycle (.github#7 L): only from ``success`` or ``redeploy_failed``,
+    under the same per-deployment advisory lock as pause, resume, destroy
+    and cancel, so a concurrent pause and redeploy cannot both pass the
+    status check. A failed redeploy surfaces as ``redeploy_failed`` (retry,
+    pause, destroy; never delete). The lock is held only for the row
+    insert; the queue dispatch happens after commit.
     """
-    crud_locks.acquire_user_xact_lock(db, current_user.userId)
-
     deployment = crud_deployments.get_deployment(db, deployment_id)
     if not deployment:
         raise HTTPException(
@@ -956,6 +1289,11 @@ def redeploy_deployment_resource(
     # (owner-or-admin). Course-teachers may inspect the resource via
     # the GET endpoints above but not bounce it.
     ensure_operate_deployment(current_user, deployment, db)
+    _refuse_pods(deployment)
+    crud_locks.acquire_deployment_xact_lock(db, deployment_id)
+    lifecycle_service.ensure_action_allowed(
+        db, deployment, lifecycle_service.DeploymentAction.REDEPLOY,
+    )
 
     if not _TF_ADDRESS_RE.match(address):
         raise HTTPException(
@@ -990,10 +1328,85 @@ def redeploy_deployment_resource(
         deployment=deployment,
         current_user=current_user,
         task_type=TaskType.REDEPLOY,
-        celery_task_name="tasks.redeploy_resource",
         response_status="redeploying",
-        extra_args=[address],
+        extra_kwargs={"resource_address": address},
     )
+
+
+def _refuse_pods(deployment) -> None:
+    """422 for the OpenStack resource endpoints on a pod deployment (they have workloads)."""
+    if deployment.runtime == RUNTIME_K8S:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "pod_deployment", "message": "Pod deployments have workloads, see /workloads"},
+        )
+
+
+# A workload name as the pod renderer makes them (DNS-1123 label).
+_WORKLOAD_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def _dispatch_workload_action(db: Session, deployment_id: UUID, workload: str, current_user: User, *, reset: bool):
+    """Restart or reset one workload of a pod deployment (202 ``redeploying``).
+
+    Operate right; only from ``success`` or ``redeploy_failed`` (lifecycle,
+    under the deployment lock). 422 for a VM deployment or a malformed name,
+    404 ``workload_not_found`` when the cluster knows no such workload of
+    this deployment (the worker checks again when the cluster cannot be
+    asked here).
+    """
+    deployment = crud_deployments.get_deployment_with_details(db, deployment_id)
+    if not deployment:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deployment not found")
+    ensure_operate_deployment(current_user, deployment, db)
+    if deployment.runtime != RUNTIME_K8S:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "vm_deployment", "message": "VM deployments redeploy per resource, see /resources"},
+        )
+    if not _WORKLOAD_RE.match(workload):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "invalid_workload"},
+        )
+    crud_locks.acquire_deployment_xact_lock(db, deployment_id)
+    lifecycle_service.ensure_action_allowed(db, deployment, lifecycle_service.DeploymentAction.REDEPLOY)
+    known = k8s_status.workload_views(deployment_id, deployment.k8s_namespace or "")
+    if known is not None and workload not in {r["workload"] for r in known}:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"reason": "workload_not_found", "workload": workload},
+        )
+    return _dispatch_lifecycle_task(
+        db=db,
+        deployment=deployment,
+        current_user=current_user,
+        task_type=TaskType.REDEPLOY,
+        response_status="redeploying",
+        extra_kwargs={"resource_address": f"reset:{workload}" if reset else workload},
+    )
+
+
+@router.post("/{deployment_id}/workloads/{workload}/restart", status_code=status.HTTP_202_ACCEPTED)
+def restart_workload(
+    deployment_id: UUID,
+    workload: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_keycloak),
+):
+    """Restart one team's or person's workload (a new pod); its data stays."""
+    return _dispatch_workload_action(db, deployment_id, workload, current_user, reset=False)
+
+
+@router.post("/{deployment_id}/workloads/{workload}/reset", status_code=status.HTTP_202_ACCEPTED)
+def reset_workload(
+    deployment_id: UUID,
+    workload: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_keycloak),
+):
+    """Reset one workload: its volume is deleted, it starts from scratch."""
+    return _dispatch_workload_action(db, deployment_id, workload, current_user, reset=True)
 
 
 def _view_asdict(view) -> dict:
@@ -1024,20 +1437,22 @@ def _view_asdict(view) -> dict:
 # ----------------------------------------------------------------
 #
 # The only action permitted while a worker task is still in flight.
-# Cancel is not "forget about it" - it is stop-and-clean, in this order:
+# Cancel is not "forget about it" - it is stop-and-clean, in this order,
+# all in one transaction (.github#5, no Celery revoke any more):
 #
-#   1. Revoke the Celery task with ``terminate=True``. The worker's
-#      subprocess runner kills its entire process group on the way out,
-#      so packer/terraform cannot survive as an orphan still talking to
-#      the tenant.
-#   2. Mark the in-flight task row CANCELLED in this same transaction.
-#      The revoke event that would otherwise do it arrives
-#      asynchronously, and until it lands the partial unique index would
-#      reject the destroy task we are about to insert.
+#   1. Mark the in-flight task CANCELLED with ``cancel_requested_at`` and a
+#      terminal ``task-revoked`` event, so open streams end and the
+#      partial unique index admits the destroy task inserted below.
+#   2. A queue message no worker has claimed yet is deleted: the job never
+#      starts. Otherwise ``NOTIFY task_cancel`` reaches the worker running
+#      it, which kills the tool's process group (packer/terraform cannot
+#      survive as an orphan still talking to the tenant) and lets go of it.
 #   3. Dispatch a destroy with ``sweep_build_artifacts=True``. Terraform
 #      destroy alone is not enough: the Packer build instance belongs to
-#      Packer, not to Terraform, so it appears in no state file and
-#      would keep running and keep burning quota.
+#      Packer, not to Terraform, so it appears in no state file and would
+#      keep running and keep burning quota. While a worker still holds the
+#      cancelled job the destroy is parked behind it, so the two never run
+#      on the same state at once (security review A-5, race 2).
 @router.post("/{deployment_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
 def cancel_deployment(
     deployment_id: UUID,
@@ -1065,25 +1480,35 @@ def cancel_deployment(
         db, deployment, lifecycle_service.DeploymentAction.CANCEL,
     )
 
+    blocking_task_id = None
     in_flight = crud_deployments.get_latest_task(db, deployment_id)
-    if in_flight is not None and in_flight.celeryTaskId:
-        try:
-            celery_app.control.revoke(
-                in_flight.celeryTaskId, terminate=True, signal="SIGTERM",
-            )
-        except Exception as exc:  # noqa: BLE001 - a broker hiccup must not strand the user
-            # Worst case the task keeps running and the sweep below
-            # races it; surfacing a 5xx here would leave the user with
-            # no way to clean up at all.
-            logger.warning(
-                "Could not revoke celery task %s for deployment %s: %s",
-                in_flight.celeryTaskId,
-                deployment_id,
-                exc,
-            )
     if in_flight is not None and in_flight.status in (TaskStatus.PENDING, TaskStatus.RUNNING):
         in_flight.status = TaskStatus.CANCELLED
-        in_flight.finished_at = datetime.now(UTC)
+        in_flight.cancel_requested_at = datetime.now(UTC)
+        in_flight.finished_at = utcnow()
+        unclaimed = db.execute(
+            text("DELETE FROM celery_queue WHERE task_id = :id AND claimed_by IS NULL"),
+            {"id": in_flight.taskId},
+        ).rowcount
+        if not unclaimed:
+            # A worker has (or had) the job: the destroy waits for it.
+            blocking_task_id = in_flight.taskId
+        task_events.add_event(
+            db,
+            in_flight.taskId,
+            EVENT_REVOKED,
+            terminal_payload(
+                EVENT_REVOKED,
+                deployment_id=str(deployment_id),
+                task_id=str(in_flight.taskId),
+                task_type=in_flight.type.value if in_flight.type else None,
+            ),
+        )
+        # Delivered with the commit inside the dispatch below.
+        db.execute(text("SELECT pg_notify(:channel, :task_id)"), {
+            "channel": NOTIFY_TASK_CANCEL,
+            "task_id": str(in_flight.taskId),
+        })
         db.flush()
 
     return _dispatch_lifecycle_task(
@@ -1091,10 +1516,11 @@ def cancel_deployment(
         deployment,
         current_user,
         task_type=TaskType.DESTROY,
-        celery_task_name="tasks.destroy_deployment",
         response_status="destroying",
-        # Positional tail of the worker signature: sweep_build_artifacts.
-        extra_args=[True],
+        # VM: reap the Packer build the cancel interrupted. Pods: the destroy
+        # removes the namespace with everything the deploy created.
+        extra_kwargs={"sweep_build_artifacts": True} if deployment.runtime != RUNTIME_K8S else None,
+        after_task_id=blocking_task_id,
     )
 
 
@@ -1136,7 +1562,6 @@ def pause_deployment(
         deployment,
         current_user,
         task_type=TaskType.PAUSE,
-        celery_task_name="tasks.pause_deployment",
         response_status="pausing",
     )
 
@@ -1178,7 +1603,6 @@ def resume_deployment(
         deployment,
         current_user,
         task_type=TaskType.RESUME,
-        celery_task_name="tasks.resume_deployment",
         response_status="resuming",
     )
 
@@ -1244,8 +1668,11 @@ def download_deployment_file(
             detail=f"No uploaded file under variable '{var_name}'",
         )
     # ``var_value`` is ``{slot_key: {name, content_b64, size, content_type}}``;
-    # the slot-level entry IS the file metadata, no extra wrapper.
+    # a team- or user-scoped variable wraps each entry as ``{"uploaded": …}``
+    # (its HCL type is a map of maps).
     entry = var_value.get(slot_key)
+    if isinstance(entry, dict) and isinstance(entry.get("uploaded"), dict):
+        entry = entry["uploaded"]
     if not isinstance(entry, dict) or "content_b64" not in entry:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1262,20 +1689,17 @@ def download_deployment_file(
             detail="Stored file payload is not valid base64",
         )
 
+    # Never the uploader's content type, and a name that cannot break the
+    # header: the bytes are served for saving, not for the browser to render
+    # (.github#7 R).
     filename = str(entry.get("name") or f"{var_name}-{slot_key}")
-    content_type = str(entry.get("content_type") or "application/octet-stream")
     return Response(
         content=payload,
-        media_type=content_type,
+        media_type="application/octet-stream",
         headers={
-            # ``filename*`` is the RFC 5987 form for non-ASCII names;
-            # we always emit it alongside the legacy ``filename`` so
-            # clients without UTF-8 support still see something.
-            "Content-Disposition": (
-                f'attachment; filename="{filename}"; '
-                f"filename*=UTF-8''{filename}"
-            ),
+            "Content-Disposition": content_disposition(filename),
             "Content-Length": str(len(payload)),
+            "X-Content-Type-Options": "nosniff",
         },
     )
 
@@ -1291,21 +1715,18 @@ def get_my_access(
 ):
     """Return the calling member's OWN access credentials for a deployment.
 
-    The full terraform ``outputs`` are owner-view-only (they carry every
-    teammate's credentials in one object). This endpoint is the member
-    counterpart: a team member — typically a student — retrieves only
-    THEIR OWN account, extracted server-side from the latest successful
-    deploy. Teammates' credentials are never included in the response.
+    The only way to the credentials (no mails, .github#7 I). The full
+    outputs carry every teammate's credentials and are owner-view only;
+    a team member — typically a student — gets exactly their own account
+    entry, matched exactly by ``services.access`` (.github#7 H), plus their
+    team's VM block. Never a teammate's.
 
-    Authorisation reuses :func:`ensure_resend_access` with the target set
-    to the caller themself, which collapses to the member-view gate
-    (owner, staff, team-member, or direct mapping). A caller with no
-    access to the deployment gets 403; the resend endpoint uses the same
-    gate for the self-resend button, so the two stay consistent.
+    Member-view gate: owner, team member or direct mapping; anyone else
+    gets 403.
 
     Returns 200 with empty maps when there's no successful deploy yet or
-    the app issued no per-user credential for this user — the UI renders
-    a "no credentials yet" state rather than treating it as an error.
+    no entry belongs to the caller exactly — the UI renders a "no
+    credentials yet" state rather than treating it as an error.
     """
     deployment = crud_deployments.get_deployment(db, deployment_id)
     if not deployment:
@@ -1313,150 +1734,15 @@ def get_my_access(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Deployment not found",
         )
-    # Self-target → member-view gate. Non-members get 403 here.
-    ensure_resend_access(current_user, deployment, current_user.userId, db)
+    ensure_view_deployment_member(current_user, deployment, db)
 
-    access = deployment_notifier.get_user_access(
-        db, deployment_id, current_user.userId
-    )
-    if access is None:
-        # No successful deploy yet, user not in any team, or no per-user
-        # credential in the outputs — surface an empty (but valid) payload.
+    result = access.get_user_access(db, deployment_id, current_user.userId)
+    if result is None:
         return MyAccessResponse()
     return MyAccessResponse(
-        user_accounts=access.get("user_accounts", {}),
-        team_vms=access.get("team_vms", {}),
+        user_accounts=result.get("user_accounts", {}),
+        team_vms=result.get("team_vms", {}),
     )
-
-
-# ----------------------------------------------------------------
-# RESEND ACCESS MAIL FOR ONE TEAM MEMBER
-# ----------------------------------------------------------------
-@router.post(
-    "/{deployment_id}/teams/{team_id}/users/{user_id}/resend-access",
-    status_code=status.HTTP_202_ACCEPTED,
-)
-def resend_access_credentials(
-    deployment_id: UUID,
-    team_id: UUID,
-    user_id: UUID,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user_keycloak),
-):
-    """Re-send the per-user access mail for one team member.
-
-    Reuses the original notify pipeline — same template, same
-    credential extraction from the latest successful DEPLOY task's
-    ``terraform_outputs``. Useful when the user lost their first mail
-    or the deploy ran before the user's email got fixed.
-
-    Access control: caller must have access to the deployment (owner
-    or teacher/admin). The endpoint is intentionally idempotent —
-    each call sends one mail to the targeted user. There's no rate
-    limit at the API level; SMTP and Gmail's per-account quota are
-    the natural backstops.
-
-    Mapping ResendError to HTTP:
-      * ``deployment_not_found`` → 404
-      * ``team_not_in_deployment`` / ``user_not_in_team`` → 404
-      * ``no_successful_deploy`` → 409 (nothing to resend yet)
-      * ``no_credentials_for_user`` → 409 (template didn't issue
-        per-user creds, or matcher missed despite the fuzzy logic)
-    """
-    deployment = crud_deployments.get_deployment(db, deployment_id)
-    if not deployment:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Deployment not found",
-        )
-    ensure_deployment_access(deployment, current_user, db)
-
-    # Members may only re-send their own access mail. Owner-view
-    # callers (creator, teacher, admin) can resend for anyone in
-    # any team. Without this check a student in team A could trigger
-    # a mail to anyone else's address, which is both privacy-leaky
-    # and a tiny SMTP-amplification vector.
-    #
-    # This 403 is decided BEFORE the SMTP-disabled 503 below: a
-    # not-authorised caller must not learn the SMTP-state of the
-    # platform — that would be a (small) information disclosure.
-    if not can_view_deployment_owner(current_user, deployment, db) and str(user_id) != str(current_user.userId):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Members may only resend their own access mail",
-        )
-
-    # SMTP kill-switch check: refuse cleanly with 503 BEFORE running the
-    # notifier so the response carries the correct semantic ("we chose
-    # not to send" — operator configuration) rather than the existing
-    # 502 ("we tried and SMTP rejected" — infrastructure failure).
-    # Frontend distinguishes the two reasons in the toast text so the
-    # user understands whether to ask an admin to enable mail or to
-    # simply retry. The 503 + Retry-After header signals "service
-    # temporarily unavailable; come back later" semantics.
-    #
-    # Order vs. 409 in-flight: a 503 here is non-recoverable until an
-    # operator flips the env-flag, whereas 409 is a transient state
-    # the caller can simply wait out. Returning the 503 first matches
-    # the "service-level concern beats per-request concern" pattern
-    # used by every other 5xx vs 4xx ordering in this router.
-    if not email_service.is_smtp_enabled():
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"reason": "smtp_disabled"},
-            headers={"Retry-After": "3600"},
-        )
-
-    # Refuse while another lifecycle action is in flight. Resending
-    # the access mail relies on the latest successful DEPLOY task's
-    # ``terraform_outputs``; during pending/running/destroying/
-    # pausing/resuming the deployment is in transition and the
-    # credentials might no longer be reachable on the VM (paused →
-    # SHUTOFF, destroying → tearing down). Returning 409 here keeps
-    # the user's mental model consistent with the rest of the
-    # lifecycle gates.
-    #
-    # Per-deployment advisory lock is acquired BEFORE the status
-    # read so a concurrent /pause / /resume / DELETE can't slip a
-    # transition past us between the check and the mail send. The
-    # lock is the same one those endpoints take, so the four
-    # mutators serialise against each other on the same deployment.
-    crud_locks.acquire_deployment_xact_lock(db, deployment_id)
-    current_status = crud_deployments.get_deployment_status(db, deployment_id)
-    if current_status in lifecycle_service.IN_FLIGHT_STATUSES:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"Cannot resend access mail while deployment is '{current_status}'. "
-                "Wait for the active task to finish."
-            ),
-        )
-
-    try:
-        sent = deployment_notifier.resend_user_access(
-            db, deployment_id, team_id, user_id,
-        )
-    except deployment_notifier.ResendError as e:
-        reason = str(e)
-        # 404 for "this user/team isn't in this deployment", 409 for
-        # "the deployment hasn't reached the state where it could
-        # have emitted credentials yet".
-        if reason in ("deployment_not_found", "team_not_in_deployment", "user_not_in_team"):
-            http_status = status.HTTP_404_NOT_FOUND
-        else:
-            http_status = status.HTTP_409_CONFLICT
-        raise HTTPException(status_code=http_status, detail={"reason": reason})
-
-    if not sent:
-        # Template render + payload were fine, only SMTP rejected.
-        # 502 makes the "upstream service failed" semantics clear so
-        # the frontend can surface a retry rather than a 4xx that
-        # implies the request itself was wrong.
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail={"reason": "smtp_send_failed"},
-        )
-    return {"status": "sent"}
 
 
 # ----------------------------------------------------------------
@@ -1475,14 +1761,18 @@ def resend_access_credentials(
 # * ``event: log`` — every ``task-log`` from the worker. The payload
 #   is the LogEntry dict (timestamp, level, category, message, plus
 #   tool/streaming flags for streaming subprocess lines).
-# * ``event: overflow`` — emitted by the in-process pubsub when a
-#   slow consumer overran its bounded queue.
+# * ``event: succeeded`` / ``failed`` / ``revoked`` — the task ended.
 # * comment lines starting with ``:`` are SSE keepalive pings.
 #
-# The stream stays open until the deployment reaches a terminal state
-# (success/failed/cancelled), the client disconnects, or the backend
-# shuts down. There's no client-driven close — EventSource handles
-# reconnect automatically.
+# The events come from ``task_events`` (.github#5): the worker appends
+# them, any API replica can serve any stream. Each frame carries the row
+# id as its SSE ``id``; a client that reconnects with ``Last-Event-ID``
+# resumes right after it. Without one it gets the tail of the transcript
+# first. New rows are announced by ``NOTIFY task_events``
+# (``task_events.hub``), with a slow poll as fallback.
+#
+# The stream stays open until the task reaches a terminal state, the
+# client disconnects, or the backend shuts down.
 @router.get("/{deployment_id}/stream")
 async def stream_deployment_events(
     deployment_id: UUID,
@@ -1492,10 +1782,9 @@ async def stream_deployment_events(
 ):
     """Live progress + log stream for one deployment as Server-Sent Events.
 
-    The connection is authenticated with the same Keycloak dependency
-    used elsewhere; the standard auth middleware also vets the token
-    before this handler runs. After auth we attach to the in-process
-    pubsub for this deployment and forward every event to the client.
+    Streams the events of the deployment's latest task and ends with its
+    terminal event. Starts with a ``snapshot`` event; for a task that is
+    already finished (or no task at all) the stream ends right after it.
     """
     deployment = crud_deployments.get_deployment(db, deployment_id)
     if not deployment:
@@ -1507,10 +1796,6 @@ async def stream_deployment_events(
     # and plain members still see metadata only.
     ensure_view_deployment_owner(current_user, deployment, db)
 
-    # Snapshot the latest task once before subscribing so the client
-    # gets a meaningful initial state. Reading happens before the
-    # generator yields its first chunk to avoid the "subscribed but
-    # nothing buffered yet" gap.
     latest_task = crud_deployments.get_latest_task(db, deployment_id)
     snapshot_payload = {
         "task_id": str(latest_task.taskId) if latest_task else None,
@@ -1520,59 +1805,58 @@ async def stream_deployment_events(
         "type": latest_task.type.value if latest_task else None,
     }
     initial_status = latest_task.status if latest_task else None
-
-    deployment_id_str = str(deployment_id)
+    task_id = latest_task.taskId if latest_task else None
+    # A successful destroy soft-deletes the deployment; the client reloads
+    # when the stream ends and must find it gone. Other follow-up work
+    # does not need to hold up the terminal event.
+    finalize_first = latest_task is not None and latest_task.type == TaskType.DESTROY
+    try:
+        last_event_id = int(request.headers.get("last-event-id") or 0) or None
+    except ValueError:
+        last_event_id = None
 
     async def event_stream() -> AsyncIterator[bytes]:
-        queue = pubsub.subscribe(deployment_id_str)
-        try:
-            yield _sse_frame("snapshot", snapshot_payload)
+        yield _sse_frame("snapshot", snapshot_payload)
+        # Nothing will happen for a finished task (or a deployment without
+        # one): the client renders the static logs instead.
+        if task_id is None or initial_status in _FINISHED_STATUSES:
+            return
 
-            # Backfill what's been happening lately. The pubsub keeps a
-            # bounded ring buffer of recent events per deployment so a
-            # client connecting mid-stream sees the last few minutes of
-            # progress / log output instead of an empty tail until the
-            # next worker line lands. Replays the buffer in order so
-            # ``streamCurrentPhaseIndex``/``streamProgress`` end up at
-            # their latest values before the live loop starts.
-            for past_event in pubsub.recent(deployment_id_str):
-                event_name = _event_name_for(past_event.get("type"))
-                yield _sse_frame(event_name, past_event)
-
-            # If the task is already in a terminal state we still yield
-            # the snapshot but close the stream right away — no live
-            # events will ever arrive for this deployment.
-            if initial_status in (TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED):
-                return
-
-            # Heartbeat / event-pump loop. Wait up to 15s for an event;
-            # if nothing arrives, send a ``: keepalive`` comment so
-            # proxies and the EventSource client don't time out.
+        loop = asyncio.get_running_loop()
+        with task_events.hub.subscribe(task_id) as wake:
+            rows, finished = await asyncio.to_thread(_stream_rows, task_id, last_event_id)
+            keepalive_at = loop.time() + _SSE_KEEPALIVE_SECONDS
+            after_id = last_event_id or 0
             while True:
+                for event_id, event_type, payload in rows:
+                    after_id = max(after_id, event_id)
+                    if event_type in TERMINAL_EVENTS:
+                        if finalize_first:
+                            await asyncio.to_thread(_finalize, task_id)
+                        yield _sse_frame(_event_name_for(event_type), payload, event_id=event_id)
+                        return
+                    yield _sse_frame(_event_name_for(event_type), payload, event_id=event_id)
+                if finished and not rows:
+                    # Finished without a terminal event on record (e.g. the
+                    # dispatch failed): close with one built from the row.
+                    terminal = await asyncio.to_thread(_terminal_from_row, task_id)
+                    if terminal is not None:
+                        yield _sse_frame(_event_name_for(terminal[0]), terminal[1])
+                    return
+                if not rows:
+                    poll = _SSE_POLL_SECONDS if task_events.hub.listening else _SSE_FALLBACK_POLL_SECONDS
+                    timeout = min(poll, max(keepalive_at - loop.time(), 0.0))
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(wake.wait(), timeout=timeout)
+                    wake.clear()
                 if await request.is_disconnected():
                     return
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=15.0)
-                except TimeoutError:
+                now = loop.time()
+                if now >= keepalive_at:
+                    # Proxies and EventSource close idle connections.
                     yield b": keepalive\n\n"
-                    continue
-
-                event_name = _event_name_for(event.get("type"))
-                yield _sse_frame(event_name, event)
-
-                # Stop streaming once the parent task reaches a
-                # terminal state. The lifecycle events (succeeded /
-                # failed / revoked) flow through the same pubsub key,
-                # so we look for them right here. Without this break
-                # the connection would dangle until the client closes
-                # it.
-                if event.get("type") in ("task-succeeded", "task-failed", "task-revoked"):
-                    return
-        except asyncio.CancelledError:
-            # FastAPI cancels the generator on client disconnect.
-            raise
-        finally:
-            pubsub.unsubscribe(deployment_id_str, queue)
+                    keepalive_at = now + _SSE_KEEPALIVE_SECONDS
+                rows, finished = await asyncio.to_thread(_stream_rows, task_id, after_id)
 
     return StreamingResponse(
         event_stream(),
@@ -1585,6 +1869,60 @@ async def stream_deployment_events(
     )
 
 
+_FINISHED_STATUSES = (TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED)
+_SSE_KEEPALIVE_SECONDS = 15.0
+# With the event hub listening, new rows are announced; the poll only
+# covers a missed notification. Without it (hub reconnecting) poll faster.
+_SSE_POLL_SECONDS = 5.0
+_SSE_FALLBACK_POLL_SECONDS = 1.0
+
+
+def _stream_rows(task_id: UUID, after_id: int | None) -> tuple[list[tuple[int, str, dict]], bool]:
+    """Events to send next and whether the task has finished.
+
+    ``after_id`` None means a fresh connection: the tail of the
+    transcript. Runs in a worker thread with its own session, because the
+    stream outlives the request's session.
+    """
+    with SessionLocal() as session:
+        if after_id is None:
+            events = task_events.backfill(session, task_id)
+        else:
+            events = task_events.events_after(session, task_id, after_id)
+        status_value = session.execute(
+            select(TaskModel.status).where(TaskModel.taskId == task_id)
+        ).scalar()
+    finished = status_value in _FINISHED_STATUSES
+    return [(event.id, event.type, event.payload) for event in events], finished
+
+
+def _finalize(task_id: UUID) -> None:
+    """Run the task's follow-up work now (no-op if another process already did)."""
+    with SessionLocal() as session:
+        task_finalizer.finalize_task(session, task_id)
+
+
+def _terminal_from_row(task_id: UUID) -> tuple[str, dict] | None:
+    """A terminal event built from the task row, for tasks that ended without one."""
+    with SessionLocal() as session:
+        task = session.get(TaskModel, task_id)
+        if task is None or task.status not in _FINISHED_STATUSES:
+            return None
+        event_type = _TERMINAL_EVENT_BY_STATUS[task.status]
+        return event_type, terminal_payload(
+            event_type,
+            deployment_id=str(task.deploymentId),
+            task_id=str(task.taskId),
+            task_type=task.type.value if task.type else None,
+        )
+
+
+_TERMINAL_EVENT_BY_STATUS = {
+    TaskStatus.SUCCESS: EVENT_SUCCEEDED,
+    TaskStatus.FAILED: EVENT_FAILED,
+    TaskStatus.CANCELLED: EVENT_REVOKED,
+}
+
 _EVENT_NAME_MAP: dict[str, str] = {
     "task-progress": "progress",
     "task-log": "log",
@@ -1596,25 +1934,26 @@ _EVENT_NAME_MAP: dict[str, str] = {
 }
 
 
-def _event_name_for(celery_event_type: str | None) -> str:
-    """Map Celery event type names onto short SSE event names.
+def _event_name_for(event_type: str | None) -> str:
+    """Map stored event types onto short SSE event names.
 
     Frontend code attaches listeners by these short names rather than
-    the verbose celery-internal ones; ``_EVENT_NAME_MAP`` is the
-    single source of truth on both sides of the wire.
+    the verbose event types; ``_EVENT_NAME_MAP`` is the single source
+    of truth on both sides of the wire.
     """
-    return _EVENT_NAME_MAP.get(celery_event_type or "", "message")
+    return _EVENT_NAME_MAP.get(event_type or "", "message")
 
 
-def _sse_frame(event_name: str, payload: dict) -> bytes:
+def _sse_frame(event_name: str, payload: dict, event_id: int | None = None) -> bytes:
     """Serialise one SSE frame.
 
     SSE format:
 
     ```
-    event: <name>\\n
-    data: <json>\\n
-    \\n
+    id: <event id>\n        (stored events only)
+    event: <name>\n
+    data: <json>\n
+    \n
     ```
 
     Embedded newlines in the JSON would split the frame into multiple
@@ -1622,4 +1961,5 @@ def _sse_frame(event_name: str, payload: dict) -> bytes:
     which keep everything on one line.
     """
     body = json.dumps(payload, default=str)
-    return f"event: {event_name}\ndata: {body}\n\n".encode()
+    id_line = f"id: {event_id}\n" if event_id is not None else ""
+    return f"{id_line}event: {event_name}\ndata: {body}\n\n".encode()

@@ -14,7 +14,7 @@ from unittest.mock import patch
 import pytest
 
 from app.crud import app_version_approvals as crud_approvals
-from tests.conftest import create_app_in_db
+from tests.conftest import FakeGitRemote, create_app_in_db
 
 # ================================================================
 # APP LISTING VISIBILITY
@@ -43,7 +43,7 @@ def test_student_sees_public_app_after_approval(student_client, mock_admin, mock
     app_obj = create_app_in_db(db, mock_user, name="Public Approved App", is_private=False)
 
     # Directly create approval via CRUD (avoids multi-client override conflicts)
-    crud_approvals.submit_version(db, app_obj.appId, "v1.0")
+    crud_approvals.submit_version(db, app_obj.appId, "v1.0", FakeGitRemote.sha_for("v1.0"))
     crud_approvals.approve(db, app_obj.appId, "v1.0", mock_admin.userId)
 
     resp = student_client.get("/apps/")
@@ -77,7 +77,7 @@ def test_submit_version_duplicate_pending_returns_409(client, mock_user, db):
 @pytest.mark.integration
 def test_resubmit_after_rejection_succeeds(client, mock_admin, mock_user, db):
     app_obj = create_app_in_db(db, mock_user)
-    crud_approvals.submit_version(db, app_obj.appId, "v1.0")
+    crud_approvals.submit_version(db, app_obj.appId, "v1.0", FakeGitRemote.sha_for("v1.0"))
     crud_approvals.reject(db, app_obj.appId, "v1.0", mock_admin.userId, "bad terraform")
 
     resp = client.post(f"/apps/{app_obj.appId}/versions/v1.0/submit", json={})

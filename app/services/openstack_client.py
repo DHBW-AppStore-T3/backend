@@ -2,14 +2,17 @@
 
 Three responsibilities:
 
-1. Build auth kwargs from the encrypted user credentials (single
-   source of truth).
-2. Open one connection per request, exposed as a context manager so
-   endpoints can close it cleanly.
-3. A process-local TTL cache for list responses: the wizard fires
-   several GETs in quick succession, and a 60s cache avoids a Keystone
-   token refresh per click. A frontend refresh button triggers
-   ``invalidate_user``.
+1. Open one connection per request with *the caller's own* credential —
+   a chosen one (wizard, quota), or the one for a deployment's project
+   (live view, lifecycle): another person's credential is never used, so an
+   admin or a project peer acts with their own (security review L-6).
+   Exposed as context managers so endpoints can close it cleanly.
+2. Refuse Keystone URLs outside the allowlist before connecting
+   (``openstack_validator.auth_url_allowed``, .github#7 C), also for
+   credentials stored before the allowlist existed.
+3. A process-local TTL cache for list responses: the wizard fires several
+   GETs in quick succession, and a 60s cache avoids a Keystone token
+   refresh per click. A frontend refresh button triggers ``invalidate``.
 """
 
 from __future__ import annotations
@@ -27,90 +30,121 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.crud import openstack_credentials as crud_creds
-from app.models import User
+from app.models import User, UserOpenStackCredential
+from app.services.openstack_validator import auth_url_allowed, connect_kwargs
 
 logger = logging.getLogger(__name__)
 
-
-# ----------------------------------------------------------------
-# Connection-Bau
-# ----------------------------------------------------------------
-def _build_connect_kwargs(creds: dict) -> dict:
-    """Build the kwargs dict for ``openstack.connect`` from decrypted
-    user credentials. Supports password and application-credential
-    (v3applicationcredential) auth.
-    """
-    base = {
-        "auth_url": creds["auth_url"],
-        "region_name": creds.get("region_name"),
-        "interface": creds.get("interface") or "public",
-        "identity_api_version": creds.get("identity_api_version") or "3",
-    }
-    if creds["auth_type"] == "v3applicationcredential":
-        base.update(
-            {
-                "auth_type": "v3applicationcredential",
-                "application_credential_id": creds["identifier"],
-                "application_credential_secret": creds["secret"],
-            }
-        )
-    else:
-        base.update(
-            {
-                "auth_type": "password",
-                "username": creds["identifier"],
-                "password": creds["secret"],
-                "project_id": creds.get("project_id"),
-                "project_name": creds.get("project_name"),
-                "user_domain_name": creds.get("user_domain_name"),
-                "project_domain_name": creds.get("project_domain_name")
-                or creds.get("user_domain_name"),
-            }
-        )
-    return base
+API_TIMEOUT_SECONDS = 30
 
 
 @contextmanager
-def user_connection(db: Session, user: User) -> Iterator[Any]:
-    """Yield an ``openstack.Connection`` for the user.
+def _connection(creds: dict, owner: str) -> Iterator[Any]:
+    """Open a connection and close it afterwards.
 
-    - 412 if no credentials are stored (frontend shows a CTA banner)
-    - 502 for a transient OpenStack error on connect (500s are reserved
-      for backend bugs)
+    422 ``auth_url_not_allowed`` for a Keystone URL outside the allowlist.
+    Any non-HTTPException raised while connecting *or* inside the ``with``
+    body becomes 502 ``openstack_unavailable`` (500s are reserved for bugs;
+    the SDK's message is logged, not returned).
     """
-    try:
-        creds = crud_creds.get_decrypted_for_backend(db, user.userId)
-    except crud_creds.NoCredentialError:
+    if not auth_url_allowed(creds.get("auth_url")):
         raise HTTPException(
-            status_code=status.HTTP_412_PRECONDITION_FAILED,
-            detail={"reason": "openstack_credentials_missing"},
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "auth_url_not_allowed"},
         )
-
-    conn = None
+    conn: Any = None
     try:
-        conn = openstack.connect(**_build_connect_kwargs(creds))
+        conn = openstack.connect(api_timeout=API_TIMEOUT_SECONDS, **connect_kwargs(creds))
         yield conn
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001 — SDK raises many types
-        logger.warning(
-            "OpenStack connect failed for user %s: %s", user.userId, exc
-        )
+        logger.warning("OpenStack call failed for %s: %s", owner, exc)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail={"reason": "openstack_unavailable", "message": str(exc)},
-        )
+            detail={"reason": "openstack_unavailable"},
+        ) from None
     finally:
-        # Close politely; the SDK tolerates leaving it to GC. Ignore errors.
         if conn is not None:
             with suppress(Exception):
                 conn.close()
 
 
+def owned_credential(db: Session, user: User, credential_id: UUID) -> UserOpenStackCredential:
+    """The caller's credential ``credential_id``; 404 if missing or someone else's."""
+    row = crud_creds.get_owned(db, user.userId, credential_id)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"reason": "openstack_credential_not_found"},
+        )
+    return row
+
+
+def deploy_credential(db: Session, user: User, credential_id: UUID | None) -> UserOpenStackCredential:
+    """The credential a new VM deployment is made with: the caller's, verified.
+
+    412 ``openstack_credentials_missing`` without ``credential_id``, 404 for
+    a credential that is not the caller's, 409
+    ``openstack_credentials_unverified`` for one whose project Keystone has
+    not confirmed yet (re-check it first): the deployment's project decides
+    who its peers are.
+    """
+    if credential_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_412_PRECONDITION_FAILED,
+            detail={"reason": "openstack_credentials_missing"},
+        )
+    row = owned_credential(db, user, credential_id)
+    if not row.project_verified or not row.project_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"reason": "openstack_credentials_unverified"},
+        )
+    return row
+
+
+def project_credential(db: Session, user: User, project_id: str | None) -> UserOpenStackCredential:
+    """The caller's own verified credential for ``project_id``.
+
+    409 ``deployment_project_unknown`` when ``project_id`` is None (a VM
+    deployment from before projects were verified, until its owner
+    re-checks their old credential); 403
+    ``openstack_credentials_missing_for_project`` if the caller has no
+    credential for it: a peer's or the owner's credential is never used.
+    """
+    if not project_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"reason": "deployment_project_unknown"},
+        )
+    row = crud_creds.get_for_project(db, user.userId, project_id)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"reason": "openstack_credentials_missing_for_project", "project_id": project_id},
+        )
+    return row
+
+
+@contextmanager
+def credential_connection(row: UserOpenStackCredential) -> Iterator[Any]:
+    """A connection with the given credential; the caller checked it is theirs."""
+    with _connection(crud_creds.decrypted(row), f"credential {row.credentialId}") as conn:
+        yield conn
+
+
+@contextmanager
+def project_connection(db: Session, user: User, project_id: str | None) -> Iterator[Any]:
+    """A connection with the caller's own credential for ``project_id`` (403 without one)."""
+    with credential_connection(project_credential(db, user, project_id)) as conn:
+        yield conn
+
+
 # ----------------------------------------------------------------
-# TTL-Cache für Resource-Listen
+# TTL cache for resource lists
 # ----------------------------------------------------------------
-# Key = (user_id, resource_kind, frozenset of filter items)
+# Key = (credential_id, resource_kind, frozenset of filter items)
 # Value = (expiry_epoch, data)
 _CacheKey = tuple[str, str, frozenset]
 _cache: dict[_CacheKey, tuple[float, list[dict]]] = {}
@@ -118,23 +152,21 @@ _cache_lock = threading.Lock()
 _TTL_SECONDS = 60.0
 
 
-def _make_key(user_id: UUID, kind: str, filters: dict | None) -> _CacheKey:
+def _make_key(credential_id: UUID, kind: str, filters: dict | None) -> _CacheKey:
     items: frozenset = frozenset((filters or {}).items())
-    return (str(user_id), kind, items)
+    return (str(credential_id), kind, items)
 
 
 def cached_list(
-    user_id: UUID,
+    credential_id: UUID,
     kind: str,
     filters: dict | None,
     fetch: Callable[[], list[dict]],
 ) -> list[dict]:
     """TTL-cache wrapper. ``fetch`` is called only when no valid entry
-    exists. The cache is process-local and in-memory; multiple backend
-    instances run independent caches, which is fine since the data is
-    allowed to be up to 60s stale.
+    exists. Process-local; data may be up to 60s stale.
     """
-    key = _make_key(user_id, kind, filters)
+    key = _make_key(credential_id, kind, filters)
     now = time.monotonic()
 
     with _cache_lock:
@@ -142,8 +174,6 @@ def cached_list(
         if cached and cached[0] > now:
             return cached[1]
 
-    # Two concurrent requests may both fetch here; inefficient but not
-    # incorrect, and simpler than a per-key lock map.
     data = fetch()
 
     with _cache_lock:
@@ -152,18 +182,19 @@ def cached_list(
     return data
 
 
-def invalidate_user(user_id: UUID, kind: str | None = None) -> int:
-    """Invalidate the cache for one user (triggered by the frontend
-    refresh button). Without ``kind`` all resource types for the user
-    are removed. Returns the number of removed entries.
+def invalidate(credential_id: UUID, kind: str | None = None) -> int:
+    """Invalidate the cache of one credential (refresh button, credential
+    replaced or deleted). Without ``kind`` every resource type; ``kind``
+    also matches kinds cached per variant (``availability_zones`` removes
+    ``availability_zones_compute`` …). Returns the number of removed entries.
     """
-    user_str = str(user_id)
+    cred = str(credential_id)
     removed = 0
     with _cache_lock:
         for key in list(_cache.keys()):
-            if key[0] != user_str:
+            if key[0] != cred:
                 continue
-            if kind is not None and key[1] != kind:
+            if kind is not None and key[1] != kind and not key[1].startswith(kind + "_"):
                 continue
             del _cache[key]
             removed += 1

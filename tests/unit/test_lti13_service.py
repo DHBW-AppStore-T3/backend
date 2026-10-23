@@ -1,10 +1,11 @@
+import base64
 import time
 from unittest.mock import MagicMock, patch
 
+import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from jose import jwt
 
 from app.services import lti13_service
 
@@ -21,10 +22,8 @@ def _jwk_dict(private_key, kid="test-kid"):
     public_numbers = private_key.public_key().public_numbers()
 
     def _b64(n: int) -> str:
-        from jose.utils import base64url_encode
-
         length = (n.bit_length() + 7) // 8
-        return base64url_encode(n.to_bytes(length, "big")).decode()
+        return base64.urlsafe_b64encode(n.to_bytes(length, "big")).rstrip(b"=").decode()
 
     return {
         "kty": "RSA",

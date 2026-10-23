@@ -1,5 +1,5 @@
-"""Tests für den prozesslokalen TTL-Cache und die ``user_connection``-
-Brücke in ``app.services.openstack_client``.
+"""Tests für den prozesslokalen TTL-Cache und die Verbindungen mit der
+eigenen Credential in ``app.services.openstack_client``.
 
 Der Cache ist Modul-State; jeder Test räumt ihn vorher leer, damit
 Reihenfolge-Effekte ausgeschlossen sind.
@@ -15,9 +15,10 @@ import pytest
 from app.services import openstack_client
 from app.services.openstack_client import (
     cached_list,
-    invalidate_user,
-    user_connection,
+    invalidate,
+    project_connection,
 )
+from tests.conftest import TEST_PROJECT, add_credential
 
 
 @pytest.fixture(autouse=True)
@@ -77,8 +78,8 @@ def test_cached_list_refreshes_after_ttl_expires():
 
 
 @pytest.mark.integration
-def test_invalidate_user_drops_cache_for_that_user_only():
-    """``invalidate_user`` darf nur Einträge des angegebenen Users
+def test_invalidate_drops_cache_for_that_user_only():
+    """``invalidate`` darf nur Einträge des angegebenen Users
     entfernen — andere Benutzer behalten ihren Cache."""
     user_a = uuid.uuid4()
     user_b = uuid.uuid4()
@@ -89,7 +90,7 @@ def test_invalidate_user_drops_cache_for_that_user_only():
     cached_list(user_a, "networks", None, fetch_a)
     cached_list(user_b, "networks", None, fetch_b)
 
-    removed = invalidate_user(user_a)
+    removed = invalidate(user_a)
     assert removed == 1
 
     # User A muss erneut fetchen, User B behält den gecachten Wert.
@@ -101,37 +102,45 @@ def test_invalidate_user_drops_cache_for_that_user_only():
 
 
 @pytest.mark.integration
-def test_user_connection_uses_credentials_from_envelope(db, mock_user):
-    """``user_connection`` muss die dekrypteten Credentials des Users
-    auflösen und an ``openstack.connect`` als Auth-Kwargs übergeben."""
-    fake_creds = {
-        "auth_url": "https://keystone.example/v3",
-        "auth_type": "v3applicationcredential",
-        "identifier": "app-cred-id",
-        "secret": "app-cred-secret",
-        "region_name": "RegionOne",
-        "interface": "public",
-        "identity_api_version": "3",
-    }
+def test_project_connection_uses_the_callers_own_credential(db, mock_user, mock_student):
+    """Always the caller's credential for the project, never someone else's."""
+    from fastapi import HTTPException
 
+    add_credential(db, mock_user)
+    add_credential(db, mock_student, "other-project", identifier="student-cred")
     fake_conn = MagicMock()
 
     with patch(
-        "app.services.openstack_client.crud_creds.get_decrypted_for_backend",
-        return_value=fake_creds,
-    ) as mock_get_creds, patch(
-        "app.services.openstack_client.openstack.connect",
-        return_value=fake_conn,
-    ) as mock_connect, user_connection(db, mock_user) as conn:
+        "app.services.openstack_client.openstack.connect", return_value=fake_conn
+    ) as mock_connect, project_connection(db, mock_user, TEST_PROJECT) as conn:
         assert conn is fake_conn
 
-    mock_get_creds.assert_called_once_with(db, mock_user.userId)
-    mock_connect.assert_called_once()
     kwargs = mock_connect.call_args.kwargs
-    assert kwargs["auth_url"] == "https://keystone.example/v3"
     assert kwargs["auth_type"] == "v3applicationcredential"
     assert kwargs["application_credential_id"] == "app-cred-id"
     assert kwargs["application_credential_secret"] == "app-cred-secret"
     assert kwargs["region_name"] == "RegionOne"
-    # Die Connection wird im Finally-Block höflich geschlossen.
     fake_conn.close.assert_called_once()
+
+    with pytest.raises(HTTPException) as exc, project_connection(db, mock_student, TEST_PROJECT):
+        pass
+    assert exc.value.status_code == 403
+    assert exc.value.detail["reason"] == "openstack_credentials_missing_for_project"
+
+
+@pytest.mark.integration
+def test_an_unverified_credential_opens_no_project(db, mock_user):
+    """A typed project id (credential from before verification) opens nothing."""
+    from fastapi import HTTPException
+
+    add_credential(db, mock_user, verified=False)
+
+    with patch("app.services.openstack_client.openstack.connect") as mock_connect:
+        with pytest.raises(HTTPException) as exc, project_connection(db, mock_user, TEST_PROJECT):
+            pass
+        assert exc.value.status_code == 403
+        with pytest.raises(HTTPException) as unknown, project_connection(db, mock_user, None):
+            pass
+        assert unknown.value.status_code == 409
+        assert unknown.value.detail == {"reason": "deployment_project_unknown"}
+    mock_connect.assert_not_called()

@@ -15,11 +15,10 @@ import pytest
 from app.models import (
     App,
     Deployment,
-    OpenStackAuthType,
     User,
-    UserOpenStackCredential,
     UserRole,
 )
+from tests.conftest import add_credential
 
 
 def _b64(b: bytes) -> str:
@@ -27,19 +26,7 @@ def _b64(b: bytes) -> str:
 
 
 def _ensure_user_credentials(db, user):
-    from app.utils import crypto
-
-    db.add(
-        UserOpenStackCredential(
-            credentialId=uuid.uuid4(),
-            userId=user.userId,
-            auth_type=OpenStackAuthType.APPLICATION_CREDENTIAL,
-            auth_url="https://keystone.example/v3",
-            encrypted_identifier=crypto.encrypt("test-id"),
-            encrypted_secret=crypto.encrypt("test-secret"),
-        )
-    )
-    db.commit()
+    return add_credential(db, user)
 
 
 def _ensure_app(db, user) -> App:
@@ -47,7 +34,9 @@ def _ensure_app(db, user) -> App:
         appId=uuid.uuid4(),
         name=f"app-{uuid.uuid4().hex[:8]}",
         userId=user.userId,
-        git_link="https://example.com/repo.git",
+        git_link="https://example.com/acme/repo.git",
+        # The owner's own private app: deployable without an approval.
+        is_private=True,
     )
     db.add(app)
     db.commit()
@@ -71,7 +60,7 @@ def patched_celery():
 def test_post_deployment_persists_files_under_terraform(
     client, db, mock_user, patched_celery
 ):
-    _ensure_user_credentials(db, mock_user)
+    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     pdf = b"%PDF-1.4\n%fake pdf bytes for the test\n"
@@ -79,6 +68,7 @@ def test_post_deployment_persists_files_under_terraform(
         "name": "with-files",
         "appId": str(app.appId),
         "releaseTag": "v1",
+        "credentialId": str(cred.credentialId),
         "userInputVar": {"terraform": {"some_other": "x"}, "packer": {}},
         "files": {
             "task_pdf": {
@@ -115,11 +105,13 @@ def test_post_deployment_persists_files_under_terraform(
     # Existing terraform vars were preserved through the merge.
     assert persisted["terraform"]["some_other"] == "x"
 
-    # Celery args carry the same dict — the worker sees what's in
-    # the DB.
-    celery_args = patched_celery.call_args.kwargs.get("args") or patched_celery.call_args.args[1]
-    user_vars_arg = celery_args[4]
+    # The job's keyword arguments carry the same dict — the worker sees
+    # what's in the DB — and the commit the deployment is pinned to.
+    job_kwargs = patched_celery.call_args.kwargs["kwargs"]
+    user_vars_arg = job_kwargs["user_vars"]
     assert user_vars_arg["terraform"]["task_pdf"]["all"]["content_b64"] == _b64(pdf)
+    assert job_kwargs["commit_sha"] == deployment.commit_sha
+    assert len(deployment.commit_sha) == 40
 
 
 @pytest.mark.integration
@@ -127,7 +119,7 @@ def test_post_deployment_413_when_single_file_too_large(
     client, db, mock_user, patched_celery
 ):
     """One file over 2 MB → 413, no row created, no celery dispatch."""
-    _ensure_user_credentials(db, mock_user)
+    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     big = b"x" * (2 * 1024 * 1024 + 10)
@@ -137,6 +129,7 @@ def test_post_deployment_413_when_single_file_too_large(
             "name": "too-big",
             "appId": str(app.appId),
             "releaseTag": "v1",
+            "credentialId": str(cred.credentialId),
             "files": {
                 "task_pdf": {
                     "all": {
@@ -163,7 +156,7 @@ def test_post_deployment_413_when_single_file_too_large(
 def test_post_deployment_422_on_invalid_base64(
     client, db, mock_user, patched_celery
 ):
-    _ensure_user_credentials(db, mock_user)
+    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     response = client.post(
@@ -172,6 +165,7 @@ def test_post_deployment_422_on_invalid_base64(
             "name": "bad-b64",
             "appId": str(app.appId),
             "releaseTag": "v1",
+            "credentialId": str(cred.credentialId),
             "files": {
                 "task_pdf": {
                     "all": {
@@ -192,7 +186,7 @@ def test_post_deployment_422_on_invalid_base64(
 def test_detail_endpoint_strips_file_bytes(
     client, db, mock_user, patched_celery
 ):
-    _ensure_user_credentials(db, mock_user)
+    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     pdf = b"PDF data" * 100
@@ -202,6 +196,7 @@ def test_detail_endpoint_strips_file_bytes(
             "name": "stripped-detail",
             "appId": str(app.appId),
             "releaseTag": "v1",
+            "credentialId": str(cred.credentialId),
             "files": {
                 "task_pdf": {
                     "all": {
@@ -226,7 +221,7 @@ def test_detail_endpoint_strips_file_bytes(
 def test_download_endpoint_returns_owner_bytes(
     client, db, mock_user, patched_celery
 ):
-    _ensure_user_credentials(db, mock_user)
+    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     payload_bytes = b"hello, world\n" * 10
@@ -236,6 +231,7 @@ def test_download_endpoint_returns_owner_bytes(
             "name": "downloadable",
             "appId": str(app.appId),
             "releaseTag": "v1",
+            "credentialId": str(cred.credentialId),
             "files": {
                 "task_pdf": {
                     "all": {
@@ -253,15 +249,53 @@ def test_download_endpoint_returns_owner_bytes(
     response = client.get(f"/deployments/{deployment_id}/files/task_pdf/all")
     assert response.status_code == 200
     assert response.content == payload_bytes
-    assert response.headers["content-type"].startswith("text/plain")
+    # Served for saving, never rendered: not the uploader's type (.github#7 R).
+    assert response.headers["content-type"] == "application/octet-stream"
+    assert response.headers["x-content-type-options"] == "nosniff"
     assert "hello.txt" in response.headers["content-disposition"]
+
+
+@pytest.mark.integration
+def test_upload_names_are_stored_without_paths_or_header_breakers(client, db, mock_user, patched_celery):
+    cred = _ensure_user_credentials(db, mock_user)
+    app = _ensure_app(db, mock_user)
+    payload_bytes = b"x"
+    create = client.post(
+        "/deployments/",
+        json={
+            "name": "names",
+            "appId": str(app.appId),
+            "releaseTag": "v1",
+            "credentialId": str(cred.credentialId),
+            "files": {
+                "task_pdf": {
+                    "all": {
+                        "name": '../../etc/cron.d/a"\r\nSet-Cookie: x=1.pdf',
+                        "content_b64": _b64(payload_bytes),
+                        "size": 1,
+                        "content_type": "text/html",
+                    }
+                }
+            },
+        },
+    )
+    assert create.status_code == 201, create.text
+    deployment_id = create.json()["deploymentId"]
+
+    response = client.get(f"/deployments/{deployment_id}/files/task_pdf/all")
+
+    disposition = response.headers["content-disposition"]
+    assert "/" not in disposition.split("filename*=")[0]
+    assert chr(13) not in disposition and chr(10) not in disposition
+    assert disposition.startswith('attachment; filename="')
+    assert "set-cookie" not in {k.lower() for k in response.headers}
 
 
 @pytest.mark.integration
 def test_download_endpoint_404_for_unknown_slot(
     client, db, mock_user, patched_celery
 ):
-    _ensure_user_credentials(db, mock_user)
+    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     payload_bytes = b"x" * 32
@@ -271,6 +305,7 @@ def test_download_endpoint_404_for_unknown_slot(
             "name": "with-one-slot",
             "appId": str(app.appId),
             "releaseTag": "v1",
+            "credentialId": str(cred.credentialId),
             "files": {
                 "task_pdf": {
                     "all": {
@@ -301,7 +336,7 @@ def test_download_endpoint_member_403(
 ):
     """A team member with read-access to the deployment must NOT be
     able to fetch file bytes — only the owner-view does."""
-    _ensure_user_credentials(db, mock_user)
+    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     payload_bytes = b"secret" * 100
@@ -311,6 +346,7 @@ def test_download_endpoint_member_403(
             "name": "owner-only-download",
             "appId": str(app.appId),
             "releaseTag": "v1",
+            "credentialId": str(cred.credentialId),
             "files": {
                 "task_pdf": {
                     "all": {

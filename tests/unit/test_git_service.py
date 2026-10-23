@@ -1,194 +1,209 @@
-"""Unit tests for :mod:`app.services.git_service`.
+"""Unit tests for :mod:`app.services.git_service` and :mod:`app.git_urls`.
 
-DB-less Tests: GitPython wird vollständig gemockt; es passieren keine
-Netzwerk- oder Dateisystem-Operationen jenseits eines tmp_path. Diese
-Tests sichern das Verhalten von ``clone_release_vars`` in den vier
-Phase-C4-Szenarien ab:
-
-1. Shallow Fetch eines konkreten Tags
-2. Verhalten bei nicht-HTTPS (Schema-)URLs
-3. Tag nicht auffindbar im Remote
-4. Authentifizierungs-Fehler werden propagiert
-
-Wir patchen ``git.Repo.init`` direkt (statt der ``git_service``-Symbole),
-weil der Service ``import git`` macht und ``git.Repo.init`` per
-Attribut auflöst. ``autospec`` deaktivieren wir, da ``git.Repo``
-dynamische Properties wie ``head.commit`` exponiert, die das echte
-Spec-Modell nur umständlich nachbildet — die Tests kontrollieren die
-Mock-Surface explizit über ``MagicMock``-Konfiguration.
+App repositories are public and read anonymously (.github#7 B); what is
+read is always one commit (.github#7 G). GitPython is mocked: no network
+and nothing on disk beyond ``tmp_path``.
 """
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import git
 import pytest
 
-from app.services.git_service import GitService
+from app.git_urls import (
+    GitHostNotAllowed,
+    checked_https_url,
+    is_commit_sha,
+    parse_allowed_hosts,
+    to_https_url,
+)
+from app.services import git_service as git_module
+from app.services.git_service import CommitNotServed, GitService
 
-pytestmark = pytest.mark.unit
+pytestmark = [pytest.mark.unit, pytest.mark.real_git]
+
+SHA = "0123456789abcdef0123456789abcdef01234567"
+ALLOWED = {"github.com", "gitlab.dhbw.cloud"}
 
 
 # ----------------------------------------------------------------
-# Helpers
+# git_urls
 # ----------------------------------------------------------------
-def _make_repo_mock() -> MagicMock:
-    """Build a ``git.Repo``-shaped MagicMock with the surface the
-    service touches: ``create_remote``, ``head.commit.hexsha`` and the
-    ``git.checkout`` shortcut. Caller mutates ``origin.fetch`` to
-    inject error scenarios."""
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("https://github.com/acme/app", "https://github.com/acme/app"),
+        ("https://github.com/acme/app.git", "https://github.com/acme/app.git"),
+        ("git@github.com:acme/app.git", "https://github.com/acme/app.git"),
+        ("http://github.com/acme/app/", "https://github.com/acme/app"),
+        ("HTTPS://GitHub.com/acme/app", "https://github.com/acme/app"),
+        ("https://user:token@github.com/acme/app", "https://github.com/acme/app"),
+        ("https://gitlab.dhbw.cloud/group/sub/app", "https://gitlab.dhbw.cloud/group/sub/app"),
+    ],
+)
+def test_checked_url_normalises_to_credential_free_https(raw, expected):
+    assert checked_https_url(raw, ALLOWED) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "https://evil.example/acme/app",          # host not allowed
+        "https://gitlab.evil.example/acme/app",   # "gitlab" in the name is no longer special
+        "https://github.com:8443/acme/app",       # a port never matches
+        "https://10.0.0.1/acme/app",              # IP literal
+        "https://[::1]/acme/app",                 # IPv6 literal
+        "https://github.com/acme",                # no repository part
+        "https://github.com/acme/../secret/app",  # traversal
+        "https://github.com/-oProxyCommand/app",  # option-like segment
+        "https://github.com/acme/app?ref=x",      # query
+        "file:///etc/passwd",
+        "",
+    ],
+)
+def test_checked_url_refuses(raw):
+    with pytest.raises(GitHostNotAllowed):
+        checked_https_url(raw, ALLOWED)
+
+
+def test_to_https_url_drops_userinfo_and_parse_hosts():
+    assert to_https_url("https://x:y@github.com/a/b") == "https://github.com/a/b"
+    assert parse_allowed_hosts(" GitHub.com, ,gitlab.dhbw.cloud ") == frozenset({"github.com", "gitlab.dhbw.cloud"})
+
+
+def test_is_commit_sha():
+    assert is_commit_sha(SHA)
+    assert not is_commit_sha(SHA[:8])
+    assert not is_commit_sha(SHA.upper())
+    assert not is_commit_sha(None)
+
+
+# ----------------------------------------------------------------
+# GitService
+# ----------------------------------------------------------------
+@pytest.fixture
+def allowed(monkeypatch):
+    monkeypatch.setattr(git_module.settings, "APP_GIT_ALLOWED_HOSTS", "github.com")
+
+
+def _repo_mock(head_sha: str = SHA) -> MagicMock:
     repo = MagicMock(name="Repo")
     origin = MagicMock(name="Origin")
     repo.create_remote.return_value = origin
-    repo.head.commit.hexsha = "deadbeefcafebabe"
-    repo.git.checkout = MagicMock(name="checkout")
+    repo.head.commit.hexsha = head_sha
     return repo
 
 
 def _service(tmp_path, monkeypatch) -> GitService:
-    """Instantiate the service with a redirected temp base path and a
-    deterministic access token. Avoids relying on the real
-    ``settings`` singleton."""
     svc = GitService()
     monkeypatch.setattr(svc, "base_path", tmp_path)
-    monkeypatch.setattr(svc, "token", "test-token-xyz")
     return svc
 
 
-# ----------------------------------------------------------------
-# Tests
-# ----------------------------------------------------------------
-@patch("app.services.git_service.git.Repo")
-def test_clone_repository_at_tag_uses_shallow_fetch(
-    mock_repo_cls, tmp_path, monkeypatch
-):
-    """``clone_release_vars`` muss einen Shallow-Fetch (``depth=1``)
-    auf ``refs/tags/<tag>`` ausführen und anschließend genau diesen
-    Tag auschecken — sonst ist der Sparse-Checkout sinnlos großvolumig."""
-    repo = _make_repo_mock()
-    mock_repo_cls.init.return_value = repo
-
-    svc = _service(tmp_path, monkeypatch)
-    result_path = svc.clone_release_vars(
-        git_url="https://github.com/acme/widgets.git",
-        tag="v1.2.3",
-        deployment_id="dep-001",
-    )
-
-    # Result path liegt unter base_path
-    assert result_path.startswith(str(tmp_path))
-
-    # Repo wurde initialisiert (nicht clone-d), Sparse-Setup folgt
-    mock_repo_cls.init.assert_called_once()
-
-    # Remote-URL trägt den Token (HTTPS-Authentifizierung)
-    repo.create_remote.assert_called_once()
-    remote_args = repo.create_remote.call_args
-    assert remote_args.args[0] == "origin"
-    assert "test-token-xyz@github.com/acme/widgets.git" in remote_args.args[1]
-
-    # Fetch ist shallow und gezielt auf den Tag
-    origin = repo.create_remote.return_value
-    origin.fetch.assert_called_once_with(
-        refspec="refs/tags/v1.2.3:refs/tags/v1.2.3", depth=1
-    )
-
-    # Checkout des Tag-Refs mit force=True
-    repo.git.checkout.assert_called_once_with("refs/tags/v1.2.3", force=True)
+def test_service_has_no_token():
+    svc = GitService()
+    assert not hasattr(svc, "token")
+    assert not hasattr(git_module.settings, "GIT_ACCESS_TOKEN")
 
 
 @patch("app.services.git_service.git.Repo")
-def test_clone_repository_rejects_non_https_url(
-    mock_repo_cls, tmp_path, monkeypatch
-):
-    """Eine nicht-HTTPS-URL (hier: ``ftp://``) lässt den Fetch
-    fehlschlagen — der Service muss den Fehler in einen
-    ``"Failed to clone"``-Exception kapseln und das angelegte
-    Repo-Verzeichnis aufräumen."""
-    repo = _make_repo_mock()
+def test_clone_fetches_exactly_the_commit_anonymously(mock_repo_cls, tmp_path, monkeypatch, allowed):
+    repo = _repo_mock()
     mock_repo_cls.init.return_value = repo
-    origin = repo.create_remote.return_value
-    # GitPython hebt bei unbekanntem Schema einen GitCommandError —
-    # wir simulieren das mit einem RuntimeError, da der Service
-    # ohnehin breit Exception fängt und neu wirft.
-    origin.fetch.side_effect = RuntimeError(
-        "fatal: unsupported protocol: ftp"
-    )
-
     svc = _service(tmp_path, monkeypatch)
 
-    with pytest.raises(Exception) as excinfo:
-        svc.clone_release_vars(
-            git_url="ftp://example.com/acme/widgets.git",
-            tag="v1.0.0",
-            deployment_id="dep-002",
-        )
+    path = svc.clone_release_vars("git@github.com:acme/widgets.git", "v1.2.3", SHA)
 
-    assert "Failed to clone" in str(excinfo.value)
-    # Cleanup: das Repo-Verzeichnis darf nach Fehler nicht zurückbleiben
-    assert not (tmp_path / "deploy_dep-002").exists()
+    assert path.startswith(str(tmp_path))
+    # Remote is the credential-free HTTPS URL; nothing carries a token.
+    repo.create_remote.assert_called_once_with("origin", "https://github.com/acme/widgets.git")
+    origin = repo.create_remote.return_value
+    origin.fetch.assert_called_once()
+    assert origin.fetch.call_args.args[0] == SHA
+    assert origin.fetch.call_args.kwargs["depth"] == 1
+    repo.git.checkout.assert_called_once_with("--detach", SHA, force=True)
+    # Git never asks for credentials.
+    env = repo.git.update_environment.call_args.kwargs
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
 
 
 @patch("app.services.git_service.git.Repo")
-def test_clone_repository_tag_not_found_raises(
-    mock_repo_cls, tmp_path, monkeypatch
-):
-    """Existiert der angeforderte Tag im Remote nicht, propagiert
-    GitPython einen Fetch-Fehler; der Service muss ihn als
-    ``"Failed to clone"`` umverpacken und nicht stillschweigend
-    weiterlaufen (sonst würde ein leeres Repo durchgereicht)."""
-    repo = _make_repo_mock()
-    mock_repo_cls.init.return_value = repo
+def test_clone_falls_back_to_the_tag_and_checks_it_still_points_there(mock_repo_cls, tmp_path, monkeypatch, allowed):
+    repo = _repo_mock()
     origin = repo.create_remote.return_value
-    origin.fetch.side_effect = RuntimeError(
-        "fatal: couldn't find remote ref refs/tags/v9.9.9"
-    )
-
+    origin.fetch.side_effect = [git.GitCommandError(["git", "fetch"], 128), None]
+    mock_repo_cls.init.return_value = repo
     svc = _service(tmp_path, monkeypatch)
 
-    with pytest.raises(Exception) as excinfo:
-        svc.clone_release_vars(
-            git_url="https://github.com/acme/widgets.git",
-            tag="v9.9.9",
-            deployment_id="dep-003",
-        )
+    svc.clone_release_vars("https://github.com/acme/widgets", "v1", SHA)
 
-    msg = str(excinfo.value)
-    assert "Failed to clone" in msg
-    assert "v9.9.9" in msg or "couldn't find remote ref" in msg
-
-    # Checkout darf nicht mehr aufgerufen worden sein — Fetch hat ja
-    # bereits abgebrochen
-    repo.git.checkout.assert_not_called()
+    assert origin.fetch.call_count == 2
+    assert origin.fetch.call_args.kwargs["refspec"] == "refs/tags/v1:refs/tags/v1"
 
 
 @patch("app.services.git_service.git.Repo")
-def test_clone_repository_authentication_failure_propagates(
-    mock_repo_cls, tmp_path, monkeypatch
-):
-    """Bei abgelaufenem oder falschem Token wirft GitPython eine
-    Authentifizierungs-Exception. Der Service muss diese in seine
-    ``Failed to clone``-Hülle einpacken, dabei aber die Original-
-    Ursache via ``__cause__`` durchreichen (``raise ... from e``),
-    damit die Logs das Auth-Problem nachvollziehen können."""
-    repo = _make_repo_mock()
+def test_clone_refuses_a_moved_tag(mock_repo_cls, tmp_path, monkeypatch, allowed):
+    repo = _repo_mock(head_sha="f" * 40)
     mock_repo_cls.init.return_value = repo
-    origin = repo.create_remote.return_value
-    auth_error = RuntimeError(
-        "fatal: Authentication failed for 'https://github.com/acme/widgets.git/'"
-    )
-    origin.fetch.side_effect = auth_error
-
     svc = _service(tmp_path, monkeypatch)
 
-    with pytest.raises(Exception) as excinfo:
-        svc.clone_release_vars(
-            git_url="https://github.com/acme/widgets.git",
-            tag="v1.0.0",
-            deployment_id="dep-004",
-        )
+    with pytest.raises(CommitNotServed):
+        svc.clone_release_vars("https://github.com/acme/widgets", "v1", SHA)
+    # The partial clone is gone.
+    assert list(tmp_path.iterdir()) == []
 
-    # Wrapped error mentions clone failure
-    assert "Failed to clone" in str(excinfo.value)
-    # Original cause ist via __cause__ erreichbar (raise ... from e)
-    assert excinfo.value.__cause__ is auth_error
-    assert "Authentication failed" in str(excinfo.value.__cause__)
+
+@patch("app.services.git_service.git.Repo")
+def test_clone_refuses_a_host_outside_the_allowlist(mock_repo_cls, tmp_path, monkeypatch, allowed):
+    mock_repo_cls.init.return_value = _repo_mock()
+    svc = _service(tmp_path, monkeypatch)
+
+    with pytest.raises(GitHostNotAllowed):
+        svc.clone_release_vars("https://evil.example/acme/widgets", "v1", SHA)
+    mock_repo_cls.init.return_value.create_remote.assert_not_called()
+
+
+LS_REMOTE = "\n".join([
+    f"{'a' * 40}\trefs/tags/v1.0.0",
+    f"{'b' * 40}\trefs/tags/v1.1.0",
+    f"{'c' * 40}\trefs/tags/v1.1.0^{{}}",
+    f"{'d' * 40}\trefs/heads/main",
+    f"{'e' * 40}\trefs/tags/nightly",
+])
+
+
+def test_versions_peel_annotated_tags_and_sort(monkeypatch, allowed):
+    execute = MagicMock(return_value=LS_REMOTE)
+    monkeypatch.setattr(git_module.git.cmd.Git, "execute", execute)
+
+    versions = GitService().get_versions("https://github.com/acme/widgets")
+
+    assert [v["version"] for v in versions] == ["v1.1.0", "v1.0.0", "nightly"]
+    assert versions[0]["sha"] == "c" * 40  # the commit, not the tag object
+    cmd = execute.call_args.args[0]
+    assert cmd[:3] == ["git", "-c", "credential.helper="]
+    assert cmd[-1] == "https://github.com/acme/widgets"
+    assert execute.call_args.kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_resolve_tag(monkeypatch, allowed):
+    monkeypatch.setattr(git_module.git.cmd.Git, "execute", MagicMock(return_value=LS_REMOTE))
+    svc = GitService()
+    assert svc.resolve_tag("https://github.com/acme/widgets", "v1.0.0") == "a" * 40
+    assert svc.resolve_tag("https://github.com/acme/widgets", "v9") is None
+
+
+def test_unreadable_repository_is_reported_not_raised(monkeypatch, allowed):
+    monkeypatch.setattr(
+        git_module.git.cmd.Git, "execute",
+        MagicMock(side_effect=git.GitCommandError(["git", "ls-remote"], 128, stderr="not found")),
+    )
+    result = GitService().verify_repository_access("https://github.com/acme/private")
+    assert result["success"] is False
+    assert "public" in result["message"]
+
+
+def test_disallowed_host_propagates_from_verify(allowed):
+    with pytest.raises(GitHostNotAllowed):
+        GitService().verify_repository_access("https://evil.example/acme/app")

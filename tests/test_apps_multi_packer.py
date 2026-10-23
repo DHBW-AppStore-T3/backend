@@ -135,7 +135,7 @@ def test_get_app_variables_returns_per_template_variables(
     )
 
     app_obj = create_app_in_db(
-        db, mock_user, name="multi", git_link="https://example.com/multi.git"
+        db, mock_user, name="multi", git_link="https://example.com/acme/multi.git"
     )
 
     response = client.get(f"/apps/{app_obj.appId}/variables?version=v1.0")
@@ -163,7 +163,7 @@ def test_get_app_variables_legacy_single_template_returns_default_key(
     )
 
     app_obj = create_app_in_db(
-        db, mock_user, name="legacy", git_link="https://example.com/legacy.git"
+        db, mock_user, name="legacy", git_link="https://example.com/acme/legacy.git"
     )
 
     response = client.get(f"/apps/{app_obj.appId}/variables?version=v1.0")
@@ -193,7 +193,7 @@ def test_get_app_variables_mixed_layout_raises(
     _write_multi_packer_template(repo, "webserver")
 
     app_obj = create_app_in_db(
-        db, mock_user, name="mixed", git_link="https://example.com/mixed.git"
+        db, mock_user, name="mixed", git_link="https://example.com/acme/mixed.git"
     )
 
     response = client.get(f"/apps/{app_obj.appId}/variables?version=v1.0")
@@ -229,7 +229,7 @@ def test_submit_version_records_packer_template_keys_in_metadata(
         db,
         mock_user,
         name="multi-submit",
-        git_link="https://example.com/multi.git",
+        git_link="https://example.com/acme/multi.git",
     )
 
     resp = client.post(
@@ -273,7 +273,7 @@ def test_submit_version_with_invalid_packer_key_raises(
         db,
         mock_user,
         name="bad-key",
-        git_link="https://example.com/bad.git",
+        git_link="https://example.com/acme/bad.git",
     )
 
     resp = client.post(
@@ -324,7 +324,7 @@ variable "flavor" {
         db,
         mock_user,
         name="multi-tf",
-        git_link="https://example.com/multi-tf.git",
+        git_link="https://example.com/acme/multi-tf.git",
     )
 
     response = client.get(f"/apps/{app_obj.appId}/variables?version=v1.0")
@@ -370,7 +370,7 @@ variable "flavor" {
         db,
         mock_user,
         name="legacy-tf",
-        git_link="https://example.com/legacy-tf.git",
+        git_link="https://example.com/acme/legacy-tf.git",
     )
 
     response = client.get(f"/apps/{app_obj.appId}/variables?version=v1.0")
@@ -423,7 +423,7 @@ variable "flavor" {
         db,
         mock_user,
         name="multi-users",
-        git_link="https://example.com/multi-users.git",
+        git_link="https://example.com/acme/multi-users.git",
     )
 
     response = client.get(f"/apps/{app_obj.appId}/variables?version=v1.0")
