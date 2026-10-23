@@ -29,6 +29,11 @@ class UserUpdate(BaseModel):
 
 
 class UserResponse(UserBase):
+    # Output only: the address was validated when the user was created or
+    # synced from Keycloak. Re-validating it strictly here made every response
+    # embedding the user fail with HTTP 500 for reserved domains (.invalid,
+    # .test, example.test), which email-validator rejects.
+    email: str
     userId: UUID
     role: UserRole
     courseId: UUID | None = None
