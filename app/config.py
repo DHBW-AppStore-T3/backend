@@ -1,3 +1,4 @@
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -66,10 +67,28 @@ class Settings(BaseSettings):
     # Never enable in production.
     DEV_MODE: bool = False
 
+    # Skip real OpenStack calls: credential validation is a no-op and the
+    # resource endpoints return static dummy data. Only allowed with DEV_MODE.
+    OPENSTACK_SIMULATE: bool = False
+
     # Self-service-ui handoff (POST /handoff/mint). Own secret, independent
     # of LTI13_SESSION_SECRET — a compromised LTI secret must not also open
     # the self-service handoff path.
     HANDOFF_SESSION_SECRET: str = "change-me-in-production"
+
+    @model_validator(mode="after")
+    def _refuse_simulate_in_production(self) -> "Settings":
+        if self.OPENSTACK_SIMULATE and not self.DEV_MODE:
+            raise ValueError("OPENSTACK_SIMULATE requires DEV_MODE=true")
+        return self
+
+    @property
+    def celery_broker_url(self) -> str:
+        """Broker URL for Celery; defaults to the application database."""
+        if self.CELERY_BROKER_URL:
+            return self.CELERY_BROKER_URL
+        scheme, _, rest = self.DATABASE_URL.partition("://")
+        return f"pgq+{scheme.split('+', 1)[0]}://{rest}"
 
     class Config:
         env_file = ".env"

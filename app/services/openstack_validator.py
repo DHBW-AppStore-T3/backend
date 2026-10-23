@@ -11,6 +11,7 @@ import socket
 import openstack
 from openstack import exceptions as os_exc
 
+from app.config import settings
 from app.models import OpenStackAuthType
 from app.schemas import OpenStackCredentialUpsert
 
@@ -50,6 +51,8 @@ def validate(payload: OpenStackCredentialUpsert) -> tuple[bool, str | None]:
     The error message is short and human-readable — safe to surface in the
     UI. Never echoes the secret back.
     """
+    if settings.OPENSTACK_SIMULATE:
+        return True, None
     prev_default_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(_TIMEOUT_SECONDS)
     try:
