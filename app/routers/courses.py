@@ -15,7 +15,7 @@ from app.schemas import (
     CourseWithUsers,
     UserResponse,
 )
-from app.utils.capabilities import ensure_edit_course
+from app.utils.capabilities import ensure_edit_course, ensure_view_course_roster
 from app.utils.keycloak_auth import get_current_user_keycloak
 from app.utils.permissions import (
     require_admin,
@@ -70,13 +70,19 @@ def get_course(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user_keycloak)
 ):
-    """Get course by ID with all users"""
+    """Get course by ID with all users.
+
+    The member list is personal data (e-mail addresses): teachers and
+    admins may read it, students get 403 (.github#7 F, security review
+    M-2).
+    """
     course = crud_courses.get_course(db, course_id)
     if not course:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Course not found"
         )
+    ensure_view_course_roster(current_user, course, db)
     return course
 
 
@@ -203,7 +209,7 @@ def list_course_members(
 ):
     """List the users currently enrolled in ``course_id``.
 
-    Teacher/Admin only — student rosters are management data.
+    Teachers and admins only — student rosters are management data.
     """
     course = crud_courses.get_course(db, course_id)
     if not course:
@@ -211,6 +217,7 @@ def list_course_members(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Course not found"
         )
+    ensure_view_course_roster(current_user, course, db)
     return crud_courses.get_course_members(db, course_id)
 
 
@@ -231,6 +238,11 @@ def add_course_members(
     as the deployment-team picker, so by the time we get here the
     user-ids exist in our DB. Returns the post-update member list of
     the course so the UI can refresh without a second round trip.
+
+    Course-teachers of THIS course and admins only; moving a user out of
+    another course also needs that right on the other course (.github#7 F,
+    security review H-1/A-3): nobody pulls someone from a course they do
+    not manage into their own.
     """
     course = crud_courses.get_course(db, course_id)
     if not course:
@@ -238,6 +250,18 @@ def add_course_members(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Course not found"
         )
+    ensure_edit_course(current_user, course, db)
+    for user_id in payload.userIds:
+        user = crud_users.get_user(db, user_id)
+        if user is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"reason": "unknown_user", "user_id": str(user_id)},
+            )
+        if user.courseId is not None and user.courseId != course_id:
+            source = crud_courses.get_course(db, user.courseId)
+            if source is not None:
+                ensure_edit_course(current_user, source, db)
 
     crud_courses.add_users_to_course(db, course_id, payload.userIds)
     return crud_courses.get_course_members(db, course_id)
@@ -257,6 +281,7 @@ def remove_course_member(
 
     Returns 404 if the user isn't actually enrolled in this course —
     we never silently detach somebody from a different course.
+    Course-teachers of THIS course and admins only (.github#7 F).
     """
     course = crud_courses.get_course(db, course_id)
     if not course:
@@ -264,6 +289,7 @@ def remove_course_member(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Course not found"
         )
+    ensure_edit_course(current_user, course, db)
 
     removed = crud_courses.remove_user_from_course(db, course_id, user_id)
     if not removed:

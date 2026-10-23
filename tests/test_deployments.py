@@ -42,7 +42,7 @@ def _make_app(db, user_id):
         appId=uuid.uuid4(),
         name=f"App {uuid.uuid4().hex[:6]}",
         userId=user_id,
-        git_link="https://example.com/repo.git",
+        git_link="https://example.com/acme/repo.git",
     )
     db.add(a)
     db.commit()
@@ -384,7 +384,39 @@ def test_list_deployments_student_sees_team_member_deployments(db, mock_user):
         (TaskStatus.SUCCESS, TaskType.DESTROY, "destroyed"),
         (TaskStatus.FAILED, TaskType.DESTROY, "failed"),
         (TaskStatus.CANCELLED, TaskType.DESTROY, "cancelled"),
+        (TaskStatus.PENDING, TaskType.REDEPLOY, "redeploying"),
+        (TaskStatus.RUNNING, TaskType.REDEPLOY, "redeploying"),
+        (TaskStatus.SUCCESS, TaskType.REDEPLOY, "success"),
+        (TaskStatus.FAILED, TaskType.REDEPLOY, "redeploy_failed"),
+        (TaskStatus.CANCELLED, TaskType.REDEPLOY, "redeploy_failed"),
+        (TaskStatus.RUNNING, TaskType.PAUSE, "pausing"),
+        (TaskStatus.FAILED, TaskType.RESUME, "resume_failed"),
     ],
 )
 def test_derive_status_mapping(task_status, task_type, expected):
     assert crud_deployments.derive_status(task_status, task_type) == expected
+
+
+@pytest.mark.integration
+def test_list_deployments_status_filter_knows_the_redeploy_states(client, db, mock_user):
+    """``redeploying`` / ``redeploy_failed`` filter exactly like ``derive_status``
+    labels them, and ``running`` no longer matches a running redeploy."""
+    app = _make_app(db, mock_user.userId)
+    base = datetime(2026, 1, 1, 0, 0, 0)
+    redeploying = _make_deployment(db, mock_user.userId, app.appId, name="redeploying")
+    failed = _make_deployment(db, mock_user.userId, app.appId, name="redeploy-failed")
+    for dep, status in ((redeploying, TaskStatus.RUNNING), (failed, TaskStatus.FAILED)):
+        _make_task(db, dep.deploymentId, type_=TaskType.DEPLOY, status=TaskStatus.SUCCESS, created_at=base)
+        _make_task(db, dep.deploymentId, type_=TaskType.REDEPLOY, status=status,
+                   created_at=base + timedelta(minutes=1))
+
+    def names(status):
+        resp = client.get(f"/deployments/?status_filter={status}")
+        assert resp.status_code == 200
+        return {d["name"] for d in resp.json()}
+
+    assert names("redeploying") == {"redeploying"}
+    assert names("redeploy_failed") == {"redeploy-failed"}
+    assert names("running") == set()
+    assert names("failed") == set()
+    assert names("nonsense") == set()

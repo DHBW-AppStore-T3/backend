@@ -50,11 +50,12 @@ def _app(owner_id: uuid.UUID, is_private: bool = False) -> SimpleNamespace:
     )
 
 
-def _deployment(owner_id: uuid.UUID, course_id: uuid.UUID | None = None) -> SimpleNamespace:
+def _deployment(owner_id: uuid.UUID, course_id: uuid.UUID | None = None,
+                owner_role: UserRole = UserRole.STUDENT) -> SimpleNamespace:
     return SimpleNamespace(
         deploymentId=uuid.uuid4(),
         userId=owner_id,
-        user=SimpleNamespace(courseId=course_id),
+        user=SimpleNamespace(courseId=course_id, role=owner_role),
     )
 
 
@@ -180,6 +181,20 @@ def test_ensure_view_deployment_owner_passes_for_course_teacher(teacher):
     caps.ensure_view_deployment_owner(teacher, dep, db)
 
 
+def test_ensure_view_deployment_owner_refuses_a_colleagues_deployment(teacher):
+    """The course-teacher right covers students' deployments only
+    (.github#7 F): pulling a colleague into one's course gives nothing."""
+    course_id = uuid.uuid4()
+    dep = _deployment(uuid.uuid4(), course_id=course_id, owner_role=UserRole.TEACHER)
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = (
+        SimpleNamespace(courseId=course_id, userId=teacher.userId)
+    )
+    with pytest.raises(HTTPException) as exc:
+        caps.ensure_view_deployment_owner(teacher, dep, db)
+    assert exc.value.status_code == 403
+
+
 # ================================================================
 # DEPLOYMENTS — ensure_operate_deployment
 # Bug #1 regression: team-membership does NOT confer operate rights.
@@ -201,23 +216,6 @@ def test_ensure_operate_deployment_passes_for_owner(student, db_mock):
     """The owner may operate the deployment — no raise."""
     dep = _deployment(student.userId)
     caps.ensure_operate_deployment(student, dep, db_mock)
-
-
-# ================================================================
-# DEPLOYMENTS — ensure_resend_access
-# ================================================================
-def test_ensure_resend_access_raises_for_unrelated_user(student):
-    """Resending credentials to someone else requires owner-view access.
-    A student who is not the owner and not in the team is rejected.
-    """
-    dep = _deployment(uuid.uuid4())
-    target = uuid.uuid4()
-    db = MagicMock()
-    db.query.return_value.filter.return_value.first.return_value = None
-    with pytest.raises(HTTPException) as exc:
-        caps.ensure_resend_access(student, dep, target, db)
-    assert exc.value.status_code == 403
-    assert exc.value.detail["code"] == "deployment_resend_forbidden"
 
 
 # ================================================================

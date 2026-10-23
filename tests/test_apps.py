@@ -32,7 +32,7 @@ def test_get_apps_unauthenticated(unauth_client):
 # changing the repo would make existing deployments point at a different
 # repo than they originally deployed.
 
-ORIGINAL_GIT_LINK = "https://example.com/orig.git"
+ORIGINAL_GIT_LINK = "https://example.com/acme/orig.git"
 
 
 @pytest.fixture

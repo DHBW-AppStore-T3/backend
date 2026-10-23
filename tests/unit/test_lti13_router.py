@@ -1,3 +1,5 @@
+import re
+import urllib.parse
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -21,9 +23,14 @@ def _mock_request(cookies=None, form=None, query_params=None, method="POST"):
 
 def _mock_login_request(**params):
     """A GET request carrying `params` in the query string — matches how
-    lti13_login reads request.query_params for a GET, vs. request.form()
-    for a POST."""
+    lti13_login_get reads request.query_params, vs. request.form() in
+    lti13_login_post."""
     return _mock_request(query_params=params, method="GET")
+
+
+def _known_state(nonce="nonce-1"):
+    """The nonce store as the launch sees it: one stored state (no database in unit tests)."""
+    return patch.object(lti13, "_pop_nonce", return_value=nonce)
 
 
 async def test_lti13_jwks_returns_empty_keyset():
@@ -33,12 +40,13 @@ async def test_lti13_jwks_returns_empty_keyset():
 
 
 async def test_lti13_login_redirects_with_state_cookie():
-    lti13._nonce_store.clear()
+    db = MagicMock()
     with (
         patch.object(settings, "LTI13_PLATFORM_ISSUER", "https://moodle.example.com"),
         patch.object(settings, "LTI13_CLIENT_ID", "client-123"),
     ):
-        redirect = await lti13.lti13_login(
+        redirect = await lti13.lti13_login_get(
+            db=db,
             request=_mock_login_request(
                 iss="https://moodle.example.com",
                 login_hint="hint",
@@ -51,17 +59,22 @@ async def test_lti13_login_redirects_with_state_cookie():
     assert redirect.status_code == 302
     assert "auth.php" in redirect.headers["location"]
     assert "lti13_state" in redirect.headers.get("set-cookie", "")
+    # The state/nonce pair goes to the database, not into process memory.
+    stored = db.add.call_args.args[0]
+    assert stored.state in redirect.headers["set-cookie"]
+    assert f"nonce={stored.nonce}" in redirect.headers["location"]
+    db.commit.assert_called()
 
 
 async def test_lti13_login_accepts_post_from_moodle():
     """Moodle sends this as a POST with form-encoded params, not a GET —
     verified against a real Moodle 5.x instance, 2026-09-25."""
-    lti13._nonce_store.clear()
     with (
         patch.object(settings, "LTI13_PLATFORM_ISSUER", "https://moodle.example.com"),
         patch.object(settings, "LTI13_CLIENT_ID", "client-123"),
     ):
-        redirect = await lti13.lti13_login(
+        redirect = await lti13.lti13_login_post(
+            db=MagicMock(),
             request=_mock_request(
                 method="POST",
                 form={"iss": "https://moodle.example.com", "client_id": "client-123"},
@@ -72,12 +85,12 @@ async def test_lti13_login_accepts_post_from_moodle():
 
 
 async def test_lti13_login_warns_on_client_id_mismatch_but_still_redirects():
-    lti13._nonce_store.clear()
     with (
         patch.object(settings, "LTI13_PLATFORM_ISSUER", "https://moodle.example.com"),
         patch.object(settings, "LTI13_CLIENT_ID", "configured-client"),
     ):
-        redirect = await lti13.lti13_login(
+        redirect = await lti13.lti13_login_get(
+            db=MagicMock(),
             request=_mock_login_request(
                 iss="https://moodle.example.com",
                 client_id="different-client",
@@ -88,7 +101,7 @@ async def test_lti13_login_warns_on_client_id_mismatch_but_still_redirects():
 
 async def test_lti13_login_requires_iss():
     with pytest.raises(HTTPException) as exc_info:
-        await lti13.lti13_login(request=_mock_login_request(iss=None))
+        await lti13.lti13_login_get(request=_mock_login_request(iss=None), db=MagicMock())
     assert exc_info.value.status_code == 400
 
 
@@ -110,19 +123,18 @@ async def test_lti13_launch_rejects_expired_or_unknown_state():
         cookies={"lti13_state": "known-state"},
         form={"id_token": "tok", "state": "known-state"},
     )
-    lti13._nonce_store.clear()  # state was never stored via /login
-    with pytest.raises(HTTPException) as exc_info:
+    with _known_state(None), pytest.raises(HTTPException) as exc_info:  # never stored via /login
         await lti13.lti13_launch(request=request, db=MagicMock())
     assert exc_info.value.status_code == 400
 
 
 async def test_lti13_launch_rejects_when_not_configured():
-    lti13._store_nonce("known-state", "nonce-1")
     request = _mock_request(
         cookies={"lti13_state": "known-state"},
         form={"id_token": "tok", "state": "known-state"},
     )
     with (
+        _known_state(),
         patch.object(settings, "LTI13_CLIENT_ID", ""),
         pytest.raises(HTTPException) as exc_info,
     ):
@@ -131,12 +143,12 @@ async def test_lti13_launch_rejects_when_not_configured():
 
 
 async def test_lti13_launch_rejects_invalid_id_token():
-    lti13._store_nonce("known-state", "nonce-1")
     request = _mock_request(
         cookies={"lti13_state": "known-state"},
         form={"id_token": "tok", "state": "known-state"},
     )
     with (
+        _known_state(),
         patch.object(settings, "LTI13_CLIENT_ID", "client-123"),
         patch.object(lti13.lti13_service, "validate_id_token", side_effect=ValueError("bad token")),
         pytest.raises(HTTPException) as exc_info,
@@ -146,12 +158,12 @@ async def test_lti13_launch_rejects_invalid_id_token():
 
 
 async def test_lti13_launch_rejects_missing_email_claim():
-    lti13._store_nonce("known-state", "nonce-1")
     request = _mock_request(
         cookies={"lti13_state": "known-state"},
         form={"id_token": "tok", "state": "known-state"},
     )
     with (
+        _known_state(),
         patch.object(settings, "LTI13_CLIENT_ID", "client-123"),
         patch.object(lti13.lti13_service, "validate_id_token", return_value={}),
         patch.object(
@@ -166,7 +178,6 @@ async def test_lti13_launch_rejects_missing_email_claim():
 
 
 async def test_lti13_launch_creates_new_user_and_course_jit():
-    lti13._store_nonce("known-state", "nonce-1")
     request = _mock_request(
         cookies={"lti13_state": "known-state"},
         form={"id_token": "tok", "state": "known-state"},
@@ -183,6 +194,7 @@ async def test_lti13_launch_creates_new_user_and_course_jit():
     db.refresh.side_effect = _refresh
 
     with (
+        _known_state(),
         patch.object(settings, "LTI13_CLIENT_ID", "client-123"),
         patch.object(settings, "APP_BASE_URL", "https://app.example.com"),
         patch.object(settings, "LTI13_SESSION_SECRET", "test-secret"),
@@ -201,12 +213,21 @@ async def test_lti13_launch_creates_new_user_and_course_jit():
         response = await lti13.lti13_launch(request=request, db=db)
 
     assert response.status_code == 200
-    assert "session_token=" in response.body.decode()
+    target = re.search(r'window\.location\.href = "([^"]+)"', response.body.decode()).group(1)
+    url = urllib.parse.urlsplit(target)
+    # The session travels in the fragment, which no browser sends to a
+    # server: nothing in the query, so nothing in access logs or Referer.
+    assert f"{url.scheme}://{url.netloc}" == "https://app.example.com"
+    assert url.query == ""
+    handoff = urllib.parse.parse_qs(url.fragment)
+    # Only what the frontend reads; name and course come from /users/me.
+    assert set(handoff) == {"lti", "email", "role", "session_token"}
+    assert handoff["email"] == ["new@example.com"]
+    assert lti13.lti13_service.verify_session_token(handoff["session_token"][0], "test-secret") == "new@example.com"
     assert db.add.call_count == 2  # course + user
 
 
 async def test_lti13_launch_promotes_existing_user_and_updates_course():
-    lti13._store_nonce("known-state", "nonce-1")
     request = _mock_request(
         cookies={"lti13_state": "known-state"},
         form={"id_token": "tok", "state": "known-state"},
@@ -220,6 +241,7 @@ async def test_lti13_launch_promotes_existing_user_and_updates_course():
     ]
 
     with (
+        _known_state(),
         patch.object(settings, "LTI13_CLIENT_ID", "client-123"),
         patch.object(settings, "LTI13_SESSION_SECRET", "test-secret"),
         patch.object(lti13.lti13_service, "validate_id_token", return_value={}),

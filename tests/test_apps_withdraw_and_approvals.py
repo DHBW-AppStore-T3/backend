@@ -19,7 +19,7 @@ from app.database import get_db
 from app.main import app as fastapi_app
 from app.models import User, UserRole
 from app.utils.keycloak_auth import get_current_user_keycloak
-from tests.conftest import TestingSessionLocal, create_app_in_db
+from tests.conftest import FakeGitRemote, TestingSessionLocal, create_app_in_db
 
 
 # ----------------------------------------------------------------
@@ -66,7 +66,7 @@ def _override_user(user: User) -> None:
 @pytest.mark.integration
 def test_owner_can_withdraw_pending_version(client, mock_user, db):
     app_obj = create_app_in_db(db, mock_user)
-    crud_approvals.submit_version(db, app_obj.appId, "v1.0")
+    crud_approvals.submit_version(db, app_obj.appId, "v1.0", FakeGitRemote.sha_for("v1.0"))
 
     resp = client.delete(f"/apps/{app_obj.appId}/versions/v1.0/submit")
     assert resp.status_code == 204
@@ -79,7 +79,7 @@ def test_owner_can_withdraw_pending_version(client, mock_user, db):
 @pytest.mark.integration
 def test_owner_cannot_withdraw_approved_version_409(client, mock_user, mock_admin, db):
     app_obj = create_app_in_db(db, mock_user)
-    crud_approvals.submit_version(db, app_obj.appId, "v1.0")
+    crud_approvals.submit_version(db, app_obj.appId, "v1.0", FakeGitRemote.sha_for("v1.0"))
     crud_approvals.approve(db, app_obj.appId, "v1.0", mock_admin.userId)
 
     resp = client.delete(f"/apps/{app_obj.appId}/versions/v1.0/submit")
@@ -91,7 +91,7 @@ def test_non_owner_teacher_cannot_withdraw_403(client, mock_user, db):
     """Bug #2 Regression: ein Teacher darf eine fremde App nicht
     withdrawen — nur Owner oder Admin."""
     app_obj = create_app_in_db(db, mock_user)
-    crud_approvals.submit_version(db, app_obj.appId, "v1.0")
+    crud_approvals.submit_version(db, app_obj.appId, "v1.0", FakeGitRemote.sha_for("v1.0"))
 
     # Aktiven User auf einen anderen Teacher umstellen
     other = _make_other_teacher(db)
@@ -110,7 +110,7 @@ def test_non_owner_teacher_cannot_withdraw_403(client, mock_user, db):
 @pytest.mark.integration
 def test_admin_can_force_withdraw(admin_client, mock_user, db):
     app_obj = create_app_in_db(db, mock_user)
-    crud_approvals.submit_version(db, app_obj.appId, "v1.0")
+    crud_approvals.submit_version(db, app_obj.appId, "v1.0", FakeGitRemote.sha_for("v1.0"))
 
     resp = admin_client.delete(f"/apps/{app_obj.appId}/versions/v1.0/submit")
     assert resp.status_code == 204
@@ -134,9 +134,9 @@ def test_withdraw_unknown_version_404(client, mock_user, db):
 @pytest.mark.integration
 def test_list_version_approvals_returns_history_owner(client, mock_user, mock_admin, db):
     app_obj = create_app_in_db(db, mock_user)
-    crud_approvals.submit_version(db, app_obj.appId, "v1.0")
+    crud_approvals.submit_version(db, app_obj.appId, "v1.0", FakeGitRemote.sha_for("v1.0"))
     crud_approvals.reject(db, app_obj.appId, "v1.0", mock_admin.userId, "fix me")
-    crud_approvals.submit_version(db, app_obj.appId, "v2.0")
+    crud_approvals.submit_version(db, app_obj.appId, "v2.0", FakeGitRemote.sha_for("v2.0"))
 
     resp = client.get(f"/apps/{app_obj.appId}/versions")
     assert resp.status_code == 200
@@ -149,9 +149,9 @@ def test_list_version_approvals_returns_history_owner(client, mock_user, mock_ad
 @pytest.mark.integration
 def test_list_version_approvals_admin_sees_full_history(admin_client, mock_user, mock_admin, db):
     app_obj = create_app_in_db(db, mock_user, is_private=True)
-    crud_approvals.submit_version(db, app_obj.appId, "v1.0")
+    crud_approvals.submit_version(db, app_obj.appId, "v1.0", FakeGitRemote.sha_for("v1.0"))
     crud_approvals.approve(db, app_obj.appId, "v1.0", mock_admin.userId)
-    crud_approvals.submit_version(db, app_obj.appId, "v2.0")
+    crud_approvals.submit_version(db, app_obj.appId, "v2.0", FakeGitRemote.sha_for("v2.0"))
 
     resp = admin_client.get(f"/apps/{app_obj.appId}/versions")
     assert resp.status_code == 200
@@ -164,7 +164,7 @@ def test_list_version_approvals_admin_sees_full_history(admin_client, mock_user,
 @pytest.mark.integration
 def test_list_version_approvals_student_403_for_private_app(student_client, mock_user, db):
     app_obj = create_app_in_db(db, mock_user, is_private=True)
-    crud_approvals.submit_version(db, app_obj.appId, "v1.0")
+    crud_approvals.submit_version(db, app_obj.appId, "v1.0", FakeGitRemote.sha_for("v1.0"))
 
     resp = student_client.get(f"/apps/{app_obj.appId}/versions")
     assert resp.status_code == 403
@@ -179,7 +179,7 @@ def test_list_version_approvals_student_403_even_for_public_approved_app(
     Selbst eine public+approved App liefert für Studenten 403 zurück —
     Version-History gehört nicht in den Storefront-View."""
     app_obj = create_app_in_db(db, mock_user, is_private=False)
-    crud_approvals.submit_version(db, app_obj.appId, "v1.0")
+    crud_approvals.submit_version(db, app_obj.appId, "v1.0", FakeGitRemote.sha_for("v1.0"))
     crud_approvals.approve(db, app_obj.appId, "v1.0", mock_admin.userId)
 
     resp = student_client.get(f"/apps/{app_obj.appId}/versions")

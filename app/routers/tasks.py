@@ -5,11 +5,12 @@ Read-only access to task information for a deployment. Tasks are created by the
 deployment flow itself; this router exposes status and details so the frontend
 can render progress.
 
-Every endpoint enforces ``ensure_deployment_access`` (to prevent IDOR) plus
-``ensure_view_deployment_owner``, so only the deployment creator, admins, and
-the course-teacher of the deployment owner's course can read task logs — which
-contain Terraform outputs, IPs, and worker stack traces. Members get a 403 even
-though they can read deployment metadata.
+Every endpoint enforces ``ensure_view_deployment_owner`` (which also prevents
+IDOR), so only the deployment creator, admins, and the course-teacher of a
+student owner's course can read task logs — which
+contain IPs and worker stack traces. Members get a 403 even though they can
+read deployment metadata. No endpoint returns a task's Terraform state or
+outputs (.github#7 E).
 """
 
 from uuid import UUID
@@ -20,13 +21,17 @@ from sqlalchemy.orm import Session
 from app.crud import deployments as crud_deployments
 from app.crud import tasks as crud_tasks
 from app.database import get_db
-from app.models import User
+from app.models import Task, User
 from app.schemas import TaskResponse
 from app.utils.capabilities import ensure_view_deployment_owner
 from app.utils.keycloak_auth import get_current_user_keycloak
-from app.utils.permissions import ensure_deployment_access
 
 router = APIRouter()
+
+
+def _task_response(task: Task) -> TaskResponse:
+    """The task without its state and outputs (.github#7 E)."""
+    return TaskResponse.model_validate(task)
 
 
 @router.get("/deployment/{deployment_id}", response_model=list[TaskResponse])
@@ -42,9 +47,8 @@ def get_deployment_tasks(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Deployment not found",
         )
-    ensure_deployment_access(deployment, current_user, db)
     ensure_view_deployment_owner(current_user, deployment, db)
-    return crud_tasks.get_tasks(db, deployment_id=deployment_id)
+    return [_task_response(task) for task in crud_tasks.get_tasks(db, deployment_id=deployment_id)]
 
 
 @router.get("/{task_id}", response_model=TaskResponse)
@@ -66,6 +70,5 @@ def get_task(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Deployment for task not found",
         )
-    ensure_deployment_access(deployment, current_user, db)
     ensure_view_deployment_owner(current_user, deployment, db)
-    return task
+    return _task_response(task)

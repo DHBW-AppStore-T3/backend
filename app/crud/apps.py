@@ -157,3 +157,20 @@ def soft_delete_app(db: Session, app_id: UUID) -> bool:
     db_app.deleted_at = utcnow()
     db.commit()
     return True
+
+
+def set_hidden_by_admin(db: Session, app_id: UUID, hidden: bool) -> App | None:
+    """Set or lift an admin's deactivation of the app and commit; None if it does not exist.
+
+    Setting it also makes the app private; lifting it leaves ``is_private``
+    to the caller. Soft-deleted apps are included.
+    """
+    db_app = get_app(db, app_id, include_deleted=True)
+    if not db_app:
+        return None
+    db_app.hidden_by_admin = hidden
+    if hidden:
+        db_app.is_private = True
+    db.commit()
+    db.refresh(db_app)
+    return db_app

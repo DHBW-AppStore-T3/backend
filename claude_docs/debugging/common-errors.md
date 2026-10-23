@@ -21,6 +21,14 @@ einer expliziten `:? is required`-Fehlermeldung ab (siehe
 Worker unterschiedliche Werte haben, startet zwar beides, aber jede
 Entschlüsselung schlägt zur Laufzeit fehl.
 
+Task-Ergebnisse (`tasks.outputs_enc`) haben einen eigenen Schlüssel,
+`RESULTS_ENCRYPTION_KEY` (API, VM-Executor und Pod-Deployer; der
+Pod-Deployer bekommt nur ihn, in Kubernetes ohne den Credential-Key).
+Ohne ihn versiegelt der Credential-Key wie bisher; Ergebnisse, die mit
+ihm versiegelt wurden, öffnet die API weiterhin. In Produktion darf er
+nicht gleich dem Credential-Key sein. Hat ein Worker einen anderen
+Ergebnis-Schlüssel als die API, zeigt die API keine Outputs dieser Tasks.
+
 ## CORS_ORIGINS
 
 Stand 2026-09-15 gab es einen Merge-Konflikt zwischen zwei Remotes zum
