@@ -310,3 +310,13 @@ def test_requests_above_limits_are_rejected():
     bad["workload"]["containers"][0]["resources"] = {"cpu": "500m", "memory": "1Gi", "requests": {"cpu": "1", "memory": "1Gi"}}
     with pytest.raises(SpecValidationError, match="requests.cpu"):
         parse_spec(bad)
+
+
+def test_exposed_container_has_tcp_readiness_probe_on_named_port():
+    _, objs, _ = build()
+    for sts in of_kind(objs, "StatefulSet"):
+        for c in sts["spec"]["template"]["spec"]["containers"]:
+            if any(p["name"] == "http" for p in c.get("ports", [])):
+                assert c["readinessProbe"]["tcpSocket"] == {"port": "http"}
+            else:
+                assert "readinessProbe" not in c

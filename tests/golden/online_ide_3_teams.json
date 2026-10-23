@@ -305,6 +305,14 @@
                   "protocol": "TCP"
                 }
               ],
+              "readinessProbe": {
+                "failureThreshold": 3,
+                "periodSeconds": 3,
+                "tcpSocket": {
+                  "port": "http"
+                },
+                "timeoutSeconds": 2
+              },
               "resources": {
                 "limits": {
                   "cpu": "500m",
@@ -557,6 +565,14 @@
                   "protocol": "TCP"
                 }
               ],
+              "readinessProbe": {
+                "failureThreshold": 3,
+                "periodSeconds": 3,
+                "tcpSocket": {
+                  "port": "http"
+                },
+                "timeoutSeconds": 2
+              },
               "resources": {
                 "limits": {
                   "cpu": "500m",
@@ -809,6 +825,14 @@
                   "protocol": "TCP"
                 }
               ],
+              "readinessProbe": {
+                "failureThreshold": 3,
+                "periodSeconds": 3,
+                "tcpSocket": {
+                  "port": "http"
+                },
+                "timeoutSeconds": 2
+              },
               "resources": {
                 "limits": {
                   "cpu": "500m",
@@ -1061,6 +1085,14 @@
                   "protocol": "TCP"
                 }
               ],
+              "readinessProbe": {
+                "failureThreshold": 3,
+                "periodSeconds": 3,
+                "tcpSocket": {
+                  "port": "http"
+                },
+                "timeoutSeconds": 2
+              },
               "resources": {
                 "limits": {
                   "cpu": "500m",
@@ -1313,6 +1345,14 @@
                   "protocol": "TCP"
                 }
               ],
+              "readinessProbe": {
+                "failureThreshold": 3,
+                "periodSeconds": 3,
+                "tcpSocket": {
+                  "port": "http"
+                },
+                "timeoutSeconds": 2
+              },
               "resources": {
                 "limits": {
                   "cpu": "500m",
@@ -1565,6 +1605,14 @@
                   "protocol": "TCP"
                 }
               ],
+              "readinessProbe": {
+                "failureThreshold": 3,
+                "periodSeconds": 3,
+                "tcpSocket": {
+                  "port": "http"
+                },
+                "timeoutSeconds": 2
+              },
               "resources": {
                 "limits": {
                   "cpu": "500m",
