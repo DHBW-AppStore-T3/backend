@@ -10,6 +10,7 @@ variables. Ported from the pod MVP.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -19,7 +20,14 @@ from typing import Any
 from fastapi import HTTPException, status
 
 from app.config import settings
-from app.k8s.spec import AppSpec, PlatformLimits, SpecValidationError, limits_from, parse_spec
+from app.k8s.spec import (
+    AppSpec,
+    PlatformLimits,
+    SpecValidationError,
+    apply_resource_overrides,
+    limits_from,
+    parse_spec,
+)
 from app.models import RUNTIME_K8S, RUNTIME_VM
 
 SPEC_FILE = "appstore.yaml"
@@ -43,7 +51,10 @@ class LoadedSpec:
 def platform_limits() -> PlatformLimits:
     """Limits from the settings (``APP_IMAGE_REGISTRY_ALLOWLIST``, ``APP_MAX_*``)."""
     return limits_from(
-        settings.APP_IMAGE_REGISTRY_ALLOWLIST, settings.APP_MAX_CPU, settings.APP_MAX_MEMORY, settings.APP_MAX_STORAGE
+        settings.APP_IMAGE_REGISTRY_ALLOWLIST,
+        settings.APP_MAX_CPU,
+        settings.APP_MAX_MEMORY,
+        settings.APP_MAX_STORAGE,
     )
 
 
@@ -54,10 +65,41 @@ def parse_checked(raw: bytes) -> LoadedSpec:
     except SpecValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"reason": "invalid_app_spec", "message": "appstore.yaml is invalid", "errors": exc.errors},
+            detail={
+                "reason": "invalid_app_spec",
+                "message": "appstore.yaml is invalid",
+                "errors": exc.errors,
+            },
         ) from exc
-    digests = tuple(sorted({c.image.split("@", 1)[1] for c in spec.workload.containers})) if spec.workload else ()
+    digests = (
+        tuple(sorted({c.image.split("@", 1)[1] for c in spec.workload.containers}))
+        if spec.workload
+        else ()
+    )
     return LoadedSpec(spec=spec, sha256=hashlib.sha256(raw).hexdigest(), image_digests=digests)
+
+
+def with_resource_overrides(loaded: LoadedSpec, overrides: Any) -> LoadedSpec:
+    """``loaded`` with the cpu/memory a person chose in the wizard (``userInputVar.resources``).
+
+    Only the job gets the changed spec; hash and digests stay those of the
+    reviewed file, which is why the approval still matches. 422 with one field
+    path per problem.
+    """
+    if not overrides:
+        return loaded
+    try:
+        spec = apply_resource_overrides(loaded.spec, overrides, platform_limits())
+    except SpecValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "reason": "invalid_resources",
+                "message": "resources are invalid",
+                "errors": exc.errors,
+            },
+        ) from exc
+    return dataclasses.replace(loaded, spec=spec)
 
 
 def read_spec_from_repo(repo_path: str) -> LoadedSpec | None:

@@ -45,6 +45,7 @@ from app.schemas import (
 )
 from app.services import (
     access,
+    app_spec,
     k8s_status,
     openstack_client,
     task_events,
@@ -460,6 +461,8 @@ def create_deployment(
     workloads = None
     if is_pods:
         _check_pod_files(loaded_spec, deployment.userInputVar)
+        # What the person chose for cpu/memory (only where the app allows it).
+        loaded_spec = app_spec.with_resource_overrides(loaded_spec, deployment.userInputVar.get("resources"))
         workloads = _check_pod_workloads(db, current_user, loaded_spec, deployment.teams or [])
 
     db_deployment = crud_deployments.create_deployment(

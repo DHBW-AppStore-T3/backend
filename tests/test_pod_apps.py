@@ -187,6 +187,7 @@ def test_runtime_of_a_vm_app(client, db, mock_user, fake_git):
         "scope": None,
         "egress": None,
         "access": [],
+        "resources": [],
     }
 
 
@@ -721,3 +722,76 @@ def test_the_detail_carries_permissions_and_allowed_actions(client, db, mock_use
     assert set(owner_view["actions"]) == {"destroy", "pause", "redeploy"}
     assert member_view["permissions"] == {"owner_view": False, "operate": False, "member": True}
     assert member_view["actions"] == []
+
+
+# ----------------------------------------------------------------
+# cpu/memory chosen in the wizard (resourceBounds)
+# ----------------------------------------------------------------
+def _tunable_spec():
+    spec = copy.deepcopy(SPEC)
+    c = spec["workload"]["containers"][0]
+    c["resources"] = {"cpu": "1", "memory": "1Gi"}
+    c["resourceBounds"] = {"cpu": {"min": "500m", "max": "2"}, "memory": {"min": "1Gi", "max": "4Gi"}}
+    return spec
+
+
+def _deploy_with_resources(client, app, resources, teams):
+    body = {
+        "name": "d",
+        "appId": str(app.appId),
+        "releaseTag": "v1.0",
+        "teams": teams,
+        "userInputVar": {"resources": resources},
+    }
+    return client.post("/deployments/", json=body)
+
+
+def test_the_runtime_offers_the_resource_choices(client, db, mock_user, pod_repo):
+    pod_repo(_tunable_spec())
+    app = _app(db, mock_user)
+    response = client.get(f"/apps/{app.appId}/runtime", params={"version": "v1.0"})
+    assert response.status_code == 200, response.text
+    assert response.json()["resources"] == [
+        {
+            "container": "ide",
+            "cpu": {"default": "1", "min": "500m", "max": "2"},
+            "memory": {"default": "1Gi", "min": "1Gi", "max": "4Gi"},
+        }
+    ]
+
+
+def test_a_chosen_size_reaches_the_job_but_not_the_review(client, db, mock_user, pod_repo, sent):
+    pod_repo(_tunable_spec())
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+
+    response = _deploy_with_resources(client, app, {"ide": {"cpu": "2", "memory": "3Gi"}}, [_team("T", alice)])
+
+    assert response.status_code == 201, response.text
+    _, kwargs = _job(sent)
+    assert kwargs["spec"]["workload"]["containers"][0]["resources"] == {"cpu": "2", "memory": "3Gi"}
+
+
+def test_a_size_outside_the_bounds_is_refused(client, db, mock_user, pod_repo, sent):
+    pod_repo(_tunable_spec())
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+
+    response = _deploy_with_resources(client, app, {"ide": {"memory": "64Gi"}}, [_team("T", alice)])
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["reason"] == "invalid_resources"
+    sent.assert_not_called()
+
+
+def test_an_app_without_bounds_ignores_no_choice(client, db, mock_user, pod_repo, sent):
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+
+    response = _deploy_with_resources(client, app, {"ide": {"cpu": "1"}}, [_team("T", alice)])
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["errors"][0]["msg"] == "this container's resources cannot be changed"
