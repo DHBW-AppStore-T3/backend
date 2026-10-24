@@ -75,7 +75,7 @@ from app.task_contract import (
     TERMINAL_EVENTS,
     terminal_payload,
 )
-from app.utils import crypto
+from app.utils import crypto, rate_limit
 from app.utils.capabilities import (
     can_operate_deployment,
     can_view_deployment_owner,
@@ -343,7 +343,12 @@ def get_deployment(
 # ----------------------------------------------------------------
 # CREATE DEPLOYMENT
 # ----------------------------------------------------------------
-@router.post("/", response_model=DeploymentResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/",
+    response_model=DeploymentResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(rate_limit.DEPLOY)],
+)
 def create_deployment(
     deployment: DeploymentCreate,
     db: Session = Depends(get_db),
