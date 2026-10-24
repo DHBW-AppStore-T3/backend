@@ -90,6 +90,7 @@ class CourseMembersUpdate(BaseModel):
     user-id whose FK is (re-)pointed to this course; an existing
     enrollment on another course is overwritten.
     """
+
     userIds: list[UUID] = []
 
 
@@ -225,6 +226,7 @@ class DeploymentFileUpload(BaseModel):
     ``content_b64`` MUST be standard (RFC 4648) base64. The value sent
     to Terraform stays base64 for cloud-init's ``encoding: b64``.
     """
+
     name: str
     content_b64: str
     size: int
@@ -311,6 +313,7 @@ class TaskSummary(BaseModel):
 # Terraform outputs parsed
 class DeploymentOutputs(BaseModel):
     """Parsed Terraform outputs - structure depends on app"""
+
     raw: dict[str, Any] | None = None  # Full outputs as dict
 
     model_config = ConfigDict(from_attributes=True)
@@ -330,6 +333,7 @@ class MyAccessResponse(BaseModel):
     unchanged. Empty maps mean "no credentials yet" (no successful deploy,
     or the app issued no per-user account) — a valid 200, not an error.
     """
+
     user_accounts: dict[str, dict[str, Any]] = {}
     team_vms: dict[str, dict[str, Any]] = {}
 
@@ -344,6 +348,7 @@ class DeploymentPermissions(BaseModel):
     cancel and team changes. ``member``: the caller is in one of its teams
     and gets their own access through ``my-access``.
     """
+
     owner_view: bool = False
     operate: bool = False
     member: bool = False
@@ -352,6 +357,7 @@ class DeploymentPermissions(BaseModel):
 # Full deployment detail response
 class DeploymentDetail(DeploymentWithRelations):
     """Full deployment details with teams, task info, and outputs"""
+
     teams: list[DeploymentTeamResponse] = []
     latest_task: TaskSummary | None = None
     outputs: DeploymentOutputs | None = None
@@ -383,6 +389,7 @@ class LifecycleStatesSchema(BaseModel):
     renders a pill from ``status`` + ``task_state`` and shows
     ``fault_message`` as a banner when ``status == "ERROR"``.
     """
+
     status: str | None = None
     task_state: str | None = None
     vm_state: str | None = None
@@ -443,6 +450,7 @@ class DeploymentResourceSchema(BaseModel):
     ``display_name``; the instance-only fields stay ``None`` /
     empty list.
     """
+
     address: str
     type: str
     category: str
@@ -461,8 +469,18 @@ class DeploymentResourceSchema(BaseModel):
     metadata: dict[str, str] | None = None
 
 
+class PodSetupProgress(BaseModel):
+    """What an app reports about its first-start setup (an ``appstore-progress`` log line)."""
+
+    percent: int
+    step: str | None = None
+    # Seconds the app expects to need still; null when it cannot tell yet.
+    etaSeconds: int | None = None
+
+
 class PodWorkloadSchema(BaseModel):
     """One workload of a pod deployment, read live from the cluster (.github#4)."""
+
     workload: str
     team: str | None = None
     # ``scope: user``: whose workload it is.
@@ -472,11 +490,14 @@ class PodWorkloadSchema(BaseModel):
     phase: str
     url: str | None = None
     lastEvent: str | None = None
+    # Set while the app runs a setup of its own (an installer) after it started.
+    setup: PodSetupProgress | None = None
 
 
 class DeploymentResourceListResponse(BaseModel):
     """Wrap the list in an object so we can add cursor/refresh-stamp
     metadata later without a breaking API change."""
+
     resources: list[DeploymentResourceSchema]
     # True when the response was fetched with live OpenStack join.
     # False means the caller passed ``?refresh=false`` and the
@@ -504,6 +525,7 @@ class TaskBase(BaseModel):
     current_phase: str | None = None
     progress_pct: int | None = None
 
+
 class TaskCreate(TaskBase):
     pass
 
@@ -517,6 +539,7 @@ class TaskUpdate(BaseModel):
     outputs: str | None = None
     current_phase: str | None = None
     progress_pct: int | None = None
+
 
 class TaskResponse(BaseModel):
     """A task as the task API shows it to the owner view.
@@ -591,6 +614,7 @@ class UserStatistics(BaseModel):
 # ----------------------------------------------------------------
 class OpenStackCredentialBase(BaseModel):
     """Non-secret connection metadata. Mirrors the `clouds.yaml` shape."""
+
     auth_type: OpenStackAuthType
     auth_url: str
     region_name: str | None = None
@@ -609,6 +633,7 @@ class OpenStackCredentialUpsert(OpenStackCredentialBase):
     application-credential ID. `secret` is the corresponding password or
     application-credential secret. Both are stored encrypted at rest.
     """
+
     identifier: str = Field(..., min_length=1, description="username OR application-credential ID")
     secret: str = Field(..., min_length=1, description="password OR application-credential secret")
 
@@ -626,9 +651,11 @@ class OpenStackCredentialUpsert(OpenStackCredentialBase):
 
 class OpenStackCredentialFromYaml(BaseModel):
     """Convenience body: paste/upload a `clouds.yaml` and let the server pick it apart."""
+
     clouds_yaml: str = Field(..., min_length=1, description="raw clouds.yaml file contents")
     cloud_name: str | None = Field(
-        None, description="Pick a specific cloud from the YAML; required when there is more than one"
+        None,
+        description="Pick a specific cloud from the YAML; required when there is more than one",
     )
 
 
@@ -643,6 +670,7 @@ class OpenStackCredentialResponse(BaseModel):
     whose project is still unknown); deleting the credential is refused
     while there are any, so they cannot be orphaned.
     """
+
     credentialId: UUID
     auth_type: OpenStackAuthType
     auth_url: str
