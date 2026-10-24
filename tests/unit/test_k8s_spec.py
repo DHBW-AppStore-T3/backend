@@ -235,3 +235,85 @@ def test_mounts_at_the_same_path_are_rejected():
         d["variables"].append({**d["variables"][0], "name": "second_zip"})
 
     assert any("distinct" in m for m in errors_of(spec_with(two_files)).values())
+
+
+# ----------------------------------------------------------------
+# resourceBounds / apply_resource_overrides (opt-in cpu/memory choice)
+# ----------------------------------------------------------------
+def _tunable(**bounds):
+    spec = copy.deepcopy(VALID)
+    c = spec["workload"]["containers"][0]
+    c["resources"] = {"cpu": "2", "memory": "4Gi", "requests": {"cpu": "500m", "memory": "1Gi"}}
+    c["resourceBounds"] = bounds or {"cpu": {"min": "1", "max": "4"}, "memory": {"min": "2Gi", "max": "8Gi"}}
+    return spec
+
+
+BIG = PlatformLimits(max_cpu_millicores=4000, max_memory_mib=8192)
+
+
+def test_the_default_must_lie_within_the_bounds():
+    spec = _tunable(cpu={"min": "3", "max": "4"}, memory={"min": "2Gi", "max": "8Gi"})
+    with pytest.raises(SpecValidationError, match="resources.cpu"):
+        parse_spec(spec, BIG)
+
+
+def test_bounds_may_not_exceed_the_platform_limits():
+    with pytest.raises(SpecValidationError) as exc:
+        parse_spec(_tunable(), PlatformLimits(max_cpu_millicores=2000, max_memory_mib=4096))
+    assert {e["loc"] for e in exc.value.errors} == {
+        "workload.containers[0].resourceBounds.cpu.max",
+        "workload.containers[0].resourceBounds.memory.max",
+    }
+
+
+def test_a_choice_replaces_the_limits_and_scales_the_requests():
+    from app.k8s.spec import apply_resource_overrides
+
+    spec = parse_spec(_tunable(), BIG)
+    out = apply_resource_overrides(spec, {"ide": {"cpu": "4", "memory": "8Gi"}}, BIG)
+    r = out.workload.containers[0].resources
+    assert (r.cpu, r.memory) == ("4", "8Gi")
+    assert (r.requests.cpu, r.requests.memory) == ("1", "2Gi")
+    # the reviewed spec is untouched
+    assert spec.workload.containers[0].resources.cpu == "2"
+
+
+@pytest.mark.parametrize(
+    ("choice", "loc"),
+    [
+        ({"ide": {"cpu": "8"}}, "resources.ide.cpu"),
+        ({"ide": {"memory": "512Mi"}}, "resources.ide.memory"),
+        ({"ide": {"cpu": "lots"}}, "resources.ide"),
+        ({"ide": {"disk": "1Gi"}}, "resources.ide"),
+        ({"other": {"cpu": "2"}}, "resources.other"),
+    ],
+)
+def test_a_choice_outside_the_bounds_is_refused(choice, loc):
+    from app.k8s.spec import apply_resource_overrides
+
+    spec = parse_spec(_tunable(), BIG)
+    with pytest.raises(SpecValidationError) as exc:
+        apply_resource_overrides(spec, choice, BIG)
+    assert exc.value.errors[0]["loc"] == loc
+
+
+def test_a_container_without_bounds_cannot_be_changed():
+    from app.k8s.spec import apply_resource_overrides
+
+    spec = parse_spec(VALID)
+    with pytest.raises(SpecValidationError, match="cannot be changed"):
+        apply_resource_overrides(spec, {"ide": {"cpu": "1"}})
+
+
+def test_resource_choices_list_default_and_range():
+    from app.k8s.spec import resource_choices
+
+    spec = parse_spec(_tunable(), BIG)
+    assert resource_choices(spec, PlatformLimits(max_cpu_millicores=3000, max_memory_mib=8192)) == [
+        {
+            "container": "ide",
+            "cpu": {"default": "2", "min": "1", "max": "3"},
+            "memory": {"default": "4Gi", "min": "2Gi", "max": "8Gi"},
+        }
+    ]
+    assert resource_choices(parse_spec(VALID)) == []

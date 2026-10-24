@@ -16,6 +16,7 @@ from app.crud import app_version_approvals as crud_approvals
 from app.crud import apps as crud_apps
 from app.database import get_db
 from app.git_urls import GitHostNotAllowed
+from app.k8s.spec import resource_choices
 from app.models import RUNTIME_K8S, RUNTIME_VM, User, UserRole
 from app.schemas import (
     AppCreate,
@@ -496,6 +497,9 @@ class AppRuntimeResponse(BaseModel):
     scope: str | None = None
     egress: str | None = None
     access: list[dict[str, Any]] = []
+    # Containers whose cpu/memory a person may choose (``resourceBounds``):
+    # default and range, so the wizard can offer them.
+    resources: list[dict[str, Any]] = []
 
 
 @router.get("/{app_id}/runtime", response_model=AppRuntimeResponse)
@@ -529,6 +533,7 @@ def get_app_runtime(
         scope=loaded.spec.scope,
         egress=loaded.spec.egress,
         access=[a.model_dump(by_alias=True, exclude_none=True) for a in loaded.spec.access],
+        resources=resource_choices(loaded.spec, app_spec.platform_limits()),
     )
 
 
