@@ -131,6 +131,15 @@ class Settings(BaseSettings):
     LTI13_REDIRECT_URI: str = "http://localhost:8000/lti13/launch"
     LTI13_SESSION_SECRET: str = "change-me-in-production"
 
+    # Skip real OpenStack calls: credential validation is a no-op and the
+    # resource endpoints return static dummy data. Only allowed in development.
+    OPENSTACK_SIMULATE: bool = False
+
+    # Self-service-ui handoff (POST /handoff/mint). Own secret, independent
+    # of LTI13_SESSION_SECRET — a compromised LTI secret must not also open
+    # the self-service handoff path.
+    HANDOFF_SESSION_SECRET: str = "change-me-in-production"
+
     @property
     def is_development(self) -> bool:
         return self.APP_ENV == "development"
@@ -167,6 +176,8 @@ class Settings(BaseSettings):
             self.LTI13_SESSION_SECRET in _PLACEHOLDER_SECRETS or len(self.LTI13_SESSION_SECRET) < 32
         ):
             problems.append("LTI13_SESSION_SECRET must be a random secret of at least 32 characters")
+        if self.OPENSTACK_SIMULATE:
+            problems.append("OPENSTACK_SIMULATE must not be set in production")
         if problems:
             raise ValueError("unsafe production configuration: " + "; ".join(problems))
         return self
