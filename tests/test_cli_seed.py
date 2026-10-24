@@ -76,6 +76,69 @@ def test_seed_does_not_touch_existing_data(db, pod_repo):
     assert db.query(App).one().description == "edited by hand"
 
 
+def _approval(db):
+    db.expire_all()
+    return db.query(AppVersionApproval).one()
+
+
+def test_seed_never_approves_again_what_an_admin_rejected_or_revoked(db, pod_repo):
+    cli.seed(db, CFG, _realm())
+    _approval(db).status = AppVersionApprovalStatus.REJECTED  # what crud.revoke does
+    db.commit()
+
+    cli.seed(db, CFG, _realm())
+
+    assert _approval(db).status == AppVersionApprovalStatus.REJECTED
+
+
+def test_seed_leaves_somebody_elses_submission_to_its_review(db, pod_repo):
+    cli.seed(db, CFG, _realm())
+    approval = _approval(db)
+    approval.status, approval.notes = AppVersionApprovalStatus.PENDING, "please review"
+    db.commit()
+
+    cli.seed(db, CFG, _realm())
+
+    assert _approval(db).status == AppVersionApprovalStatus.PENDING
+
+
+def test_seed_finishes_its_own_submission_of_an_earlier_run(db, pod_repo):
+    cli.seed(db, CFG, _realm())
+    approval = _approval(db)
+    approval.status, approval.notes = AppVersionApprovalStatus.PENDING, cli.SEED_NOTE
+    db.commit()
+
+    cli.seed(db, CFG, _realm())
+
+    assert _approval(db).status == AppVersionApprovalStatus.APPROVED
+
+
+def test_seed_does_not_change_the_courses_of_users_that_existed(db, pod_repo):
+    from app.utils.keycloak_auth import sync_user_from_keycloak
+
+    for u in _realm():
+        sync_user_from_keycloak(db, u)
+
+    cli.seed(db, CFG, _realm())
+
+    assert db.query(User).filter_by(username="student1").one().courseId is None
+    assert db.query(CourseTeacher).count() == 0
+
+
+def test_seed_enrolls_only_the_users_it_created(db, pod_repo):
+    cli.seed(db, CFG, _realm())
+    student = db.query(User).filter_by(username="student1").one()
+    student.courseId = None  # a teacher took them out of the demo course
+    db.commit()
+    newcomer = {"id": "kc-new", "username": "student2", "email": "student2@dhbw.de", "roles": ["student"]}
+
+    cli.seed(db, CFG, [*_realm(), newcomer])
+
+    course = db.query(Course).one()
+    assert db.query(User).filter_by(username="student1").one().courseId is None
+    assert db.query(User).filter_by(username="student2").one().courseId == course.courseId
+
+
 def test_seed_skips_apps_whose_repository_is_not_allowed(db, pod_repo):
     cfg = {"apps": [{"name": "evil", "gitLink": "https://evil.example.org/x/y", "versions": ["v1"]}]}
 

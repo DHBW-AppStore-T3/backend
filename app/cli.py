@@ -8,14 +8,18 @@ service layer, with the same validation as the API path (allowed git hosts,
 readable public repository, ``appstore.yaml`` / spec hash, marker scan).
 
 ``seed`` fills one environment with demo data and is idempotent (nothing is
-deleted, nothing that exists is overwritten):
+deleted, nothing that exists is overwritten, no decision of a person is
+undone):
 
   - the users of the Keycloak realm are provisioned into the database exactly
     like their first login (``sync_user_from_keycloak``, same Keycloak id)
-  - the demo course; the realm's teachers teach it, the realm's students
-    without a course join it
+  - the demo course; of the users this run provisioned, the teachers teach
+    it and the students join it. Users that existed already keep their
+    courses: someone enrolled or removed them on purpose
   - the apps of the config file are registered (public, owned by the first
-    admin), their versions submitted and approved
+    admin); a version without any review entry is submitted and approved.
+    A version an admin rejected or revoked stays so, and a submission of
+    somebody else waits for its review
 """
 
 import argparse
@@ -37,6 +41,9 @@ from app.schemas import AppCreate, CourseCreate
 from app.services.git_service import git_service
 
 log = logging.getLogger("cli.seed")
+
+# The notes of the submissions ``seed`` makes; only those it approves itself.
+SEED_NOTE = "Demo-Seed"
 
 
 def _detail(exc: HTTPException) -> str:
@@ -81,21 +88,29 @@ def realm_users(env=os.environ):
 # ----------------------------------------------------------------
 # seed
 # ----------------------------------------------------------------
-def seed_users(db: Session, realm: list[dict]) -> list[User]:
+def seed_users(db: Session, realm: list[dict]) -> tuple[list[User], list[User]]:
+    """Provision the realm's users: all of them, and those this run created."""
     from app.utils.keycloak_auth import sync_user_from_keycloak
 
-    users = []
+    users, created = [], []
     for u in realm:
+        keycloak_id = u.get("id") or u.get("sub")
+        existed = db.query(User.userId).filter(User.keycloak_id == keycloak_id).first() is not None
         try:
-            users.append(sync_user_from_keycloak(db, u))
+            user = sync_user_from_keycloak(db, u)
         except Exception as exc:  # e.g. the same e-mail under another Keycloak id: keep going
             db.rollback()
             log.warning("user %s not provisioned: %s", u.get("username"), exc)
-    log.info("%d realm users provisioned", len(users))
-    return users
+            continue
+        users.append(user)
+        if not existed:
+            created.append(user)
+    log.info("%d realm users provisioned, %d of them new", len(users), len(created))
+    return users, created
 
 
 def seed_course(db: Session, name: str, users: list[User]) -> Course:
+    """The demo course, with ``users`` (the ones this run created) in it."""
     course = db.query(Course).filter(Course.name == name).first()
     if course is None:
         course = crud_courses.create_course(db, CourseCreate(name=name))
@@ -142,10 +157,12 @@ def seed_apps(db: Session, owner: User, apps: list[dict]) -> None:
             try:
                 db.expire_all()
                 ap = crud_approvals.get_approval(db, row.appId, tag)
-                if ap is not None and ap.status == AppVersionApprovalStatus.APPROVED:
+                if ap is not None and not (ap.status == AppVersionApprovalStatus.PENDING and ap.notes == SEED_NOTE):
+                    # Approved, rejected/revoked by an admin, or waiting for
+                    # the review of somebody else's submission: not ours.
                     continue
-                if ap is None or ap.status == AppVersionApprovalStatus.REJECTED:
-                    _submit_at(db, row, tag, resolve_version_commit(row, tag), notes="Demo-Seed")
+                if ap is None:
+                    _submit_at(db, row, tag, resolve_version_commit(row, tag), notes=SEED_NOTE)
                 approve_submitted_version(db, row, tag, owner.userId)
                 log.info("%s %s approved", a["name"], tag)
             except HTTPException as exc:
@@ -154,9 +171,9 @@ def seed_apps(db: Session, owner: User, apps: list[dict]) -> None:
 
 
 def seed(db: Session, cfg: dict, realm: list[dict]) -> None:
-    users = seed_users(db, realm)
-    if cfg.get("courseName") and users:
-        seed_course(db, cfg["courseName"], users)
+    _users, created = seed_users(db, realm)
+    if cfg.get("courseName") and created:
+        seed_course(db, cfg["courseName"], created)
     apps = cfg.get("apps", [])
     owner = db.query(User).filter(User.role == UserRole.ADMIN).order_by(User.created_at).first() if apps else None
     if apps and owner is None:

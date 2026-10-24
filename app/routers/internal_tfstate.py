@@ -5,9 +5,11 @@ OpenTofu then reads, writes and locks the deployment's state itself.
 Credentials are HTTP Basic: the task id as user name and the task's state
 token as password (``services/tf_state_store``).
 
-Not part of the public API: left out of the OpenAPI document, and the
-ingress does not route ``/api/internal/`` (Traefik and Caddy answer 404).
-The token check stands on its own either way.
+Not part of the public API: left out of the OpenAPI document, and neither
+gateway routes it: the frontend's nginx answers 404 for ``/api/internal/``,
+the self-service-ui's Caddy for ``/api/app-store/internal/`` (since
+self-service-ui#14; before, it forwarded it). The token check stands on
+its own either way.
 """
 
 from __future__ import annotations

@@ -28,6 +28,7 @@ from app.routers import (
 from app.services import task_service
 from app.services.reconciler import run_reconciler
 from app.services.task_events import hub
+from app.utils.cross_site import CrossSiteWriteGuard
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +151,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ----------------------------------------------------------------
+# CROSS-SITE WRITES
+# ----------------------------------------------------------------
+# Student apps share the platform's site; a write a browser sends for
+# another page is refused (review S3). Outermost, so it runs first.
+app.add_middleware(CrossSiteWriteGuard, trusted_origins=settings.trusted_write_origins)
 
 # ----------------------------------------------------------------
 # ROUTERS

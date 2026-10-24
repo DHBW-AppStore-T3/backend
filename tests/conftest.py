@@ -222,6 +222,15 @@ class FakeGitRemote:
 
 
 @pytest.fixture(autouse=True)
+def _fresh_rate_limits():
+    """Every test starts with untouched per-person budgets (app/utils/rate_limit.py)."""
+    from app.utils import rate_limit
+
+    rate_limit.limiter.reset()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def fake_git(request, monkeypatch):
     """Every test talks to a ``FakeGitRemote`` unless marked ``real_git``."""
     from app.routers import apps as apps_router

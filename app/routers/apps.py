@@ -36,6 +36,7 @@ from app.services.packer_discovery import (
     PackerTemplateDiscoveryError,
     discover_packer_templates,
 )
+from app.utils import rate_limit
 from app.utils.app_image import build_image_data_url, parse_image_data_url
 from app.utils.capabilities import (
     ensure_delete_app,
@@ -574,7 +575,12 @@ def _submit_at(db: Session, app, version_tag: str, commit_sha: str, diff_url=Non
 # ----------------------------------------------------------------
 # CREATE APP
 # ----------------------------------------------------------------
-@router.post("/", response_model=AppResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/",
+    response_model=AppResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(rate_limit.REGISTER_APP)],
+)
 def create_app(
     app: AppCreate,
     db: Session = Depends(get_db),
@@ -680,6 +686,7 @@ def update_app(
     "/{app_id}/versions/{version_tag}/submit",
     response_model=AppVersionApprovalResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(rate_limit.SUBMIT_VERSION)],
 )
 def submit_version(
     app_id: UUID,

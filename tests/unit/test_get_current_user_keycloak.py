@@ -1,3 +1,4 @@
+import uuid
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -63,13 +64,13 @@ def test_dev_user_header_ignored_in_production():
 
 def test_lti_token_valid_but_no_matching_user_falls_through_to_keycloak():
     db = MagicMock()
-    db.query.return_value.filter.return_value.first.return_value = None
+    db.get.return_value = None
 
     with (
         patch.object(settings, "LTI13_SESSION_SECRET", "test-secret"),
         patch(
             "app.utils.keycloak_auth.lti13_service.verify_session_token",
-            return_value="ghost@example.com",
+            return_value=uuid.uuid4(),
         ),
         patch(
             "app.utils.keycloak_auth.verify_keycloak_token_offline",
