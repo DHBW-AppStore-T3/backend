@@ -24,6 +24,7 @@ from app.k8s.spec import (
     AppSpec,
     PlatformLimits,
     SpecValidationError,
+    apply_network_overrides,
     apply_resource_overrides,
     limits_from,
     parse_spec,
@@ -96,6 +97,28 @@ def with_resource_overrides(loaded: LoadedSpec, overrides: Any) -> LoadedSpec:
             detail={
                 "reason": "invalid_resources",
                 "message": "resources are invalid",
+                "errors": exc.errors,
+            },
+        ) from exc
+    return dataclasses.replace(loaded, spec=spec)
+
+
+def with_network_overrides(loaded: LoadedSpec, choice: Any) -> LoadedSpec:
+    """``loaded`` with the network settings a person chose (``userInputVar.network``).
+
+    Like the resources, only the job gets the changed spec; hash and digests
+    stay those of the reviewed file. 422 with one field path per problem.
+    """
+    if not choice:
+        return loaded
+    try:
+        spec = apply_network_overrides(loaded.spec, choice)
+    except SpecValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "reason": "invalid_network",
+                "message": "network settings are invalid",
                 "errors": exc.errors,
             },
         ) from exc
