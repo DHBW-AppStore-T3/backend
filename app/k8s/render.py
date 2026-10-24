@@ -47,6 +47,14 @@ PASSWORD_KEY = "password"
 _EGRESS_EXCEPT_V4 = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"]
 _EGRESS_EXCEPT_V6 = ["fc00::/7", "fe80::/10"]
 
+# Readiness of the exposed container: the named port ``http`` (= ``expose.port``).
+_READINESS_PROBE: dict[str, Any] = {
+    "tcpSocket": {"port": "http"},
+    "periodSeconds": 3,
+    "timeoutSeconds": 2,
+    "failureThreshold": 3,
+}
+
 
 @dataclass(frozen=True)
 class DeploymentCtx:
@@ -444,6 +452,11 @@ def _workload_objects(
         }
         if c.expose:
             item["ports"] = [{"name": "http", "containerPort": c.expose.port, "protocol": "TCP"}]
+            # Ready only once the exposed port accepts connections: without a
+            # probe the pod is Ready at container start and the ingress answers
+            # 502 until the app listens. A TCP check works for every app (an
+            # HTTP check would need a path that answers 2xx/3xx without login).
+            item["readinessProbe"] = dict(_READINESS_PROBE)
         containers.append(item)
 
     if file_items:
