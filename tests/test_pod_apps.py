@@ -380,6 +380,55 @@ def test_admins_operate_pod_deployments(db, live_pod_deployment, admin_client, s
     assert admin_client.post(f"/deployments/{deployment_id}/pause").status_code == 202
 
 
+# ----------------------------------------------------------------
+# an app an admin deactivated (review S7)
+# ----------------------------------------------------------------
+def _deactivate(db, app):
+    db.expire_all()
+    row = db.get(App, app.appId)
+    row.hidden_by_admin, row.is_private = True, True
+    db.commit()
+
+
+def test_the_owner_cannot_deploy_an_app_an_admin_deactivated(client, db, mock_user, pod_repo, sent):
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+    _deactivate(db, app)
+
+    response = _deploy(client, app, teams=[_team("Team-1", alice)])
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "app_deactivated"
+    assert db.query(Deployment).count() == 0
+    sent.assert_not_called()
+
+
+def test_an_admin_can_still_deploy_a_deactivated_app(admin_client, db, mock_user, pod_repo, sent):
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _deactivate(db, app)
+
+    response = _deploy(admin_client, app, teams=[_team("Team-1", alice)])
+
+    assert response.status_code == 201, response.text
+
+
+def test_a_paused_deployment_of_a_deactivated_app_cannot_be_resumed(client, db, live_pod_deployment, sent):
+    deployment_id, _kube, _ = live_pod_deployment
+    assert client.post(f"/deployments/{deployment_id}/pause").status_code == 202
+    db.query(Task).update({"status": TaskStatus.SUCCESS})
+    db.commit()
+    _deactivate(db, db.get(Deployment, deployment_id).app)
+    sent.reset_mock()
+
+    response = client.post(f"/deployments/{deployment_id}/resume")
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "app_deactivated"
+    sent.assert_not_called()
+
+
 def test_resources_of_a_pod_deployment_list_its_workloads(client, live_pod_deployment, monkeypatch):
     from app.config import settings
 

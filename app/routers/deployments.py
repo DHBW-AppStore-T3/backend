@@ -80,6 +80,7 @@ from app.utils.capabilities import (
     can_operate_deployment,
     can_view_deployment_owner,
     ensure_deploy,
+    ensure_deploy_app,
     ensure_operate_deployment,
     ensure_view_app,
     ensure_view_deployment,
@@ -385,6 +386,9 @@ def create_deployment(
     # the frontend receives the same shape it sees on the detail
     # endpoint when visibility is denied.
     ensure_view_app(current_user, target_app, db=db)
+    # An app an admin deactivated is private, so it would skip the approval
+    # gate below: refuse it outright (403 ``app_deactivated``), admins aside.
+    ensure_deploy_app(current_user, target_app)
 
     # The deployment runs the commit the tag points to now, and every job
     # of it runs exactly that commit (.github#7 G). A public app needs an
@@ -1593,6 +1597,9 @@ def resume_deployment(
         )
 
     ensure_operate_deployment(current_user, deployment, db)
+    # Resuming starts the app again: not while an admin has deactivated it.
+    if deployment.app is not None:
+        ensure_deploy_app(current_user, deployment.app)
     # Per-deployment advisory lock — same justification as in
     # ``pause_deployment`` above: keep the status check and the task
     # insert atomic against concurrent /resume / /pause / DELETE
