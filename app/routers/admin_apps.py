@@ -41,6 +41,38 @@ def list_pending_versions(
     return crud_approvals.get_pending_approvals(db)
 
 
+def approve_submitted_version(db: Session, app, version_tag: str, admin_id: UUID):
+    """The checks and the state change of an approval, shared by the endpoint
+    and the management command (``python -m app.cli``): the submitted commit
+    must still be the tag's, its markers valid and its spec unchanged."""
+    submitted = crud_approvals.get_approval(db, app.appId, version_tag)
+    if submitted is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version approval entry not found")
+    commit_sha = resolve_version_commit(app, version_tag)
+    if submitted.commit_sha and commit_sha != submitted.commit_sha:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "version_moved",
+                "message": "The tag now points to a different commit than the one submitted; submit it again",
+            },
+        )
+    if submitted.commit_sha:
+        ensure_no_marker_errors(load_variable_definitions(app, version_tag, commit_sha), "approved")
+        # A pod version is approved only with the spec and images that were
+        # submitted (.github#4): a commit cannot change, but the platform
+        # limits can, and then the scan above already failed with 422.
+        loaded = load_version_spec(app, version_tag, commit_sha)
+        spec_sha256 = loaded.sha256 if loaded is not None and loaded.runtime == RUNTIME_K8S else None
+        if spec_sha256 != submitted.spec_sha256:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"reason": "spec_changed", "message": "The version's appstore.yaml is not the submitted one"},
+            )
+
+    return crud_approvals.approve(db, app.appId, version_tag, admin_id)
+
+
 # ----------------------------------------------------------------
 # APPROVE VERSION
 # ----------------------------------------------------------------
@@ -67,33 +99,7 @@ def approve_version(
       Terraform/Packer variable files (``marker_errors`` lists them).
     - 502: the repository cannot be read; nothing is approved unchecked.
     """
-    app = _require_app(db, app_id)
-    submitted = crud_approvals.get_approval(db, app_id, version_tag)
-    if submitted is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version approval entry not found")
-    commit_sha = resolve_version_commit(app, version_tag)
-    if submitted.commit_sha and commit_sha != submitted.commit_sha:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "reason": "version_moved",
-                "message": "The tag now points to a different commit than the one submitted; submit it again",
-            },
-        )
-    if submitted.commit_sha:
-        ensure_no_marker_errors(load_variable_definitions(app, version_tag, commit_sha), "approved")
-        # A pod version is approved only with the spec and images that were
-        # submitted (.github#4): a commit cannot change, but the platform
-        # limits can, and then the scan above already failed with 422.
-        loaded = load_version_spec(app, version_tag, commit_sha)
-        spec_sha256 = loaded.sha256 if loaded is not None and loaded.runtime == RUNTIME_K8S else None
-        if spec_sha256 != submitted.spec_sha256:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={"reason": "spec_changed", "message": "The version's appstore.yaml is not the submitted one"},
-            )
-
-    return crud_approvals.approve(db, app_id, version_tag, current_user.userId)
+    return approve_submitted_version(db, _require_app(db, app_id), version_tag, current_user.userId)
 
 
 # ----------------------------------------------------------------
