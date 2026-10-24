@@ -115,7 +115,9 @@ def sync_user_from_keycloak(db: Session, keycloak_user_data: dict, *, _retry: bo
 
     The token's realm roles are the Keycloak source of the role, and only
     that source is overwritten; the effective role is recomputed from all
-    sources (:mod:`app.utils.roles`, review S8).
+    sources (:mod:`app.utils.roles`, review S8). Data without ``roles`` and
+    ``realm_access`` (a user search result) says nothing about the role and
+    leaves it as it is: a search must not demote whoever it finds.
 
     A Keycloak account seen for the first time is linked to the account
     with its e-mail address if there is one, e.g. the one a Moodle launch
@@ -126,10 +128,10 @@ def sync_user_from_keycloak(db: Session, keycloak_user_data: dict, *, _retry: bo
     keycloak_id = keycloak_user_data.get("id") or keycloak_user_data.get("sub")
     email = keycloak_user_data.get("email")
     username = keycloak_user_data.get("username") or keycloak_id
-    keycloak_roles = keycloak_user_data.get("roles") or keycloak_user_data.get(
-        "realm_access", {}
-    ).get("roles", [])
-    keycloak_role = roles.from_keycloak(keycloak_roles)
+    keycloak_roles = keycloak_user_data.get("roles")
+    if keycloak_roles is None and "realm_access" in keycloak_user_data:
+        keycloak_roles = keycloak_user_data["realm_access"].get("roles", [])
+    keycloak_role = roles.from_keycloak(keycloak_roles) if keycloak_roles is not None else None
     first_name = keycloak_user_data.get("firstName") or keycloak_user_data.get("given_name")
     last_name = keycloak_user_data.get("lastName") or keycloak_user_data.get("family_name")
 
@@ -171,7 +173,7 @@ def sync_user_from_keycloak(db: Session, keycloak_user_data: dict, *, _retry: bo
     if username and user.username != username:
         user.username = username
         updated = True
-    if user.keycloak_role != keycloak_role:
+    if keycloak_role is not None and user.keycloak_role != keycloak_role:
         user.keycloak_role = keycloak_role
         updated = True
     updated = roles.refresh(user) or updated

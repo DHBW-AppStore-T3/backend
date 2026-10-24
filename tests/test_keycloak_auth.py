@@ -119,3 +119,37 @@ def test_an_address_another_account_holds_is_not_taken_over(db):
 
     assert user.email == "me@example.com"
     assert db.query(User).count() == 2
+
+
+def test_a_user_search_result_does_not_demote_whoever_it_finds(db):
+    """Search results (Keycloak admin API) carry no realm roles: no statement about the role."""
+    sync_user_from_keycloak(db, _kc(roles=["admin"]))
+    found = {
+        "id": "kc-1",
+        "email": "teacher@example.com",
+        "username": "teacher@example.com",
+        "firstName": "T",
+    }
+
+    user = sync_user_from_keycloak(db, found)
+
+    assert user.role == UserRole.ADMIN and user.keycloak_role == UserRole.ADMIN
+    assert user.firstName == "T"
+
+
+def test_the_user_search_keeps_roles(db, client, monkeypatch):
+    from app.routers import users as users_router
+
+    sync_user_from_keycloak(db, _kc(user_id="kc-admin", email="admin@example.com", roles=["admin"]))
+    monkeypatch.setattr(
+        users_router,
+        "search_keycloak_users",
+        lambda q, limit: [
+            {"id": "kc-admin", "username": "admin@example.com", "email": "admin@example.com"}
+        ],
+    )
+
+    response = client.get("/users/search", params={"query": "adm"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()[0]["role"] == "admin"
