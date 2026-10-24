@@ -144,7 +144,7 @@ def test_the_user_search_keeps_roles(db, client, monkeypatch):
     monkeypatch.setattr(
         users_router,
         "search_keycloak_users",
-        lambda q, limit: [
+        lambda _query, _limit: [
             {"id": "kc-admin", "username": "admin@example.com", "email": "admin@example.com"}
         ],
     )
