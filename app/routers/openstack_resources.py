@@ -27,6 +27,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.database import get_db
 from app.models import User, UserOpenStackCredential
 from app.schemas import (
@@ -46,6 +47,50 @@ from app.utils.keycloak_auth import get_current_user_keycloak
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Static data returned for every resource endpoint when OPENSTACK_SIMULATE=true.
+# Enough for the wizard to work without any real cloud.
+_SIMULATE_RESOURCES: dict[str, list[dict]] = {
+    "networks": [
+        {"id": "net-sim-001", "name": "sim-network", "description": "Simulated network", "shared": False, "external": False, "status": "ACTIVE"},
+        {"id": "net-sim-ext", "name": "ext-net", "description": "External network", "shared": True, "external": True, "status": "ACTIVE"},
+    ],
+    "subnets": [
+        {"id": "sub-sim-001", "name": "sim-subnet", "cidr": "192.168.1.0/24", "ip_version": 4, "network_id": "net-sim-001", "gateway_ip": "192.168.1.1"},
+    ],
+    "flavors": [
+        {"id": "flv-small", "name": "sim.small", "vcpus": 1, "ram": 1024, "disk": 10, "is_public": True},
+        {"id": "flv-medium", "name": "sim.medium", "vcpus": 2, "ram": 4096, "disk": 20, "is_public": True},
+        {"id": "flv-large", "name": "sim.large", "vcpus": 4, "ram": 8192, "disk": 50, "is_public": True},
+    ],
+    "images": [
+        {"id": "img-ubuntu", "name": "Ubuntu 22.04", "status": "active", "visibility": "public", "size": 2000000000, "disk_format": "qcow2"},
+        {"id": "img-debian", "name": "Debian 12", "status": "active", "visibility": "public", "size": 1500000000, "disk_format": "qcow2"},
+    ],
+    "keypairs": [
+        {"name": "sim-keypair", "fingerprint": "aa:bb:cc:dd:ee:ff", "type": "ssh", "id": "sim-keypair"},
+    ],
+    "security_groups": [
+        {"id": "sg-default", "name": "default", "description": "Default security group"},
+        {"id": "sg-web", "name": "web", "description": "HTTP/HTTPS access"},
+    ],
+    "floating_ip_pools": [
+        {"id": "net-sim-ext", "name": "ext-net", "description": "External network"},
+    ],
+    "volumes": [],
+    "routers": [
+        {"id": "rtr-sim-001", "name": "sim-router", "status": "ACTIVE", "external_gateway_info": None},
+    ],
+    "availability_zones_compute": [
+        {"id": "nova", "name": "nova", "state": "available"},
+    ],
+    "availability_zones_network": [
+        {"id": "nova", "name": "nova", "state": "available"},
+    ],
+    "availability_zones_volume": [
+        {"id": "nova", "name": "nova", "state": "available"},
+    ],
+}
 
 
 # ----------------------------------------------------------------
@@ -89,6 +134,8 @@ def _list_with_oserror(
     400 from a fetch) pass through; any other error becomes 502
     ``openstack_list_failed`` with the ``kind``.
     """
+    if settings.OPENSTACK_SIMULATE:
+        return _SIMULATE_RESOURCES.get(kind, [])
     try:
         return openstack_client.cached_list(
             credential_id=credential.credentialId,
@@ -145,6 +192,16 @@ def refresh_resource_cache(
     ``network``, ``security_group``, ``availability_zone``); 422 for an
     unknown one. 404 for a credential that is not the caller's.
     """
+    """Drop the cached resource lists of this credential (204).
+
+    Triggered by the refresh button next to a wizard picker — the user has
+    just created a resource in Horizon and wants to see it. With ``kind``
+    only that kind is dropped (the ``@openstack:<kind>`` marker names, e.g.
+    ``network``, ``security_group``, ``availability_zone``); 422 for an
+    unknown one. 404 for a credential that is not the caller's.
+    """
+    if settings.OPENSTACK_SIMULATE:
+        return None
     cache_kind = None
     if kind is not None:
         cache_kind = _REFRESH_KINDS.get(kind)

@@ -10,7 +10,7 @@ only for the user search.
 import logging
 import threading
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from keycloak import KeycloakAdmin
 from sqlalchemy.orm import Session
@@ -192,16 +192,30 @@ def sync_user_from_keycloak(db: Session, keycloak_user_data: dict) -> User:
 # ----------------------------------------------------------------
 def get_current_user_keycloak(
     credentials: HTTPAuthorizationCredentials | None = Depends(optional_security),
+    x_dev_user: str | None = Header(default=None, alias="X-Dev-User"),
     db: Session = Depends(get_db),
 ) -> User:
     """
     Validate the bearer token and return the local User record.
     JIT-provisions the user from Keycloak claims on first sight.
 
+    In development (APP_ENV=development), the X-Dev-User header may carry an
+    email address to bypass Keycloak entirely — the matching seed user is
+    returned directly. This path is refused in production.
+
     Tries the LTI 1.3 session token first (HS256, issued by
     ``/lti13/launch``) so Moodle launches authenticate without a Keycloak
     round-trip; falls through to Keycloak on any other token.
     """
+    if settings.is_development and x_dev_user:
+        user = db.query(User).filter(User.email == x_dev_user).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Dev user '{x_dev_user}' not found in database (run make seed-dev)",
+            )
+        return user
+
     if not credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

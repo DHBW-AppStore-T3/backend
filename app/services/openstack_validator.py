@@ -131,6 +131,8 @@ def validate(payload: OpenStackCredentialUpsert) -> Scope:
     Blocking network call (up to ``TIMEOUT_SECONDS`` per request). Nothing is
     sent unless the Keystone URL is allowed.
     """
+    if settings.OPENSTACK_SIMULATE:
+        return Scope(project_id="sim-project-001", project_name="Simulated Project")
     ensure_auth_url_allowed(payload.auth_url)
     try:
         conn = openstack.connect(api_timeout=TIMEOUT_SECONDS, **connect_kwargs(payload_to_creds(payload)))
