@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, model_validator
 
 API_VERSION = "appstore/v2"
 
@@ -353,6 +353,13 @@ def _check_placeholders(template: str, allowed: set[str]) -> None:
             raise ValueError(f"unknown placeholder {{{field_name}}} (allowed: {', '.join(sorted(allowed))})")
 
 
+class UserChoices(_Strict):
+    """Settings the author lets the person deploying change (opt-in, off by default)."""
+
+    internet: StrictBool = False
+    pod_network: StrictBool = Field(default=False, alias="podNetwork")
+
+
 class AppSpec(_Strict):
     api_version: Literal["appstore/v2"] = Field(alias="apiVersion")
     name: str
@@ -360,6 +367,8 @@ class AppSpec(_Strict):
     scope: Literal["team", "user"] = "team"
     workload: Workload | None = None
     egress: Literal["none", "internet"] = "none"
+    pod_network: Literal["none", "namespace"] = Field(default="none", alias="podNetwork")
+    user_choices: UserChoices | None = Field(default=None, alias="userChoices")
     variables: list[Variable] = Field(default_factory=list)
     access: list[Access] = Field(default_factory=list)
 
@@ -591,4 +600,48 @@ def resource_choices(spec: AppSpec, limits: PlatformLimits | None = None) -> lis
                 },
             }
         )
+    return out
+
+
+def apply_network_overrides(spec: AppSpec, choice: Any) -> AppSpec:
+    """A copy of ``spec`` with the network settings a person chose.
+
+    ``choice`` is ``{"internet": bool, "podNetwork": bool}`` (either key may be
+    left out). Only keys the author released in ``userChoices`` can be set;
+    the rest keeps the author's value. Raises :class:`SpecValidationError`
+    with one field path per problem.
+    """
+    if choice is None or choice == {}:
+        return spec
+    if not isinstance(choice, dict):
+        raise SpecValidationError([{"loc": "network", "msg": "must map internet/podNetwork to true or false"}])
+    allowed = spec.user_choices
+    errors: list[dict[str, str]] = []
+    for key, value in choice.items():
+        loc = f"network.{key}"
+        if key not in ("internet", "podNetwork"):
+            errors.append({"loc": loc, "msg": "unknown setting (allowed: internet, podNetwork)"})
+        elif not isinstance(value, bool):
+            errors.append({"loc": loc, "msg": "must be true or false"})
+        elif allowed is None or not (allowed.internet if key == "internet" else allowed.pod_network):
+            errors.append({"loc": loc, "msg": "this setting cannot be changed"})
+    if errors:
+        raise SpecValidationError(errors)
+    result = spec.model_copy(deep=True)
+    if "internet" in choice:
+        result.egress = "internet" if choice["internet"] else "none"
+    if "podNetwork" in choice:
+        result.pod_network = "namespace" if choice["podNetwork"] else "none"
+    return result
+
+
+def network_choices(spec: AppSpec) -> dict[str, Any]:
+    """What the wizard offers: per released setting the author's default."""
+    out: dict[str, Any] = {}
+    if spec.user_choices is None:
+        return out
+    if spec.user_choices.internet:
+        out["internet"] = {"default": spec.egress == "internet"}
+    if spec.user_choices.pod_network:
+        out["podNetwork"] = {"default": spec.pod_network == "namespace"}
     return out

@@ -463,6 +463,7 @@ def create_deployment(
         _check_pod_files(loaded_spec, deployment.userInputVar)
         # What the person chose for cpu/memory (only where the app allows it).
         loaded_spec = app_spec.with_resource_overrides(loaded_spec, deployment.userInputVar.get("resources"))
+        loaded_spec = app_spec.with_network_overrides(loaded_spec, deployment.userInputVar.get("network"))
         workloads = _check_pod_workloads(db, current_user, loaded_spec, deployment.teams or [])
 
     db_deployment = crud_deployments.create_deployment(
