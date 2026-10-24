@@ -419,6 +419,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Rebuilds the Debian upgrade layer (Dockerfile, APT_REFRESH).
+          build-args: APT_REFRESH=${{ github.run_id }}
 
   # ================================================================
   # 🔒 IMAGE SCAN — Trivy CVE scan against the built image
@@ -452,6 +454,7 @@ jobs:
           platforms: linux/amd64
           tags: backend:scan
           cache-from: type=gha
+          build-args: APT_REFRESH=${{ github.run_id }}
 
       - name: Trivy image scan (gate)
         uses: aquasecurity/trivy-action@v0.36.0
@@ -537,6 +540,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Rebuilds the Debian upgrade layer (Dockerfile, APT_REFRESH).
+          build-args: APT_REFRESH=${{ github.run_id }}
 
   # ================================================================
   # ☸️ ROLL OUT ON KUBERNETES — dev -> staging, main -> prod
