@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, model_validator
 
 API_VERSION = "appstore/v2"
 
@@ -356,8 +356,8 @@ def _check_placeholders(template: str, allowed: set[str]) -> None:
 class UserChoices(_Strict):
     """Settings the author lets the person deploying change (opt-in, off by default)."""
 
-    internet: bool = False
-    pod_network: bool = Field(default=False, alias="podNetwork")
+    internet: StrictBool = False
+    pod_network: StrictBool = Field(default=False, alias="podNetwork")
 
 
 class AppSpec(_Strict):
@@ -611,7 +611,7 @@ def apply_network_overrides(spec: AppSpec, choice: Any) -> AppSpec:
     the rest keeps the author's value. Raises :class:`SpecValidationError`
     with one field path per problem.
     """
-    if not choice:
+    if choice is None or choice == {}:
         return spec
     if not isinstance(choice, dict):
         raise SpecValidationError([{"loc": "network", "msg": "must map internet/podNetwork to true or false"}])

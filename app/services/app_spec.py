@@ -46,7 +46,12 @@ class LoadedSpec:
 
     def payload(self) -> dict[str, Any]:
         """The spec as the pod worker gets it in the job (it validates it again)."""
-        return self.spec.model_dump(mode="json", by_alias=True, exclude_none=True)
+        data = self.spec.model_dump(mode="json", by_alias=True, exclude_none=True)
+        # Left out at its default so that a worker that predates the field
+        # (it forbids unknown keys) still accepts apps that do not use it.
+        if data.get("podNetwork") == "none":
+            del data["podNetwork"]
+        return data
 
 
 def platform_limits() -> PlatformLimits:
@@ -109,7 +114,7 @@ def with_network_overrides(loaded: LoadedSpec, choice: Any) -> LoadedSpec:
     Like the resources, only the job gets the changed spec; hash and digests
     stay those of the reviewed file. 422 with one field path per problem.
     """
-    if not choice:
+    if choice is None or choice == {}:
         return loaded
     try:
         spec = apply_network_overrides(loaded.spec, choice)

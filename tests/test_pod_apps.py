@@ -867,3 +867,89 @@ def test_a_non_boolean_network_choice_is_refused(client, db, mock_user, pod_repo
     response = _deploy_with_network(client, app, {"internet": "yes"}, [_team("T", alice)])
 
     assert response.status_code == 422 and response.json()["detail"]["reason"] == "invalid_network"
+
+
+def _body(app, network, teams):
+    return {
+        "name": "d",
+        "appId": str(app.appId),
+        "releaseTag": "v1.0",
+        "teams": teams,
+        "userInputVar": {} if network is None else {"network": network},
+    }
+
+
+def test_the_job_payload_of_an_old_style_spec_has_no_pod_network_key(client, db, mock_user, pod_repo, sent):
+    # A worker that predates podNetwork forbids unknown keys.
+    pod_repo(SPEC)
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+
+    assert client.post("/deployments/", json=_body(app, None, [_team("T", alice)])).status_code == 201
+    _, kwargs = _job(sent)
+    assert "podNetwork" not in kwargs["spec"] and "userChoices" not in kwargs["spec"]
+
+
+def test_the_job_payload_carries_pod_network_when_the_author_sets_it(client, db, mock_user, pod_repo, sent):
+    pod_repo({**copy.deepcopy(SPEC), "podNetwork": "namespace"})
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+
+    assert client.post("/deployments/", json=_body(app, None, [_team("T", alice)])).status_code == 201
+    assert _job(sent)[1]["spec"]["podNetwork"] == "namespace"
+
+
+def test_a_network_choice_keeps_the_approved_hash_and_is_stored(client, db, mock_user, pod_repo, sent):
+    pod_repo(_networked_spec(podNetwork=True))
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+    before = db.query(AppVersionApproval).filter_by(appId=app.appId).one().spec_sha256
+
+    response = _deploy_with_network(client, app, {"podNetwork": True}, [_team("T", alice)])
+
+    assert response.status_code == 201, response.text
+    _, kwargs = _job(sent)
+    assert kwargs["spec"]["podNetwork"] == "namespace"
+    db.expire_all()
+    assert db.query(AppVersionApproval).filter_by(appId=app.appId).one().spec_sha256 == before
+    row = db.get(Deployment, uuid.UUID(response.json()["deploymentId"]))
+    stored = row.userInputVar
+    assert (json.loads(stored) if isinstance(stored, str) else stored)["network"] == {"podNetwork": True}
+
+
+def test_a_network_choice_for_an_app_without_user_choices_is_refused(client, db, mock_user, pod_repo, sent):
+    pod_repo(SPEC)
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+
+    response = _deploy_with_network(client, app, {"internet": True}, [_team("T", alice)])
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["reason"] == "invalid_network"
+    assert response.json()["detail"]["errors"][0]["loc"] == "network.internet"
+    sent.assert_not_called()
+
+
+def test_valid_resources_do_not_save_an_invalid_network_choice(client, db, mock_user, pod_repo, sent):
+    spec = _tunable_spec()
+    spec["userChoices"] = {"podNetwork": True}
+    pod_repo(spec)
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+    body = {
+        "name": "d",
+        "appId": str(app.appId),
+        "releaseTag": "v1.0",
+        "teams": [_team("T", alice)],
+        "userInputVar": {"resources": {"ide": {"cpu": "2"}}, "network": {"internet": True}},
+    }
+
+    response = client.post("/deployments/", json=body)
+
+    assert response.status_code == 422 and response.json()["detail"]["reason"] == "invalid_network"
+    sent.assert_not_called()

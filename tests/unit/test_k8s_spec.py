@@ -398,3 +398,17 @@ def test_network_choices_list_only_released_keys_with_the_author_default():
     assert network_choices(parse_spec(_networked(podNetwork=True))) == {"podNetwork": {"default": False}}
     both = parse_spec({**_networked(internet=True, podNetwork=True), "egress": "internet", "podNetwork": "namespace"})
     assert network_choices(both) == {"internet": {"default": True}, "podNetwork": {"default": True}}
+
+
+def test_user_choices_must_be_real_booleans():
+    assert "userChoices.internet" in errors_of(_networked(internet=1))
+    assert "userChoices.podNetwork" in errors_of(_networked(podNetwork="yes"))
+
+
+@pytest.mark.parametrize("choice", [[], 0, "", False])
+def test_network_override_refuses_a_falsy_non_mapping(choice):
+    from app.k8s.spec import apply_network_overrides
+
+    with pytest.raises(SpecValidationError) as exc:
+        apply_network_overrides(parse_spec(_networked(internet=True)), choice)
+    assert exc.value.errors[0]["loc"] == "network"
