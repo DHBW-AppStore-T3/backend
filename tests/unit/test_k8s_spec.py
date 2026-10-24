@@ -317,3 +317,84 @@ def test_resource_choices_list_default_and_range():
         }
     ]
     assert resource_choices(parse_spec(VALID)) == []
+
+
+# ----------------------------------------------------------------
+# podNetwork / userChoices / apply_network_overrides (opt-in network choice)
+# ----------------------------------------------------------------
+def _networked(**choices):
+    return {**copy.deepcopy(VALID), "userChoices": choices}
+
+
+def test_network_defaults_are_off_and_not_changeable():
+    spec = parse_spec(VALID)
+    assert spec.pod_network == "none" and spec.user_choices is None
+
+
+def test_unknown_user_choice_and_pod_network_value_are_rejected():
+    assert "userChoices.disk" in errors_of(_networked(disk=True))
+    assert "podNetwork" in errors_of({**VALID, "podNetwork": "cluster"})
+
+
+def test_network_override_sets_both_values_and_keeps_the_original():
+    from app.k8s.spec import apply_network_overrides
+
+    spec = parse_spec(_networked(internet=True, podNetwork=True))
+    spec.egress = "none"
+    out = apply_network_overrides(spec, {"internet": True, "podNetwork": True})
+    assert out.egress == "internet" and out.pod_network == "namespace"
+    assert spec.egress == "none" and spec.pod_network == "none"
+
+
+def test_network_override_can_switch_the_author_default_off():
+    from app.k8s.spec import apply_network_overrides
+
+    spec = parse_spec(_networked(internet=True))
+    assert spec.egress == "internet"
+    assert apply_network_overrides(spec, {"internet": False}).egress == "none"
+
+
+def test_network_override_leaves_unreleased_keys_alone_when_not_sent():
+    from app.k8s.spec import apply_network_overrides
+
+    spec = parse_spec({**_networked(internet=True), "podNetwork": "namespace"})
+    out = apply_network_overrides(spec, {"internet": True})
+    assert out.pod_network == "namespace"
+
+
+@pytest.mark.parametrize(
+    ("choices", "choice", "loc", "msg"),
+    [
+        ({}, {"internet": True}, "network.internet", "cannot be changed"),
+        ({"internet": True}, {"podNetwork": True}, "network.podNetwork", "cannot be changed"),
+        ({"internet": True}, {"internet": "yes"}, "network.internet", "true or false"),
+        ({"internet": True}, {"internet": 1}, "network.internet", "true or false"),
+        ({"internet": True}, {"dns": True}, "network.dns", "unknown setting"),
+    ],
+)
+def test_network_override_errors_carry_the_field_path(choices, choice, loc, msg):
+    from app.k8s.spec import apply_network_overrides
+
+    with pytest.raises(SpecValidationError) as exc:
+        apply_network_overrides(parse_spec(_networked(**choices)), choice)
+    assert [(e["loc"], msg in e["msg"]) for e in exc.value.errors] == [(loc, True)]
+
+
+def test_network_override_without_user_choices_is_refused_and_empty_choice_is_a_noop():
+    from app.k8s.spec import apply_network_overrides
+
+    spec = parse_spec(VALID)
+    assert apply_network_overrides(spec, None) is spec and apply_network_overrides(spec, {}) is spec
+    with pytest.raises(SpecValidationError):
+        apply_network_overrides(spec, {"internet": True})
+    with pytest.raises(SpecValidationError, match="network"):
+        apply_network_overrides(spec, ["internet"])
+
+
+def test_network_choices_list_only_released_keys_with_the_author_default():
+    from app.k8s.spec import network_choices
+
+    assert network_choices(parse_spec(VALID)) == {}
+    assert network_choices(parse_spec(_networked(podNetwork=True))) == {"podNetwork": {"default": False}}
+    both = parse_spec({**_networked(internet=True, podNetwork=True), "egress": "internet", "podNetwork": "namespace"})
+    assert network_choices(both) == {"internet": {"default": True}, "podNetwork": {"default": True}}

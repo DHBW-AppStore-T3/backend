@@ -68,6 +68,16 @@ def test_matches_golden_file():
     assert objs == json.loads(GOLDEN.read_text(encoding="utf-8"))
 
 
+GOLDEN_NETWORKED = GOLDEN.with_name("online_ide_networked.json")
+
+
+def test_networked_pods_match_golden_file():
+    _, objs, _ = build({**VALID, "egress": "internet", "podNetwork": "namespace"})
+    if os.environ.get("UPDATE_GOLDEN"):
+        GOLDEN_NETWORKED.write_text(json.dumps(objs, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    assert objs == json.loads(GOLDEN_NETWORKED.read_text(encoding="utf-8"))
+
+
 def test_render_is_deterministic():
     assert build()[1] == build()[1]
 
@@ -141,6 +151,22 @@ def test_network_policy_denies_by_default_and_excludes_internal_ranges_for_both_
 def test_egress_none_has_no_internet_policy():
     names = {p["metadata"]["name"] for p in of_kind(build({**VALID, "egress": "none"})[1], "NetworkPolicy")}
     assert names == {"default-deny", "allow-ingress-controller", "allow-dns"}
+
+
+def test_pod_network_none_has_no_intra_namespace_policy():
+    names = {p["metadata"]["name"] for p in of_kind(build()[1], "NetworkPolicy")}
+    assert "allow-intra-namespace" not in names
+
+
+def test_pod_network_namespace_allows_only_own_pods_on_the_expose_port_both_ways():
+    spec, objs, _ = build({**VALID, "egress": "none", "podNetwork": "namespace"})
+    pol = next(p for p in of_kind(objs, "NetworkPolicy") if p["metadata"]["name"] == "allow-intra-namespace")["spec"]
+    port = [{"protocol": "TCP", "port": spec.workload.containers[0].expose.port}]
+    assert pol["podSelector"] == {} and pol["policyTypes"] == ["Ingress", "Egress"]
+    assert pol["ingress"] == [{"from": [{"podSelector": {}}], "ports": port}]
+    assert pol["egress"] == [{"to": [{"podSelector": {}}], "ports": port}]
+    names = {p["metadata"]["name"] for p in of_kind(objs, "NetworkPolicy")}
+    assert names == {"default-deny", "allow-ingress-controller", "allow-dns", "allow-intra-namespace"}
 
 
 def test_extra_egress_except_split_by_family():

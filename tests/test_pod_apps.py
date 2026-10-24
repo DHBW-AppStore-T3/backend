@@ -188,6 +188,7 @@ def test_runtime_of_a_vm_app(client, db, mock_user, fake_git):
         "egress": None,
         "access": [],
         "resources": [],
+        "network": {},
     }
 
 
@@ -795,3 +796,74 @@ def test_an_app_without_bounds_ignores_no_choice(client, db, mock_user, pod_repo
 
     assert response.status_code == 422
     assert response.json()["detail"]["errors"][0]["msg"] == "this container's resources cannot be changed"
+
+
+# ----------------------------------------------------------------
+# internet / pod network chosen in the wizard (userChoices)
+# ----------------------------------------------------------------
+def _networked_spec(**choices):
+    return {**copy.deepcopy(SPEC), "userChoices": choices}
+
+
+def _deploy_with_network(client, app, network, teams):
+    body = {
+        "name": "d",
+        "appId": str(app.appId),
+        "releaseTag": "v1.0",
+        "teams": teams,
+        "userInputVar": {"network": network},
+    }
+    return client.post("/deployments/", json=body)
+
+
+def test_the_runtime_offers_only_the_released_network_choices(client, db, mock_user, pod_repo):
+    pod_repo(_networked_spec(podNetwork=True))
+    app = _app(db, mock_user)
+    response = client.get(f"/apps/{app.appId}/runtime", params={"version": "v1.0"})
+    assert response.status_code == 200, response.text
+    assert response.json()["network"] == {"podNetwork": {"default": False}}
+
+
+def test_the_runtime_offers_no_network_choice_without_user_choices(client, db, mock_user, pod_repo):
+    pod_repo(SPEC)
+    app = _app(db, mock_user)
+    assert client.get(f"/apps/{app.appId}/runtime", params={"version": "v1.0"}).json()["network"] == {}
+
+
+def test_a_chosen_network_reaches_the_job(client, db, mock_user, pod_repo, sent):
+    pod_repo(_networked_spec(internet=True, podNetwork=True))
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+
+    response = _deploy_with_network(client, app, {"internet": True, "podNetwork": True}, [_team("T", alice)])
+
+    assert response.status_code == 201, response.text
+    _, kwargs = _job(sent)
+    assert kwargs["spec"]["egress"] == "internet" and kwargs["spec"]["podNetwork"] == "namespace"
+
+
+def test_a_network_choice_without_release_is_refused(client, db, mock_user, pod_repo, sent):
+    pod_repo(_networked_spec(podNetwork=True))
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+
+    response = _deploy_with_network(client, app, {"internet": True}, [_team("T", alice)])
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["reason"] == "invalid_network"
+    assert detail["errors"][0]["loc"] == "network.internet"
+    sent.assert_not_called()
+
+
+def test_a_non_boolean_network_choice_is_refused(client, db, mock_user, pod_repo, sent):
+    pod_repo(_networked_spec(internet=True))
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+
+    response = _deploy_with_network(client, app, {"internet": "yes"}, [_team("T", alice)])
+
+    assert response.status_code == 422 and response.json()["detail"]["reason"] == "invalid_network"
