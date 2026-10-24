@@ -340,6 +340,21 @@ def _network_policies(spec: AppSpec, dep: DeploymentCtx, settings: RenderSetting
                 },
             )
         )
+    if spec.pod_network == "namespace":
+        # Both directions: default-deny blocks both. No namespaceSelector or
+        # ipBlock, so it reaches only pods of this deployment's namespace.
+        peer = [{"podSelector": {}}]
+        ports = [{"protocol": "TCP", "port": port}]
+        policies.append(
+            policy(
+                "allow-intra-namespace",
+                {
+                    "policyTypes": ["Ingress", "Egress"],
+                    "ingress": [{"from": peer, "ports": ports}],
+                    "egress": [{"to": peer, "ports": ports}],
+                },
+            )
+        )
     return policies
 
 
