@@ -4,8 +4,8 @@ import threading
 import time
 from datetime import UTC, datetime
 
+import jwt
 import requests as http_requests
-from jose import JWTError, jwt
 
 _jwks_cache: dict[str, tuple[list, float]] = {}
 _jwks_lock = threading.Lock()
@@ -50,7 +50,7 @@ def validate_id_token(
     # Decode header to find the right key
     try:
         header = jwt.get_unverified_header(id_token)
-    except JWTError as exc:
+    except jwt.PyJWTError as exc:
         raise ValueError(f"Cannot read JWT header: {exc}") from exc
 
     kid = header.get("kid")
@@ -69,14 +69,14 @@ def validate_id_token(
         try:
             claims = jwt.decode(
                 id_token,
-                jwk_key,
+                jwt.PyJWK(jwk_key, algorithm="RS256").key,
                 algorithms=["RS256"],
                 audience=client_id,
                 issuer=platform_issuer,
-                options={"verify_at_hash": False},
+                options={"require": ["exp", "iat", "iss", "aud"]},
             )
             break
-        except JWTError as exc:
+        except (jwt.PyJWTError, ValueError) as exc:
             last_exc = exc
     else:
         raise ValueError(f"JWT validation failed: {last_exc}") from last_exc
@@ -137,8 +137,8 @@ def issue_session_token(email: str, secret: str, ttl_hours: int = LTI_SESSION_TT
 def verify_session_token(token: str, secret: str) -> str:
     """Verify an LTI session JWT and return the email (sub). Raises ValueError on failure."""
     try:
-        claims = jwt.decode(token, secret, algorithms=["HS256"])
-    except JWTError as exc:
+        claims = jwt.decode(token, secret, algorithms=["HS256"], options={"require": ["exp", "sub"]})
+    except jwt.PyJWTError as exc:
         raise ValueError(f"Invalid LTI session token: {exc}") from exc
     if claims.get("type") != "lti_session":
         raise ValueError("Token type is not lti_session")

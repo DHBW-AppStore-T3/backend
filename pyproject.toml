@@ -33,11 +33,16 @@ alembic = ">=1.13.1"
 psycopg2-binary = ">=2.9.9"
 pydantic = ">=2.5.3"
 pydantic-settings = ">=2.1.0"
-python-jose = {extras = ["cryptography"], version = ">=3.3.0"}
+# Access-token and LTI checks (.github#7 P); replaces python-jose.
+pyjwt = {extras = ["crypto"], version = ">=2.10.1"}
 passlib = ">=1.7.4"
 bcrypt = ">=4.0.0,<5.0.0"
 python-multipart = ">=0.0.6"
-celery = {extras = ["redis"], version = "^5.3.4"}
+# Broker: our own Postgres through the pgq transport (app/pgq.py, .github#5);
+# no RabbitMQ, no Redis result backend.
+celery = "^5.3.4"
+# psycopg 3: the pgq transport and the LISTEN connection of the live stream.
+psycopg = {extras = ["binary"], version = ">=3.2"}
 gitpython = ">=3.1.41"
 email-validator = ">=1.3.0"
 python-keycloak = ">=3.9.1"
@@ -45,11 +50,14 @@ requests = ">=2.31.0"
 openstacksdk = "^3.3.0"
 cryptography = ">=42.0.0"
 PyYAML = ">=6.0"
-jinja2 = ">=3.1.0"
+# Pod apps (.github#4): live status of their namespaces (app/k8s/kube.py).
+kubernetes = ">=31.0.0"
 # Transitive via pbr. Pinned to >=83.0.0 to close PYSEC-2026-3447
 # (CVE-2026-59890): MANIFEST.in exclusions bypassed on macOS APFS/HFS+
 # via NFD filenames. Fixed in 83.0.0.
-setuptools = ">=83.0.0"
+setuptools = ">=84.1.0"
+# Transitive (via virtualenv/poetry tooling); pinned for CVE-2026-112940, fixed in 4.2.1.
+filelock = ">=4.2.1"
 msgpack = ">=1.2.1"
 
 [tool.poetry.group.dev.dependencies]
@@ -120,6 +128,11 @@ fixable = ["ALL"]
 unfixable = []
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 
+[tool.ruff.lint.per-file-ignores]
+# Identical copies of the worker's files (tests/unit/test_shared_files.py):
+# the worker's black/isort (line length 120) decide how their imports wrap.
+"app/k8s/*.py" = ["I001"]
+
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
@@ -163,6 +176,7 @@ markers = [
     "unit: fast tests with no external dependencies",
     "integration: tests requiring database or broker",
     "api: end-to-end API tests",
+    "real_git: uses the real git_service instead of the fake remote from conftest",
 ]
 filterwarnings = [
     "error",
@@ -218,7 +232,6 @@ strict_equality = true
 module = [
     "celery.*",
     "passlib.*",
-    "jose.*",
     "git.*",
 ]
 ignore_missing_imports = true

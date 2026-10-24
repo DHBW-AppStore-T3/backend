@@ -1,8 +1,9 @@
+import json
 from datetime import datetime
 from typing import Any, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from app.models import AppVersionApprovalStatus, OpenStackAuthType, TaskStatus, TaskType, UserRole
 
@@ -28,6 +29,11 @@ class UserUpdate(BaseModel):
 
 
 class UserResponse(UserBase):
+    # Output only: the address was validated when the user was created or
+    # synced from Keycloak. Re-validating it strictly here made every response
+    # embedding the user fail with HTTP 500 for reserved domains (.invalid,
+    # .test, example.test), which email-validator rejects.
+    email: str
     userId: UUID
     role: UserRole
     courseId: UUID | None = None
@@ -84,6 +90,7 @@ class CourseMembersUpdate(BaseModel):
     user-id whose FK is (re-)pointed to this course; an existing
     enrollment on another course is overwritten.
     """
+
     userIds: list[UUID] = []
 
 
@@ -126,6 +133,8 @@ class AppResponse(AppBase):
     userId: UUID
     created_at: datetime
     is_private: bool
+    # An admin deactivated the app; only an admin can make it public again.
+    hidden_by_admin: bool = False
     # Data-URL or null. Populated from ``app.image`` + ``app.image_mime``
     # by ``serialize_app_image``; the raw bytes never leave the backend.
     image: str | None = None
@@ -161,6 +170,14 @@ class AppVersionApprovalResponse(BaseModel):
     approvalId: UUID
     appId: UUID
     version_tag: str
+    # The reviewed commit; the approval does not cover the tag once it
+    # moves (.github#7 G). None for reviews from before the pinning.
+    commit_sha: str | None = None
+    # How the version runs and, for pods, the reviewed appstore.yaml (its
+    # SHA-256) and image digests (.github#4).
+    runtime: str = "openstack-vm"
+    spec_sha256: str | None = None
+    image_digests: list[str] | None = None
     status: AppVersionApprovalStatus
     diff_url: str | None = None
     notes: str | None = None
@@ -170,6 +187,14 @@ class AppVersionApprovalResponse(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("image_digests", mode="before")
+    @classmethod
+    def _digests_from_json(cls, value):
+        """Stored as a JSON list on the row."""
+        if isinstance(value, str):
+            return json.loads(value)
+        return value
 
 
 class AppVersionApprovalWithApp(AppVersionApprovalResponse):
@@ -201,6 +226,7 @@ class DeploymentFileUpload(BaseModel):
     ``content_b64`` MUST be standard (RFC 4648) base64. The value sent
     to Terraform stays base64 for cloud-init's ``encoding: b64``.
     """
+
     name: str
     content_b64: str
     size: int
@@ -208,7 +234,9 @@ class DeploymentFileUpload(BaseModel):
 
 
 class DeploymentCreate(DeploymentBase):
-    releaseTag: str | None = None
+    # Required: the deployment runs the commit this tag points to now,
+    # which must be the approved one for a public app (.github#7 G).
+    releaseTag: str = Field(..., min_length=1)
     userInputVar: dict[str, Any] | None = None
     # Files-map keyed by ``@openstack:file:<scope>``-marked variable
     # name. Inner key:
@@ -219,12 +247,22 @@ class DeploymentCreate(DeploymentBase):
     # ends up 1:1 in the Terraform variable.
     files: dict[str, dict[str, DeploymentFileUpload]] | None = None
     teams: list[Team] = []
+    # VM apps: which of the caller's OpenStack credentials to deploy with;
+    # the deployment lives in its project, and holders of a credential for
+    # that project become its peers.
+    credentialId: UUID | None = None
 
 
 class DeploymentResponse(DeploymentBase):
     deploymentId: UUID
     userId: UUID
     releaseTag: str | None = None
+    # The commit every job of the deployment runs.
+    commit_sha: str | None = None
+    # VM deployments: the OpenStack project they live in.
+    os_project_id: str | None = None
+    # ``openstack-vm`` or ``kubernetes`` (pods, .github#4).
+    runtime: str = "openstack-vm"
     userInputVar: dict[str, Any] | None = None
     status: str | None = None  # From latest task
     created_at: datetime | None = None
@@ -275,6 +313,7 @@ class TaskSummary(BaseModel):
 # Terraform outputs parsed
 class DeploymentOutputs(BaseModel):
     """Parsed Terraform outputs - structure depends on app"""
+
     raw: dict[str, Any] | None = None  # Full outputs as dict
 
     model_config = ConfigDict(from_attributes=True)
@@ -294,19 +333,40 @@ class MyAccessResponse(BaseModel):
     unchanged. Empty maps mean "no credentials yet" (no successful deploy,
     or the app issued no per-user account) — a valid 200, not an error.
     """
+
     user_accounts: dict[str, dict[str, Any]] = {}
     team_vms: dict[str, dict[str, Any]] = {}
 
     model_config = ConfigDict(from_attributes=True)
 
 
+class DeploymentPermissions(BaseModel):
+    """What the caller may do with a deployment, decided by the API.
+
+    ``owner_view``: tasks, logs, the live stream, infrastructure and the
+    (redacted) outputs. ``operate``: pause, resume, destroy, redeploy,
+    cancel and team changes. ``member``: the caller is in one of its teams
+    and gets their own access through ``my-access``.
+    """
+
+    owner_view: bool = False
+    operate: bool = False
+    member: bool = False
+
+
 # Full deployment detail response
 class DeploymentDetail(DeploymentWithRelations):
     """Full deployment details with teams, task info, and outputs"""
+
     teams: list[DeploymentTeamResponse] = []
     latest_task: TaskSummary | None = None
     outputs: DeploymentOutputs | None = None
     logs: str | None = None  # Optional: can be excluded for large logs
+    permissions: DeploymentPermissions = DeploymentPermissions()
+    # Lifecycle actions allowed right now (``services.lifecycle``), for a
+    # caller with ``operate``: destroy, delete, pause, resume, cancel,
+    # redeploy. Empty for everyone else.
+    actions: list[str] = []
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -329,6 +389,7 @@ class LifecycleStatesSchema(BaseModel):
     renders a pill from ``status`` + ``task_state`` and shows
     ``fault_message`` as a banner when ``status == "ERROR"``.
     """
+
     status: str | None = None
     task_state: str | None = None
     vm_state: str | None = None
@@ -389,6 +450,7 @@ class DeploymentResourceSchema(BaseModel):
     ``display_name``; the instance-only fields stay ``None`` /
     empty list.
     """
+
     address: str
     type: str
     category: str
@@ -407,14 +469,44 @@ class DeploymentResourceSchema(BaseModel):
     metadata: dict[str, str] | None = None
 
 
+class PodSetupProgress(BaseModel):
+    """What an app reports about its first-start setup (an ``appstore-progress`` log line)."""
+
+    percent: int
+    step: str | None = None
+    # Seconds the app expects to need still; null when it cannot tell yet.
+    etaSeconds: int | None = None
+
+
+class PodWorkloadSchema(BaseModel):
+    """One workload of a pod deployment, read live from the cluster (.github#4)."""
+
+    workload: str
+    team: str | None = None
+    # ``scope: user``: whose workload it is.
+    user_id: str | None = None
+    ready: bool = False
+    restarts: int = 0
+    phase: str
+    url: str | None = None
+    lastEvent: str | None = None
+    # Set while the app runs a setup of its own (an installer) after it started.
+    setup: PodSetupProgress | None = None
+
+
 class DeploymentResourceListResponse(BaseModel):
     """Wrap the list in an object so we can add cursor/refresh-stamp
     metadata later without a breaking API change."""
+
     resources: list[DeploymentResourceSchema]
     # True when the response was fetched with live OpenStack join.
     # False means the caller passed ``?refresh=false`` and the
-    # response reflects only cached TF state.
+    # response reflects only cached TF state. For pods: whether the
+    # cluster could be asked.
     live: bool
+    runtime: str = "openstack-vm"
+    # Pod deployments: their workloads instead of ``resources``.
+    workloads: list[PodWorkloadSchema] = []
 
 
 # ----------------------------------------------------------------
@@ -433,6 +525,7 @@ class TaskBase(BaseModel):
     current_phase: str | None = None
     progress_pct: int | None = None
 
+
 class TaskCreate(TaskBase):
     pass
 
@@ -447,8 +540,27 @@ class TaskUpdate(BaseModel):
     current_phase: str | None = None
     progress_pct: int | None = None
 
-class TaskResponse(TaskBase):
+
+class TaskResponse(BaseModel):
+    """A task as the task API shows it to the owner view.
+
+    Deliberately without ``tf_state`` and ``outputs`` (.github#7 E): the
+    state holds every attribute of every resource, generated passwords
+    included, and the outputs hold every member's credentials. Members get
+    their own entry through ``my-access``; the owner view's outputs are
+    redacted (``task_results.redact_sensitive_outputs``).
+    """
+
     taskId: UUID
+    deploymentId: UUID
+    celeryTaskId: str | None = None
+    type: TaskType
+    status: TaskStatus
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    logs: str | None = None
+    current_phase: str | None = None
+    progress_pct: int | None = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -502,6 +614,7 @@ class UserStatistics(BaseModel):
 # ----------------------------------------------------------------
 class OpenStackCredentialBase(BaseModel):
     """Non-secret connection metadata. Mirrors the `clouds.yaml` shape."""
+
     auth_type: OpenStackAuthType
     auth_url: str
     region_name: str | None = None
@@ -520,6 +633,7 @@ class OpenStackCredentialUpsert(OpenStackCredentialBase):
     application-credential ID. `secret` is the corresponding password or
     application-credential secret. Both are stored encrypted at rest.
     """
+
     identifier: str = Field(..., min_length=1, description="username OR application-credential ID")
     secret: str = Field(..., min_length=1, description="password OR application-credential secret")
 
@@ -537,28 +651,124 @@ class OpenStackCredentialUpsert(OpenStackCredentialBase):
 
 class OpenStackCredentialFromYaml(BaseModel):
     """Convenience body: paste/upload a `clouds.yaml` and let the server pick it apart."""
+
     clouds_yaml: str = Field(..., min_length=1, description="raw clouds.yaml file contents")
     cloud_name: str | None = Field(
-        None, description="Pick a specific cloud from the YAML; required when there is more than one"
+        None,
+        description="Pick a specific cloud from the YAML; required when there is more than one",
     )
 
 
-class OpenStackCredentialResponse(OpenStackCredentialBase):
-    """Masked response — never returns identifier/secret material.
+class OpenStackCredentialResponse(BaseModel):
+    """A stored credential, masked — never identifier or secret material.
 
-    When `has_credential` is False, base fields are absent/empty and the
-    consumer should branch on `has_credential`. `is_locked` and
-    `active_deployments` are populated regardless so the frontend can
-    render the appropriate guard UI even before any credential exists.
+    ``project_id``/``project_name`` are the project Keystone scoped the
+    credential to once ``project_verified``; a credential saved before
+    projects were checked is unverified until re-checked (``/test``) and
+    cannot be deployed with. ``active_deployments`` counts the caller's
+    live deployments in that project (for an unverified credential: those
+    whose project is still unknown); deleting the credential is refused
+    while there are any, so they cannot be orphaned.
     """
-    auth_type: OpenStackAuthType | None = None  # type: ignore[assignment]
-    auth_url: str | None = None  # type: ignore[assignment]
-    has_credential: bool = True
+
+    credentialId: UUID
+    auth_type: OpenStackAuthType
+    auth_url: str
+    region_name: str | None = None
+    interface: str | None = None
+    identity_api_version: str | None = None
+    project_id: str | None = None
+    project_name: str | None = None
+    project_verified: bool = False
+    user_domain_name: str | None = None
+    project_domain_name: str | None = None
     last_validated_at: datetime | None = None
     last_validation_error: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
-    is_locked: bool = False
     active_deployments: int = 0
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# ----------------------------------------------------------------
+# OPENSTACK RESOURCE PICKER (``/me/openstack-credentials/{id}/resources``)
+# ----------------------------------------------------------------
+# Flat views of what the wizard offers for ``@openstack:`` markers. Every
+# item has ``id`` and ``name``, so a picker reads them uniformly.
+class PickerItem(BaseModel):
+    """An OpenStack resource offered in the deploy wizard's value help."""
+
+    id: str | None = None
+    name: str = ""
+
+
+class NetworkItem(PickerItem):
+    """A Neutron network."""
+
+    description: str = ""
+    shared: bool = False
+    external: bool = False
+    status: str = ""
+
+
+class SubnetItem(PickerItem):
+    """A Neutron subnet."""
+
+    cidr: str = ""
+    ip_version: int | None = 4
+    network_id: str | None = None
+    gateway_ip: str = ""
+
+
+class FlavorItem(PickerItem):
+    """A Nova flavor."""
+
+    vcpus: int = 0
+    ram: int = Field(0, description="MB")
+    disk: int = Field(0, description="GB")
+    is_public: bool = True
+
+
+class ImageItem(PickerItem):
+    """A Glance image."""
+
+    status: str = ""
+    visibility: str = ""
+    size: int = Field(0, description="bytes")
+    disk_format: str = ""
+
+
+class KeypairItem(PickerItem):
+    """A Nova key pair of the credential's user."""
+
+    fingerprint: str = ""
+    type: str = "ssh"
+
+
+class DescribedItem(PickerItem):
+    """A resource with a description (security groups, floating IP pools)."""
+
+    description: str = ""
+
+
+class VolumeItem(PickerItem):
+    """A Cinder volume."""
+
+    size: int = Field(0, description="GB")
+    status: str = ""
+    volume_type: str = ""
+    bootable: bool = False
+
+
+class RouterItem(PickerItem):
+    """A Neutron router."""
+
+    status: str = ""
+    external_gateway_info: dict[str, Any] | None = None
+
+
+class AvailabilityZoneItem(PickerItem):
+    """A compute availability zone."""
+
+    state: str | dict[str, Any] = ""

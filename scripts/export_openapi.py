@@ -18,6 +18,8 @@ os.environ.setdefault(
     "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="
 )
 os.environ.setdefault("DISABLE_BACKGROUND_TASKS", "1")
+# The placeholder key above is refused outside development (.github#7 O).
+os.environ.setdefault("APP_ENV", "development")
 
 # Add backend root to Python module path
 backend_dir = Path(__file__).resolve().parent.parent

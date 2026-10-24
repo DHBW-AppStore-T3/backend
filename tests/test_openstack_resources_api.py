@@ -1,26 +1,29 @@
 """API-Level Tests für die OpenStack-Resources-Read-API.
 
-Abgedeckt:
- * GET  /me/openstack/resources/flavors        (auth + payload-shape)
- * GET  /me/openstack/resources/flavors        (401 ohne Auth)
- * GET  /me/openstack/resources/images?status= (Visibility/Status-Filter)
- * POST /me/openstack/resources/refresh        (nur eigener Cache)
- * POST /me/openstack/resources/refresh        (invalidiert nachfolgende GETs)
- * GET  /me/openstack/resources/subnets        (network_id-Query optional)
+Abgedeckt (unter ``/me/openstack-credentials/{id}/resources``):
+ * GET  /flavors        (auth + payload-shape)
+ * GET  /flavors        (401 ohne Auth)
+ * GET  /images?status= (Visibility/Status-Filter)
+ * POST /refresh        (nur der Cache dieser Credential)
+ * POST /refresh        (invalidiert nachfolgende GETs)
+ * GET  /subnets        (network_id-Query optional)
 
-OpenStack wird wie in ``test_deployment_resources_endpoint.py`` über
-``user_connection`` gepatcht — kein realer Cloud-Call.
+OpenStack wird über ``openstack_client.credential_connection`` gepatcht —
+kein realer Cloud-Call.
 """
 from __future__ import annotations
 
+import uuid
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from app.services import openstack_client
+from tests.conftest import add_credential
 
-PREFIX = "/me/openstack/resources"
+CREDENTIAL_ID = uuid.UUID("00000000-0000-4000-8000-00000000c0de")
+PREFIX = f"/me/openstack-credentials/{CREDENTIAL_ID}/resources"
 
 
 # ----------------------------------------------------------------
@@ -75,18 +78,19 @@ def _subnet_mock(**overrides):
 
 
 @pytest.fixture
-def patched_user_connection():
-    """Patcht den Context-Manager ``user_connection`` im Resources-Router.
-    Liefert ein MagicMock, das pro Test mit den passenden SDK-Antworten
-    konfiguriert wird."""
+def patched_user_connection(db, mock_user):
+    """Legt die Credential ``CREDENTIAL_ID`` von ``mock_user`` an und patcht
+    ``credential_connection`` im Resources-Router. Liefert ein MagicMock,
+    das pro Test mit den passenden SDK-Antworten konfiguriert wird."""
+    add_credential(db, mock_user, credential_id=CREDENTIAL_ID)
     conn = MagicMock()
 
     @contextmanager
-    def _fake_conn(_db, _user):
+    def _fake_conn(_row):
         yield conn
 
     with patch(
-        "app.routers.openstack_resources.openstack_client.user_connection",
+        "app.routers.openstack_resources.openstack_client.credential_connection",
         _fake_conn,
     ):
         yield conn
@@ -165,33 +169,27 @@ def test_list_images_filters_by_visibility(
 
 
 # ----------------------------------------------------------------
-# 4. refresh — wirkt nur auf den aufrufenden User
+# 4. refresh — wirkt nur auf die eigene Credential; fremde sind 404
 # ----------------------------------------------------------------
 @pytest.mark.integration
 def test_refresh_cache_owner_only(
     client, db, mock_user, mock_admin, patched_user_connection
 ):
-    # Cache-Einträge für beide User vorpopulieren
+    other = add_credential(db, mock_admin, identifier="admin-cred")
     openstack_client._cache[
-        openstack_client._make_key(mock_user.userId, "flavors", None)
+        openstack_client._make_key(CREDENTIAL_ID, "flavors", None)
     ] = (float("inf"), [{"id": "f-mock-user"}])
     openstack_client._cache[
-        openstack_client._make_key(mock_admin.userId, "flavors", None)
+        openstack_client._make_key(other.credentialId, "flavors", None)
     ] = (float("inf"), [{"id": "f-mock-admin"}])
 
-    # mock_user triggert den Refresh
-    response = client.post(f"{PREFIX}/refresh")
-    assert response.status_code == 204
+    assert client.post(f"{PREFIX}/refresh").status_code == 204
+    # Eine fremde Credential gibt es für den Aufrufer nicht.
+    assert client.post(f"/me/openstack-credentials/{other.credentialId}/resources/refresh").status_code == 404
+    assert client.get(f"/me/openstack-credentials/{other.credentialId}/resources/flavors").status_code == 404
 
-    # Eigener Eintrag weg, fremder Eintrag bleibt
-    assert (
-        openstack_client._make_key(mock_user.userId, "flavors", None)
-        not in openstack_client._cache
-    )
-    assert (
-        openstack_client._make_key(mock_admin.userId, "flavors", None)
-        in openstack_client._cache
-    )
+    assert openstack_client._make_key(CREDENTIAL_ID, "flavors", None) not in openstack_client._cache
+    assert openstack_client._make_key(other.credentialId, "flavors", None) in openstack_client._cache
 
 
 # ----------------------------------------------------------------
@@ -228,6 +226,31 @@ def test_refresh_cache_invalidates_subsequent_list_calls(
     assert response3.status_code == 200
     assert response3.json()[0]["name"] == "updated"
     assert patched_user_connection.compute.flavors.call_count == 2
+
+
+@pytest.mark.integration
+def test_refresh_by_marker_kind_drops_only_that_kind(
+    client, db, mock_user, patched_user_connection
+):
+    """``kind`` is the marker vocabulary the UI knows; availability zones,
+    cached per service, are dropped by their prefix."""
+    patched_user_connection.compute.flavors.return_value = [_flavor_mock()]
+    client.get(f"{PREFIX}/flavors")
+    client.get(f"{PREFIX}/availability-zones")
+    assert openstack_client.invalidate(CREDENTIAL_ID, "networks") == 0
+
+    assert client.post(f"{PREFIX}/refresh", params={"kind": "availability_zone"}).status_code == 204
+    with openstack_client._cache_lock:
+        kinds = {key[1] for key in openstack_client._cache if key[0] == str(CREDENTIAL_ID)}
+    assert kinds == {"flavors"}
+
+    assert client.post(f"{PREFIX}/refresh", params={"kind": "flavor"}).status_code == 204
+    client.get(f"{PREFIX}/flavors")
+    assert patched_user_connection.compute.flavors.call_count == 2
+
+    bad = client.post(f"{PREFIX}/refresh", params={"kind": "networks"})
+    assert bad.status_code == 422
+    assert bad.json()["detail"]["reason"] == "unknown_resource_kind"
 
 
 # ----------------------------------------------------------------

@@ -1,0 +1,1835 @@
+[
+  {
+    "apiVersion": "v1",
+    "kind": "Namespace",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "latest"
+      },
+      "name": "dep-123e4567"
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "ResourceQuota",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555"
+      },
+      "name": "appstore-quota",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "hard": {
+        "limits.cpu": "3000m",
+        "limits.memory": "6144Mi",
+        "persistentvolumeclaims": "6",
+        "pods": "6",
+        "requests.cpu": "3000m",
+        "requests.memory": "6144Mi",
+        "requests.storage": "30720Mi",
+        "services": "6",
+        "services.loadbalancers": "0",
+        "services.nodeports": "0"
+      }
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "LimitRange",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555"
+      },
+      "name": "appstore-limits",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "limits": [
+        {
+          "default": {
+            "cpu": "500m",
+            "memory": "1Gi"
+          },
+          "defaultRequest": {
+            "cpu": "500m",
+            "memory": "1Gi"
+          },
+          "type": "Container"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "networking.k8s.io/v1",
+    "kind": "NetworkPolicy",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555"
+      },
+      "name": "default-deny",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "podSelector": {},
+      "policyTypes": [
+        "Ingress",
+        "Egress"
+      ]
+    }
+  },
+  {
+    "apiVersion": "networking.k8s.io/v1",
+    "kind": "NetworkPolicy",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555"
+      },
+      "name": "allow-ingress-controller",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "ingress": [
+        {
+          "from": [
+            {
+              "namespaceSelector": {
+                "matchLabels": {
+                  "kubernetes.io/metadata.name": "kube-system"
+                }
+              }
+            }
+          ],
+          "ports": [
+            {
+              "port": 8080,
+              "protocol": "TCP"
+            }
+          ]
+        }
+      ],
+      "podSelector": {},
+      "policyTypes": [
+        "Ingress"
+      ]
+    }
+  },
+  {
+    "apiVersion": "networking.k8s.io/v1",
+    "kind": "NetworkPolicy",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555"
+      },
+      "name": "allow-dns",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "egress": [
+        {
+          "ports": [
+            {
+              "port": 53,
+              "protocol": "UDP"
+            },
+            {
+              "port": 53,
+              "protocol": "TCP"
+            }
+          ],
+          "to": [
+            {
+              "namespaceSelector": {
+                "matchLabels": {
+                  "kubernetes.io/metadata.name": "kube-system"
+                }
+              },
+              "podSelector": {
+                "matchLabels": {
+                  "k8s-app": "kube-dns"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "podSelector": {},
+      "policyTypes": [
+        "Egress"
+      ]
+    }
+  },
+  {
+    "apiVersion": "networking.k8s.io/v1",
+    "kind": "NetworkPolicy",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555"
+      },
+      "name": "allow-egress-internet",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "egress": [
+        {
+          "to": [
+            {
+              "ipBlock": {
+                "cidr": "0.0.0.0/0",
+                "except": [
+                  "10.0.0.0/8",
+                  "172.16.0.0/12",
+                  "192.168.0.0/16",
+                  "169.254.0.0/16"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "to": [
+            {
+              "ipBlock": {
+                "cidr": "::/0",
+                "except": [
+                  "fc00::/7",
+                  "fe80::/10"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "podSelector": {},
+      "policyTypes": [
+        "Egress"
+      ]
+    }
+  },
+  {
+    "apiVersion": "networking.k8s.io/v1",
+    "kind": "NetworkPolicy",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555"
+      },
+      "name": "allow-intra-namespace",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "egress": [
+        {
+          "ports": [
+            {
+              "port": 8080,
+              "protocol": "TCP"
+            }
+          ],
+          "to": [
+            {
+              "podSelector": {}
+            }
+          ]
+        }
+      ],
+      "ingress": [
+        {
+          "from": [
+            {
+              "podSelector": {}
+            }
+          ],
+          "ports": [
+            {
+              "port": 8080,
+              "protocol": "TCP"
+            }
+          ]
+        }
+      ],
+      "podSelector": {},
+      "policyTypes": [
+        "Ingress",
+        "Egress"
+      ]
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Secret",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/workload": "team-a-alice"
+      },
+      "name": "team-a-alice",
+      "namespace": "dep-123e4567"
+    },
+    "stringData": {
+      "password": "pw-team-a-alice"
+    },
+    "type": "Opaque"
+  },
+  {
+    "apiVersion": "apps/v1",
+    "kind": "StatefulSet",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/team": "team-a",
+        "appstore.dhbw/user": "c2ef90b9-02bc-5d53-93cd-92652b6e1b41",
+        "appstore.dhbw/workload": "team-a-alice"
+      },
+      "name": "team-a-alice",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "replicas": 1,
+      "selector": {
+        "matchLabels": {
+          "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+          "appstore.dhbw/workload": "team-a-alice"
+        }
+      },
+      "serviceName": "team-a-alice",
+      "template": {
+        "metadata": {
+          "labels": {
+            "app.kubernetes.io/managed-by": "appstore",
+            "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+            "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+            "appstore.dhbw/workload": "team-a-alice"
+          }
+        },
+        "spec": {
+          "automountServiceAccountToken": false,
+          "containers": [
+            {
+              "env": [
+                {
+                  "name": "PASSWORD",
+                  "valueFrom": {
+                    "secretKeyRef": {
+                      "key": "password",
+                      "name": "team-a-alice"
+                    }
+                  }
+                },
+                {
+                  "name": "TEAM",
+                  "value": "team-a"
+                },
+                {
+                  "name": "APPSTORE_VAR_CPU_CLASS",
+                  "value": "small"
+                }
+              ],
+              "image": "ghcr.io/dhbw-appstore-t3/apps/code-server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "name": "ide",
+              "ports": [
+                {
+                  "containerPort": 8080,
+                  "name": "http",
+                  "protocol": "TCP"
+                }
+              ],
+              "readinessProbe": {
+                "failureThreshold": 3,
+                "periodSeconds": 3,
+                "tcpSocket": {
+                  "port": "http"
+                },
+                "timeoutSeconds": 2
+              },
+              "resources": {
+                "limits": {
+                  "cpu": "500m",
+                  "memory": "1Gi"
+                },
+                "requests": {
+                  "cpu": "500m",
+                  "memory": "1Gi"
+                }
+              },
+              "securityContext": {
+                "allowPrivilegeEscalation": false,
+                "capabilities": {
+                  "drop": [
+                    "ALL"
+                  ]
+                },
+                "readOnlyRootFilesystem": true,
+                "runAsNonRoot": true,
+                "seccompProfile": {
+                  "type": "RuntimeDefault"
+                }
+              },
+              "volumeMounts": [
+                {
+                  "mountPath": "/tmp",
+                  "name": "ide-tmp-0"
+                },
+                {
+                  "mountPath": "/home/coder",
+                  "name": "data"
+                }
+              ]
+            }
+          ],
+          "enableServiceLinks": false,
+          "nodeSelector": {
+            "appstore.dhbw/workload": "student"
+          },
+          "securityContext": {
+            "fsGroup": 1000,
+            "runAsGroup": 1000,
+            "runAsNonRoot": true,
+            "runAsUser": 1000,
+            "seccompProfile": {
+              "type": "RuntimeDefault"
+            }
+          },
+          "tolerations": [
+            {
+              "effect": "NoSchedule",
+              "key": "appstore.dhbw/workload",
+              "operator": "Equal",
+              "value": "student"
+            }
+          ],
+          "volumes": [
+            {
+              "emptyDir": {
+                "sizeLimit": "1Gi"
+              },
+              "name": "ide-tmp-0"
+            }
+          ]
+        }
+      },
+      "volumeClaimTemplates": [
+        {
+          "metadata": {
+            "labels": {
+              "app.kubernetes.io/managed-by": "appstore",
+              "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+              "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+              "appstore.dhbw/workload": "team-a-alice"
+            },
+            "name": "data"
+          },
+          "spec": {
+            "accessModes": [
+              "ReadWriteOnce"
+            ],
+            "resources": {
+              "requests": {
+                "storage": "5Gi"
+              }
+            },
+            "storageClassName": "local-path"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Service",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/workload": "team-a-alice"
+      },
+      "name": "team-a-alice",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "ports": [
+        {
+          "name": "http",
+          "port": 8080,
+          "targetPort": "http"
+        }
+      ],
+      "selector": {
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/workload": "team-a-alice"
+      },
+      "type": "ClusterIP"
+    }
+  },
+  {
+    "apiVersion": "networking.k8s.io/v1",
+    "kind": "Ingress",
+    "metadata": {
+      "annotations": {
+        "cert-manager.io/cluster-issuer": "letsencrypt"
+      },
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/workload": "team-a-alice"
+      },
+      "name": "team-a-alice",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "ingressClassName": "traefik",
+      "rules": [
+        {
+          "host": "team-a-alice-123e4567.apps.t3-k8s.example.org",
+          "http": {
+            "paths": [
+              {
+                "backend": {
+                  "service": {
+                    "name": "team-a-alice",
+                    "port": {
+                      "name": "http"
+                    }
+                  }
+                },
+                "path": "/",
+                "pathType": "Prefix"
+              }
+            ]
+          }
+        }
+      ],
+      "tls": [
+        {
+          "hosts": [
+            "team-a-alice-123e4567.apps.t3-k8s.example.org"
+          ],
+          "secretName": "team-a-alice-tls"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Secret",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/workload": "team-a-bob"
+      },
+      "name": "team-a-bob",
+      "namespace": "dep-123e4567"
+    },
+    "stringData": {
+      "password": "pw-team-a-bob"
+    },
+    "type": "Opaque"
+  },
+  {
+    "apiVersion": "apps/v1",
+    "kind": "StatefulSet",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/team": "team-a",
+        "appstore.dhbw/user": "ef45d397-0411-5f5e-8940-9bdbdef3958b",
+        "appstore.dhbw/workload": "team-a-bob"
+      },
+      "name": "team-a-bob",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "replicas": 1,
+      "selector": {
+        "matchLabels": {
+          "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+          "appstore.dhbw/workload": "team-a-bob"
+        }
+      },
+      "serviceName": "team-a-bob",
+      "template": {
+        "metadata": {
+          "labels": {
+            "app.kubernetes.io/managed-by": "appstore",
+            "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+            "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+            "appstore.dhbw/workload": "team-a-bob"
+          }
+        },
+        "spec": {
+          "automountServiceAccountToken": false,
+          "containers": [
+            {
+              "env": [
+                {
+                  "name": "PASSWORD",
+                  "valueFrom": {
+                    "secretKeyRef": {
+                      "key": "password",
+                      "name": "team-a-bob"
+                    }
+                  }
+                },
+                {
+                  "name": "TEAM",
+                  "value": "team-a"
+                },
+                {
+                  "name": "APPSTORE_VAR_CPU_CLASS",
+                  "value": "small"
+                }
+              ],
+              "image": "ghcr.io/dhbw-appstore-t3/apps/code-server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "name": "ide",
+              "ports": [
+                {
+                  "containerPort": 8080,
+                  "name": "http",
+                  "protocol": "TCP"
+                }
+              ],
+              "readinessProbe": {
+                "failureThreshold": 3,
+                "periodSeconds": 3,
+                "tcpSocket": {
+                  "port": "http"
+                },
+                "timeoutSeconds": 2
+              },
+              "resources": {
+                "limits": {
+                  "cpu": "500m",
+                  "memory": "1Gi"
+                },
+                "requests": {
+                  "cpu": "500m",
+                  "memory": "1Gi"
+                }
+              },
+              "securityContext": {
+                "allowPrivilegeEscalation": false,
+                "capabilities": {
+                  "drop": [
+                    "ALL"
+                  ]
+                },
+                "readOnlyRootFilesystem": true,
+                "runAsNonRoot": true,
+                "seccompProfile": {
+                  "type": "RuntimeDefault"
+                }
+              },
+              "volumeMounts": [
+                {
+                  "mountPath": "/tmp",
+                  "name": "ide-tmp-0"
+                },
+                {
+                  "mountPath": "/home/coder",
+                  "name": "data"
+                }
+              ]
+            }
+          ],
+          "enableServiceLinks": false,
+          "nodeSelector": {
+            "appstore.dhbw/workload": "student"
+          },
+          "securityContext": {
+            "fsGroup": 1000,
+            "runAsGroup": 1000,
+            "runAsNonRoot": true,
+            "runAsUser": 1000,
+            "seccompProfile": {
+              "type": "RuntimeDefault"
+            }
+          },
+          "tolerations": [
+            {
+              "effect": "NoSchedule",
+              "key": "appstore.dhbw/workload",
+              "operator": "Equal",
+              "value": "student"
+            }
+          ],
+          "volumes": [
+            {
+              "emptyDir": {
+                "sizeLimit": "1Gi"
+              },
+              "name": "ide-tmp-0"
+            }
+          ]
+        }
+      },
+      "volumeClaimTemplates": [
+        {
+          "metadata": {
+            "labels": {
+              "app.kubernetes.io/managed-by": "appstore",
+              "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+              "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+              "appstore.dhbw/workload": "team-a-bob"
+            },
+            "name": "data"
+          },
+          "spec": {
+            "accessModes": [
+              "ReadWriteOnce"
+            ],
+            "resources": {
+              "requests": {
+                "storage": "5Gi"
+              }
+            },
+            "storageClassName": "local-path"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Service",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/workload": "team-a-bob"
+      },
+      "name": "team-a-bob",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "ports": [
+        {
+          "name": "http",
+          "port": 8080,
+          "targetPort": "http"
+        }
+      ],
+      "selector": {
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/workload": "team-a-bob"
+      },
+      "type": "ClusterIP"
+    }
+  },
+  {
+    "apiVersion": "networking.k8s.io/v1",
+    "kind": "Ingress",
+    "metadata": {
+      "annotations": {
+        "cert-manager.io/cluster-issuer": "letsencrypt"
+      },
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/workload": "team-a-bob"
+      },
+      "name": "team-a-bob",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "ingressClassName": "traefik",
+      "rules": [
+        {
+          "host": "team-a-bob-123e4567.apps.t3-k8s.example.org",
+          "http": {
+            "paths": [
+              {
+                "backend": {
+                  "service": {
+                    "name": "team-a-bob",
+                    "port": {
+                      "name": "http"
+                    }
+                  }
+                },
+                "path": "/",
+                "pathType": "Prefix"
+              }
+            ]
+          }
+        }
+      ],
+      "tls": [
+        {
+          "hosts": [
+            "team-a-bob-123e4567.apps.t3-k8s.example.org"
+          ],
+          "secretName": "team-a-bob-tls"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Secret",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/workload": "team-b-carol"
+      },
+      "name": "team-b-carol",
+      "namespace": "dep-123e4567"
+    },
+    "stringData": {
+      "password": "pw-team-b-carol"
+    },
+    "type": "Opaque"
+  },
+  {
+    "apiVersion": "apps/v1",
+    "kind": "StatefulSet",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/team": "team-b",
+        "appstore.dhbw/user": "17f615a4-4544-5549-9039-7ff246bc88a2",
+        "appstore.dhbw/workload": "team-b-carol"
+      },
+      "name": "team-b-carol",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "replicas": 1,
+      "selector": {
+        "matchLabels": {
+          "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+          "appstore.dhbw/workload": "team-b-carol"
+        }
+      },
+      "serviceName": "team-b-carol",
+      "template": {
+        "metadata": {
+          "labels": {
+            "app.kubernetes.io/managed-by": "appstore",
+            "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+            "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+            "appstore.dhbw/workload": "team-b-carol"
+          }
+        },
+        "spec": {
+          "automountServiceAccountToken": false,
+          "containers": [
+            {
+              "env": [
+                {
+                  "name": "PASSWORD",
+                  "valueFrom": {
+                    "secretKeyRef": {
+                      "key": "password",
+                      "name": "team-b-carol"
+                    }
+                  }
+                },
+                {
+                  "name": "TEAM",
+                  "value": "team-b"
+                },
+                {
+                  "name": "APPSTORE_VAR_CPU_CLASS",
+                  "value": "small"
+                }
+              ],
+              "image": "ghcr.io/dhbw-appstore-t3/apps/code-server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "name": "ide",
+              "ports": [
+                {
+                  "containerPort": 8080,
+                  "name": "http",
+                  "protocol": "TCP"
+                }
+              ],
+              "readinessProbe": {
+                "failureThreshold": 3,
+                "periodSeconds": 3,
+                "tcpSocket": {
+                  "port": "http"
+                },
+                "timeoutSeconds": 2
+              },
+              "resources": {
+                "limits": {
+                  "cpu": "500m",
+                  "memory": "1Gi"
+                },
+                "requests": {
+                  "cpu": "500m",
+                  "memory": "1Gi"
+                }
+              },
+              "securityContext": {
+                "allowPrivilegeEscalation": false,
+                "capabilities": {
+                  "drop": [
+                    "ALL"
+                  ]
+                },
+                "readOnlyRootFilesystem": true,
+                "runAsNonRoot": true,
+                "seccompProfile": {
+                  "type": "RuntimeDefault"
+                }
+              },
+              "volumeMounts": [
+                {
+                  "mountPath": "/tmp",
+                  "name": "ide-tmp-0"
+                },
+                {
+                  "mountPath": "/home/coder",
+                  "name": "data"
+                }
+              ]
+            }
+          ],
+          "enableServiceLinks": false,
+          "nodeSelector": {
+            "appstore.dhbw/workload": "student"
+          },
+          "securityContext": {
+            "fsGroup": 1000,
+            "runAsGroup": 1000,
+            "runAsNonRoot": true,
+            "runAsUser": 1000,
+            "seccompProfile": {
+              "type": "RuntimeDefault"
+            }
+          },
+          "tolerations": [
+            {
+              "effect": "NoSchedule",
+              "key": "appstore.dhbw/workload",
+              "operator": "Equal",
+              "value": "student"
+            }
+          ],
+          "volumes": [
+            {
+              "emptyDir": {
+                "sizeLimit": "1Gi"
+              },
+              "name": "ide-tmp-0"
+            }
+          ]
+        }
+      },
+      "volumeClaimTemplates": [
+        {
+          "metadata": {
+            "labels": {
+              "app.kubernetes.io/managed-by": "appstore",
+              "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+              "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+              "appstore.dhbw/workload": "team-b-carol"
+            },
+            "name": "data"
+          },
+          "spec": {
+            "accessModes": [
+              "ReadWriteOnce"
+            ],
+            "resources": {
+              "requests": {
+                "storage": "5Gi"
+              }
+            },
+            "storageClassName": "local-path"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Service",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/workload": "team-b-carol"
+      },
+      "name": "team-b-carol",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "ports": [
+        {
+          "name": "http",
+          "port": 8080,
+          "targetPort": "http"
+        }
+      ],
+      "selector": {
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/workload": "team-b-carol"
+      },
+      "type": "ClusterIP"
+    }
+  },
+  {
+    "apiVersion": "networking.k8s.io/v1",
+    "kind": "Ingress",
+    "metadata": {
+      "annotations": {
+        "cert-manager.io/cluster-issuer": "letsencrypt"
+      },
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/workload": "team-b-carol"
+      },
+      "name": "team-b-carol",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "ingressClassName": "traefik",
+      "rules": [
+        {
+          "host": "team-b-carol-123e4567.apps.t3-k8s.example.org",
+          "http": {
+            "paths": [
+              {
+                "backend": {
+                  "service": {
+                    "name": "team-b-carol",
+                    "port": {
+                      "name": "http"
+                    }
+                  }
+                },
+                "path": "/",
+                "pathType": "Prefix"
+              }
+            ]
+          }
+        }
+      ],
+      "tls": [
+        {
+          "hosts": [
+            "team-b-carol-123e4567.apps.t3-k8s.example.org"
+          ],
+          "secretName": "team-b-carol-tls"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Secret",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/workload": "team-b-dave"
+      },
+      "name": "team-b-dave",
+      "namespace": "dep-123e4567"
+    },
+    "stringData": {
+      "password": "pw-team-b-dave"
+    },
+    "type": "Opaque"
+  },
+  {
+    "apiVersion": "apps/v1",
+    "kind": "StatefulSet",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/team": "team-b",
+        "appstore.dhbw/user": "a20cf631-9536-5551-9693-9e5b409d3c88",
+        "appstore.dhbw/workload": "team-b-dave"
+      },
+      "name": "team-b-dave",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "replicas": 1,
+      "selector": {
+        "matchLabels": {
+          "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+          "appstore.dhbw/workload": "team-b-dave"
+        }
+      },
+      "serviceName": "team-b-dave",
+      "template": {
+        "metadata": {
+          "labels": {
+            "app.kubernetes.io/managed-by": "appstore",
+            "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+            "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+            "appstore.dhbw/workload": "team-b-dave"
+          }
+        },
+        "spec": {
+          "automountServiceAccountToken": false,
+          "containers": [
+            {
+              "env": [
+                {
+                  "name": "PASSWORD",
+                  "valueFrom": {
+                    "secretKeyRef": {
+                      "key": "password",
+                      "name": "team-b-dave"
+                    }
+                  }
+                },
+                {
+                  "name": "TEAM",
+                  "value": "team-b"
+                },
+                {
+                  "name": "APPSTORE_VAR_CPU_CLASS",
+                  "value": "small"
+                }
+              ],
+              "image": "ghcr.io/dhbw-appstore-t3/apps/code-server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "name": "ide",
+              "ports": [
+                {
+                  "containerPort": 8080,
+                  "name": "http",
+                  "protocol": "TCP"
+                }
+              ],
+              "readinessProbe": {
+                "failureThreshold": 3,
+                "periodSeconds": 3,
+                "tcpSocket": {
+                  "port": "http"
+                },
+                "timeoutSeconds": 2
+              },
+              "resources": {
+                "limits": {
+                  "cpu": "500m",
+                  "memory": "1Gi"
+                },
+                "requests": {
+                  "cpu": "500m",
+                  "memory": "1Gi"
+                }
+              },
+              "securityContext": {
+                "allowPrivilegeEscalation": false,
+                "capabilities": {
+                  "drop": [
+                    "ALL"
+                  ]
+                },
+                "readOnlyRootFilesystem": true,
+                "runAsNonRoot": true,
+                "seccompProfile": {
+                  "type": "RuntimeDefault"
+                }
+              },
+              "volumeMounts": [
+                {
+                  "mountPath": "/tmp",
+                  "name": "ide-tmp-0"
+                },
+                {
+                  "mountPath": "/home/coder",
+                  "name": "data"
+                }
+              ]
+            }
+          ],
+          "enableServiceLinks": false,
+          "nodeSelector": {
+            "appstore.dhbw/workload": "student"
+          },
+          "securityContext": {
+            "fsGroup": 1000,
+            "runAsGroup": 1000,
+            "runAsNonRoot": true,
+            "runAsUser": 1000,
+            "seccompProfile": {
+              "type": "RuntimeDefault"
+            }
+          },
+          "tolerations": [
+            {
+              "effect": "NoSchedule",
+              "key": "appstore.dhbw/workload",
+              "operator": "Equal",
+              "value": "student"
+            }
+          ],
+          "volumes": [
+            {
+              "emptyDir": {
+                "sizeLimit": "1Gi"
+              },
+              "name": "ide-tmp-0"
+            }
+          ]
+        }
+      },
+      "volumeClaimTemplates": [
+        {
+          "metadata": {
+            "labels": {
+              "app.kubernetes.io/managed-by": "appstore",
+              "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+              "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+              "appstore.dhbw/workload": "team-b-dave"
+            },
+            "name": "data"
+          },
+          "spec": {
+            "accessModes": [
+              "ReadWriteOnce"
+            ],
+            "resources": {
+              "requests": {
+                "storage": "5Gi"
+              }
+            },
+            "storageClassName": "local-path"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Service",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/workload": "team-b-dave"
+      },
+      "name": "team-b-dave",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "ports": [
+        {
+          "name": "http",
+          "port": 8080,
+          "targetPort": "http"
+        }
+      ],
+      "selector": {
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/workload": "team-b-dave"
+      },
+      "type": "ClusterIP"
+    }
+  },
+  {
+    "apiVersion": "networking.k8s.io/v1",
+    "kind": "Ingress",
+    "metadata": {
+      "annotations": {
+        "cert-manager.io/cluster-issuer": "letsencrypt"
+      },
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/workload": "team-b-dave"
+      },
+      "name": "team-b-dave",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "ingressClassName": "traefik",
+      "rules": [
+        {
+          "host": "team-b-dave-123e4567.apps.t3-k8s.example.org",
+          "http": {
+            "paths": [
+              {
+                "backend": {
+                  "service": {
+                    "name": "team-b-dave",
+                    "port": {
+                      "name": "http"
+                    }
+                  }
+                },
+                "path": "/",
+                "pathType": "Prefix"
+              }
+            ]
+          }
+        }
+      ],
+      "tls": [
+        {
+          "hosts": [
+            "team-b-dave-123e4567.apps.t3-k8s.example.org"
+          ],
+          "secretName": "team-b-dave-tls"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Secret",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/workload": "team-c-erin"
+      },
+      "name": "team-c-erin",
+      "namespace": "dep-123e4567"
+    },
+    "stringData": {
+      "password": "pw-team-c-erin"
+    },
+    "type": "Opaque"
+  },
+  {
+    "apiVersion": "apps/v1",
+    "kind": "StatefulSet",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/team": "team-c",
+        "appstore.dhbw/user": "315c3ec5-1672-5e9e-8ad9-5106161bafd8",
+        "appstore.dhbw/workload": "team-c-erin"
+      },
+      "name": "team-c-erin",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "replicas": 1,
+      "selector": {
+        "matchLabels": {
+          "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+          "appstore.dhbw/workload": "team-c-erin"
+        }
+      },
+      "serviceName": "team-c-erin",
+      "template": {
+        "metadata": {
+          "labels": {
+            "app.kubernetes.io/managed-by": "appstore",
+            "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+            "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+            "appstore.dhbw/workload": "team-c-erin"
+          }
+        },
+        "spec": {
+          "automountServiceAccountToken": false,
+          "containers": [
+            {
+              "env": [
+                {
+                  "name": "PASSWORD",
+                  "valueFrom": {
+                    "secretKeyRef": {
+                      "key": "password",
+                      "name": "team-c-erin"
+                    }
+                  }
+                },
+                {
+                  "name": "TEAM",
+                  "value": "team-c"
+                },
+                {
+                  "name": "APPSTORE_VAR_CPU_CLASS",
+                  "value": "small"
+                }
+              ],
+              "image": "ghcr.io/dhbw-appstore-t3/apps/code-server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "name": "ide",
+              "ports": [
+                {
+                  "containerPort": 8080,
+                  "name": "http",
+                  "protocol": "TCP"
+                }
+              ],
+              "readinessProbe": {
+                "failureThreshold": 3,
+                "periodSeconds": 3,
+                "tcpSocket": {
+                  "port": "http"
+                },
+                "timeoutSeconds": 2
+              },
+              "resources": {
+                "limits": {
+                  "cpu": "500m",
+                  "memory": "1Gi"
+                },
+                "requests": {
+                  "cpu": "500m",
+                  "memory": "1Gi"
+                }
+              },
+              "securityContext": {
+                "allowPrivilegeEscalation": false,
+                "capabilities": {
+                  "drop": [
+                    "ALL"
+                  ]
+                },
+                "readOnlyRootFilesystem": true,
+                "runAsNonRoot": true,
+                "seccompProfile": {
+                  "type": "RuntimeDefault"
+                }
+              },
+              "volumeMounts": [
+                {
+                  "mountPath": "/tmp",
+                  "name": "ide-tmp-0"
+                },
+                {
+                  "mountPath": "/home/coder",
+                  "name": "data"
+                }
+              ]
+            }
+          ],
+          "enableServiceLinks": false,
+          "nodeSelector": {
+            "appstore.dhbw/workload": "student"
+          },
+          "securityContext": {
+            "fsGroup": 1000,
+            "runAsGroup": 1000,
+            "runAsNonRoot": true,
+            "runAsUser": 1000,
+            "seccompProfile": {
+              "type": "RuntimeDefault"
+            }
+          },
+          "tolerations": [
+            {
+              "effect": "NoSchedule",
+              "key": "appstore.dhbw/workload",
+              "operator": "Equal",
+              "value": "student"
+            }
+          ],
+          "volumes": [
+            {
+              "emptyDir": {
+                "sizeLimit": "1Gi"
+              },
+              "name": "ide-tmp-0"
+            }
+          ]
+        }
+      },
+      "volumeClaimTemplates": [
+        {
+          "metadata": {
+            "labels": {
+              "app.kubernetes.io/managed-by": "appstore",
+              "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+              "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+              "appstore.dhbw/workload": "team-c-erin"
+            },
+            "name": "data"
+          },
+          "spec": {
+            "accessModes": [
+              "ReadWriteOnce"
+            ],
+            "resources": {
+              "requests": {
+                "storage": "5Gi"
+              }
+            },
+            "storageClassName": "local-path"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Service",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/workload": "team-c-erin"
+      },
+      "name": "team-c-erin",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "ports": [
+        {
+          "name": "http",
+          "port": 8080,
+          "targetPort": "http"
+        }
+      ],
+      "selector": {
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/workload": "team-c-erin"
+      },
+      "type": "ClusterIP"
+    }
+  },
+  {
+    "apiVersion": "networking.k8s.io/v1",
+    "kind": "Ingress",
+    "metadata": {
+      "annotations": {
+        "cert-manager.io/cluster-issuer": "letsencrypt"
+      },
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/workload": "team-c-erin"
+      },
+      "name": "team-c-erin",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "ingressClassName": "traefik",
+      "rules": [
+        {
+          "host": "team-c-erin-123e4567.apps.t3-k8s.example.org",
+          "http": {
+            "paths": [
+              {
+                "backend": {
+                  "service": {
+                    "name": "team-c-erin",
+                    "port": {
+                      "name": "http"
+                    }
+                  }
+                },
+                "path": "/",
+                "pathType": "Prefix"
+              }
+            ]
+          }
+        }
+      ],
+      "tls": [
+        {
+          "hosts": [
+            "team-c-erin-123e4567.apps.t3-k8s.example.org"
+          ],
+          "secretName": "team-c-erin-tls"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Secret",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/workload": "team-c-frank"
+      },
+      "name": "team-c-frank",
+      "namespace": "dep-123e4567"
+    },
+    "stringData": {
+      "password": "pw-team-c-frank"
+    },
+    "type": "Opaque"
+  },
+  {
+    "apiVersion": "apps/v1",
+    "kind": "StatefulSet",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/team": "team-c",
+        "appstore.dhbw/user": "99f30c99-e9d9-56ac-afb4-d2453b0f4bed",
+        "appstore.dhbw/workload": "team-c-frank"
+      },
+      "name": "team-c-frank",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "replicas": 1,
+      "selector": {
+        "matchLabels": {
+          "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+          "appstore.dhbw/workload": "team-c-frank"
+        }
+      },
+      "serviceName": "team-c-frank",
+      "template": {
+        "metadata": {
+          "labels": {
+            "app.kubernetes.io/managed-by": "appstore",
+            "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+            "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+            "appstore.dhbw/workload": "team-c-frank"
+          }
+        },
+        "spec": {
+          "automountServiceAccountToken": false,
+          "containers": [
+            {
+              "env": [
+                {
+                  "name": "PASSWORD",
+                  "valueFrom": {
+                    "secretKeyRef": {
+                      "key": "password",
+                      "name": "team-c-frank"
+                    }
+                  }
+                },
+                {
+                  "name": "TEAM",
+                  "value": "team-c"
+                },
+                {
+                  "name": "APPSTORE_VAR_CPU_CLASS",
+                  "value": "small"
+                }
+              ],
+              "image": "ghcr.io/dhbw-appstore-t3/apps/code-server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "name": "ide",
+              "ports": [
+                {
+                  "containerPort": 8080,
+                  "name": "http",
+                  "protocol": "TCP"
+                }
+              ],
+              "readinessProbe": {
+                "failureThreshold": 3,
+                "periodSeconds": 3,
+                "tcpSocket": {
+                  "port": "http"
+                },
+                "timeoutSeconds": 2
+              },
+              "resources": {
+                "limits": {
+                  "cpu": "500m",
+                  "memory": "1Gi"
+                },
+                "requests": {
+                  "cpu": "500m",
+                  "memory": "1Gi"
+                }
+              },
+              "securityContext": {
+                "allowPrivilegeEscalation": false,
+                "capabilities": {
+                  "drop": [
+                    "ALL"
+                  ]
+                },
+                "readOnlyRootFilesystem": true,
+                "runAsNonRoot": true,
+                "seccompProfile": {
+                  "type": "RuntimeDefault"
+                }
+              },
+              "volumeMounts": [
+                {
+                  "mountPath": "/tmp",
+                  "name": "ide-tmp-0"
+                },
+                {
+                  "mountPath": "/home/coder",
+                  "name": "data"
+                }
+              ]
+            }
+          ],
+          "enableServiceLinks": false,
+          "nodeSelector": {
+            "appstore.dhbw/workload": "student"
+          },
+          "securityContext": {
+            "fsGroup": 1000,
+            "runAsGroup": 1000,
+            "runAsNonRoot": true,
+            "runAsUser": 1000,
+            "seccompProfile": {
+              "type": "RuntimeDefault"
+            }
+          },
+          "tolerations": [
+            {
+              "effect": "NoSchedule",
+              "key": "appstore.dhbw/workload",
+              "operator": "Equal",
+              "value": "student"
+            }
+          ],
+          "volumes": [
+            {
+              "emptyDir": {
+                "sizeLimit": "1Gi"
+              },
+              "name": "ide-tmp-0"
+            }
+          ]
+        }
+      },
+      "volumeClaimTemplates": [
+        {
+          "metadata": {
+            "labels": {
+              "app.kubernetes.io/managed-by": "appstore",
+              "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+              "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+              "appstore.dhbw/workload": "team-c-frank"
+            },
+            "name": "data"
+          },
+          "spec": {
+            "accessModes": [
+              "ReadWriteOnce"
+            ],
+            "resources": {
+              "requests": {
+                "storage": "5Gi"
+              }
+            },
+            "storageClassName": "local-path"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Service",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/workload": "team-c-frank"
+      },
+      "name": "team-c-frank",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "ports": [
+        {
+          "name": "http",
+          "port": 8080,
+          "targetPort": "http"
+        }
+      ],
+      "selector": {
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/workload": "team-c-frank"
+      },
+      "type": "ClusterIP"
+    }
+  },
+  {
+    "apiVersion": "networking.k8s.io/v1",
+    "kind": "Ingress",
+    "metadata": {
+      "annotations": {
+        "cert-manager.io/cluster-issuer": "letsencrypt"
+      },
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555",
+        "appstore.dhbw/workload": "team-c-frank"
+      },
+      "name": "team-c-frank",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "ingressClassName": "traefik",
+      "rules": [
+        {
+          "host": "team-c-frank-123e4567.apps.t3-k8s.example.org",
+          "http": {
+            "paths": [
+              {
+                "backend": {
+                  "service": {
+                    "name": "team-c-frank",
+                    "port": {
+                      "name": "http"
+                    }
+                  }
+                },
+                "path": "/",
+                "pathType": "Prefix"
+              }
+            ]
+          }
+        }
+      ],
+      "tls": [
+        {
+          "hosts": [
+            "team-c-frank-123e4567.apps.t3-k8s.example.org"
+          ],
+          "secretName": "team-c-frank-tls"
+        }
+      ]
+    }
+  }
+]

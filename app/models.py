@@ -2,22 +2,32 @@ import enum
 import uuid
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     DateTime,
     Enum,
     ForeignKey,
+    Identity,
+    Index,
     Integer,
     LargeBinary,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship
 
 from app.database import Base
 from app.utils.time import utcnow
+
+# How a deployment runs: OpenTofu/Packer on OpenStack VMs (Windows apps), or
+# pods in the cluster rendered from the app's appstore.yaml (.github#4). The
+# values are the ``runtime`` names of the appstore.yaml contract.
+RUNTIME_VM = "openstack-vm"
+RUNTIME_K8S = "kubernetes"
 
 
 # ----------------------------------------------------------------
@@ -110,10 +120,10 @@ class User(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
-    openstack_credential = relationship(
+    # One credential per OpenStack project (dhbw-appstore's model).
+    openstack_credentials = relationship(
         "UserOpenStackCredential",
         back_populates="user",
-        uselist=False,
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
@@ -132,12 +142,21 @@ class App(Base):
     image_mime = Column(String(64), nullable=True)  # e.g. "image/png" — needed to build a data-URL on read
     git_link = Column(String, nullable=True)
     is_private = Column(Boolean, nullable=False, default=False)
+    # Set by an admin's emergency deactivation: the app is private and only
+    # an admin may make it public again, so the owner cannot undo the
+    # deactivation (.github#7 R, dhbw-appstore).
+    hidden_by_admin = Column(Boolean, nullable=False, default=False, server_default=text("false"))
     userId = Column(UUID(as_uuid=True), ForeignKey("users.userId"), nullable=False, index=True)
     created_at = Column(DateTime, default=utcnow)
     # Soft-delete marker. When set, the app is hidden from default
     # queries but the row stays so existing deployments keep their FK
     # valid. Soft-delete is refused while the app has live deployments.
     deleted_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        # Default queries hide soft-deleted apps.
+        Index("ix_apps_live", "appId", postgresql_where=text("deleted_at IS NULL")),
+    )
 
     # Relationships
     user = relationship("User", back_populates="apps")
@@ -159,6 +178,23 @@ class Deployment(Base):
     deploymentId = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String, nullable=False)
     releaseTag = Column(String, nullable=True)
+    # The commit ``releaseTag`` pointed to when the deployment was created.
+    # Every job of the deployment runs exactly this commit (.github#7 G).
+    commit_sha = Column(String(40), nullable=True)
+    # VM deployments: the OpenStack project of the credential they were
+    # created with (as Keystone scoped it). Everyone holding an own verified
+    # credential for this project is a peer: owner view and operate, each
+    # with their own credential. None for pod deployments, and for VM
+    # deployments made before projects were verified until their owner's
+    # old credential is re-checked (``crud.openstack_credentials``).
+    os_project_id = Column(String, nullable=True, index=True)
+    runtime = Column(String(16), nullable=False, default=RUNTIME_VM, server_default=RUNTIME_VM)
+    # Pod deployments: their namespace (``dep-<first 8 hex of the id>``),
+    # unique across all deployments, deleted ones included, so a destroy can
+    # never reach another deployment's namespace; and how many workloads
+    # (one per team or per person) they run, for the owner's budget.
+    k8s_namespace = Column(String(63), nullable=True)
+    k8s_workloads = Column(Integer, nullable=True)
     userInputVar = Column(Text, nullable=True)  # could also be JSON
     userId = Column(UUID(as_uuid=True), ForeignKey("users.userId"), nullable=False, index=True)
     appId = Column(UUID(as_uuid=True), ForeignKey("apps.appId"), nullable=False, index=True)
@@ -167,6 +203,17 @@ class Deployment(Base):
     # allowed in terminal states, so OpenStack resources are already
     # gone by the time this is set.
     deleted_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        # Default queries hide soft-deleted deployments.
+        Index("ix_deployments_live", "deploymentId", postgresql_where=text("deleted_at IS NULL")),
+        Index(
+            "uq_deployments_k8s_namespace",
+            "k8s_namespace",
+            unique=True,
+            postgresql_where=text("k8s_namespace IS NOT NULL"),
+        ),
+    )
 
     # Relationships
     user = relationship("User", back_populates="deployments")
@@ -212,15 +259,121 @@ class Task(Base):
     logs = Column(Text, nullable=True)  # JSON or text
     tf_state = Column(Text, nullable=True)  # Terraform state as JSON/text
     outputs = Column(Text, nullable=True)  # Terraform outputs as JSON/text
-    # Live-progress columns, updated by the celery event listener on
-    # each ``task-progress`` event. Advisory only — the SSE stream is
+    # Live-progress columns, updated by the worker with each
+    # ``task-progress`` event. Advisory only — the event stream is
     # canonical; these let a page reload show the last known phase/pct.
     current_phase = Column(String(50), nullable=True)
     progress_pct = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=utcnow)
 
+    # Queue columns (.github#5). Unlike the columns above these are
+    # timezone-aware and are compared with ``now()`` in SQL.
+    # The worker process running the task and how long its lease lasts;
+    # the worker renews it while the job runs. A RUNNING task with an
+    # expired lease belongs to a worker that died (reconciler: worker_lost).
+    claimed_by = Column(Text, nullable=True)
+    lease_until = Column(DateTime(timezone=True), nullable=True)
+    # Set by POST /deployments/{id}/cancel; the worker stops the job.
+    cancel_requested_at = Column(DateTime(timezone=True), nullable=True)
+    # Follow-up work of a finished task (soft-delete after destroy, access
+    # mails after deploy) ran; claimed once, by one API process.
+    finalized_at = Column(DateTime(timezone=True), nullable=True)
+    # Fernet token of {"terraform_outputs": ..., "tf_state": ...} as the
+    # worker reported them (``app.services.task_results``). Replaces the
+    # plaintext ``outputs``/``tf_state`` for tasks run since .github#5.
+    outputs_enc = Column(LargeBinary, nullable=True)
+    # SHA-256 of the random token that lets this task's OpenTofu reach the
+    # state of its deployment through ``/internal/tfstate`` while the task
+    # is RUNNING. The token itself travels sealed in the job message only.
+    state_token_hash = Column(String(64), nullable=True)
+
+    __table_args__ = (
+        # At most one PENDING/RUNNING task per deployment: the database
+        # backstop of ``task_service.prepare_task_in_tx``. The enum stores
+        # member names, hence the upper-case literals.
+        Index(
+            "uq_tasks_active_per_deployment",
+            "deploymentId",
+            unique=True,
+            postgresql_where=text("status IN ('PENDING', 'RUNNING')"),
+        ),
+    )
+
     # Relationships
     deployment = relationship("Deployment", back_populates="tasks")
+
+
+# ----------------------------------------------------------------
+# QUEUE MODELS (.github#5)
+# ----------------------------------------------------------------
+# Celery's broker table, written and read by the ``pgq`` transport
+# (``app/pgq.py``). Declared here so migrations and ``alembic check``
+# cover it; application code goes through Celery, not this model.
+class CeleryQueueMessage(Base):
+    __tablename__ = "celery_queue"
+
+    id = Column(BigInteger, Identity(always=False), primary_key=True)
+    queue = Column(Text, nullable=False)
+    payload = Column(JSONB, nullable=False)  # Kombu message (Celery protocol 2)
+    task_id = Column(UUID(as_uuid=True), nullable=True)  # = tasks.taskId
+    # Parked until this task's worker let go of it (destroy after cancel).
+    after_task = Column(UUID(as_uuid=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+    visible_after = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+    claimed_by = Column(Text, nullable=True)
+    delivery_count = Column(Integer, nullable=False, server_default=text("0"))
+
+    __table_args__ = (
+        Index("ix_celery_queue_ready", "queue", "visible_after", "id"),
+        Index("uq_celery_queue_task_id", "task_id", unique=True, postgresql_where=text("task_id IS NOT NULL")),
+        Index("ix_celery_queue_after_task", "after_task", postgresql_where=text("after_task IS NOT NULL")),
+    )
+
+
+# Progress, log and terminal events of a task, appended by the worker
+# (and by the API for cancel / worker_lost). The row id is the SSE event
+# id. A trigger (migration 5e1f0c2a9b7d) sends ``NOTIFY task_events``.
+class TaskEvent(Base):
+    __tablename__ = "task_events"
+
+    id = Column(BigInteger, Identity(always=False), primary_key=True)
+    task_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("tasks.taskId", ondelete="CASCADE"),
+        nullable=False,
+    )
+    type = Column(Text, nullable=False)
+    payload = Column(JSONB, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+
+    __table_args__ = (Index("ix_task_events_task", "task_id", "id"),)
+
+
+# ----------------------------------------------------------------
+# TERRAFORM STATE MODEL
+# ----------------------------------------------------------------
+# The OpenTofu state of one VM deployment, written and read by OpenTofu
+# through the API's HTTP state backend (``routers/internal_tfstate``), never
+# by the worker directly; the job holds no database credentials. It lists
+# every resource with its attributes, generated passwords included, so it is
+# stored Fernet-encrypted. Deleted once a destroy has succeeded.
+class TerraformState(Base):
+    __tablename__ = "terraform_states"
+
+    deploymentId = Column(
+        UUID(as_uuid=True),
+        ForeignKey("deployments.deploymentId", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    state = Column(LargeBinary, nullable=True)  # Fernet, JSON inside
+    # OpenTofu's lock: its id, the lock info it sent (returned to a
+    # competing client) and the task that took it. A lock whose task no
+    # longer runs is stale and may be taken over, so a worker that died
+    # mid-apply cannot block the deployment for good.
+    lock_id = Column(String, nullable=True)
+    lock_info = Column(Text, nullable=True)
+    lock_task_id = Column(UUID(as_uuid=True), nullable=True)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 # ----------------------------------------------------------------
@@ -309,7 +462,6 @@ class UserOpenStackCredential(Base):
         UUID(as_uuid=True),
         ForeignKey("users.userId", ondelete="CASCADE"),
         nullable=False,
-        unique=True,
         index=True,
     )
     auth_type = Column(
@@ -326,10 +478,18 @@ class UserOpenStackCredential(Base):
     region_name = Column(String, nullable=True)
     interface = Column(String, nullable=True, default="public")
     identity_api_version = Column(String, nullable=True, default="3")
-    project_id = Column(String, nullable=True)
+    # The project Keystone scoped the token to, once ``project_verified``:
+    # it decides who is a project peer, so a typed value must never count.
+    # For password auth it is also the scope requested at login.
+    project_id = Column(String, nullable=True, index=True)
     project_name = Column(String, nullable=True)
     user_domain_name = Column(String, nullable=True)
     project_domain_name = Column(String, nullable=True)
+    # True once ``project_id`` came from a Keystone token. Credentials saved
+    # before projects were taken from Keystone carry whatever the user typed
+    # (an application credential ignores it entirely), so they are False
+    # until re-checked and count for nobody's project.
+    project_verified = Column(Boolean, nullable=False, default=False, server_default=text("false"))
 
     # Encrypted (Fernet ciphertext) — never logged, never returned via API
     encrypted_identifier = Column(LargeBinary, nullable=False)
@@ -340,7 +500,20 @@ class UserOpenStackCredential(Base):
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
-    user = relationship("User", back_populates="openstack_credential")
+    __table_args__ = (
+        # One verified credential per user and project; saving another one
+        # for the same project replaces it (that is how a secret is rotated).
+        # Unverified old rows stay out of it until re-checked.
+        Index(
+            "uq_user_openstack_credentials_project",
+            "userId",
+            "project_id",
+            unique=True,
+            postgresql_where=text("project_verified"),
+        ),
+    )
+
+    user = relationship("User", back_populates="openstack_credentials")
 
 
 # ----------------------------------------------------------------
@@ -357,6 +530,11 @@ class AppVersionApproval(Base):
         index=True,
     )
     version_tag = Column(String, nullable=False)
+    # The commit the tag pointed to at submission. The review covers this
+    # commit only: once the tag points elsewhere the version counts as
+    # unapproved until it is submitted and reviewed again (.github#7 G).
+    # NULL for approvals from before the pinning; they never count.
+    commit_sha = Column(String(40), nullable=True)
     status = Column(
         Enum(AppVersionApprovalStatus),
         nullable=False,
@@ -373,6 +551,12 @@ class AppVersionApproval(Base):
     )
     reviewed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=utcnow, nullable=False)
+    # What the review covered besides the commit (.github#4): how the version
+    # runs and, for pods, the SHA-256 of its appstore.yaml and the image
+    # digests it names (JSON list). A deploy refuses a spec that differs.
+    runtime = Column(String(16), nullable=False, default=RUNTIME_VM, server_default=RUNTIME_VM)
+    spec_sha256 = Column(String(64), nullable=True)
+    image_digests = Column(Text, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("appId", "version_tag", name="uq_app_version_approval"),
@@ -381,6 +565,23 @@ class AppVersionApproval(Base):
     # Relationships
     app = relationship("App", back_populates="version_approvals")
     reviewer = relationship("User", foreign_keys=[reviewed_by])
+
+
+# ----------------------------------------------------------------
+# LTI 1.3 LAUNCH STATE
+# ----------------------------------------------------------------
+# The state/nonce pair of an LTI login in flight (``routers/lti13``):
+# written by ``/lti13/login``, consumed exactly once by ``/lti13/launch``.
+# In the database rather than in process memory, because the two requests
+# of one launch can reach different API processes or replicas.
+class LtiNonce(Base):
+    __tablename__ = "lti_nonces"
+
+    state = Column(String(128), primary_key=True)
+    nonce = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+
+    __table_args__ = (Index("ix_lti_nonces_created_at", "created_at"),)
 
 
 # ----------------------------------------------------------------

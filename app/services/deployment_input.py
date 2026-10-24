@@ -23,6 +23,8 @@ import json
 
 from fastapi import HTTPException, status
 
+from app.utils.filenames import safe_filename
+
 # Defense-in-depth limits for inline file uploads. The UX-side warning
 # is mirrored on the wizard, but a hand-crafted POST could still try
 # to push GBs of payload through ``userInputVar``. We refuse before
@@ -190,7 +192,9 @@ def attach_files_to_user_input(
                 )
 
             encoded_slots[slot_key] = {
-                "name": upload.name,
+                # Stored as a plain file name: apps write it to disk and the
+                # download route puts it into a header (.github#7 R).
+                "name": safe_filename(upload.name),
                 "content_b64": content_b64,
                 "size": upload.size,
                 "content_type": upload.content_type or "application/octet-stream",

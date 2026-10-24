@@ -26,7 +26,17 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.crud import app_version_approvals as crud_approvals
-from app.models import App, Course, CourseTeacher, Deployment, User, UserRole
+from app.crud import openstack_credentials as crud_openstack_credentials
+from app.models import (
+    RUNTIME_K8S,
+    RUNTIME_VM,
+    App,
+    Course,
+    CourseTeacher,
+    Deployment,
+    User,
+    UserRole,
+)
 from app.utils.permissions import (
     STAFF_ROLES,
     has_deployment_access,
@@ -113,6 +123,17 @@ def ensure_edit_app(user: User, app: App) -> None:
         raise _forbidden("app_edit_forbidden")
 
 
+def can_publish_app(user: User, app: App) -> bool:
+    """Whether ``user`` may make ``app`` public: an admin always, the owner
+    only while no admin has deactivated it (``hidden_by_admin``, .github#7 R)."""
+    return _is_admin(user) or (_is_owner(user, app.userId) and not getattr(app, "hidden_by_admin", False))
+
+
+def ensure_publish_app(user: User, app: App) -> None:
+    if not can_publish_app(user, app):
+        raise _forbidden("app_hidden_by_admin")
+
+
 def can_delete_app(user: User, app: App) -> bool:
     """Whether ``user`` may (soft-)delete ``app``. Owner or admin only."""
     return _is_admin(user) or _is_owner(user, app.userId)
@@ -143,16 +164,48 @@ def ensure_approve_app_version(user: User) -> None:
         raise _forbidden("role_required", [UserRole.ADMIN.value])
 
 
+def can_register_app(user: User) -> bool:
+    """Register an app (point the platform at a repository). Teacher or admin."""
+    return _is_staff(user)
+
+
+def ensure_register_app(user: User) -> None:
+    if not can_register_app(user):
+        raise _forbidden("role_required", [r.value for r in STAFF_ROLES])
+
+
 # ================================================================
 # DEPLOYMENTS
 # ================================================================
+def can_deploy(user: User) -> bool:
+    """Start a deployment. Teacher or admin (.github#7 F): students use
+    deployments, they do not run app code on the platform."""
+    return _is_staff(user)
+
+
+def ensure_deploy(user: User) -> None:
+    if not can_deploy(user):
+        raise _forbidden("role_required", [r.value for r in STAFF_ROLES])
+
+
 def can_view_deployment_member(user: User, dep: Deployment, db: Session) -> bool:
     """Member-view access to a deployment.
 
-    Mirrors :func:`app.utils.permissions.has_deployment_access` —
-    owner, staff, team-member, or direct UserToDeployment mapping.
+    Owner, admin, team member or direct UserToDeployment mapping
+    (:func:`app.utils.permissions.has_deployment_access`); no blanket
+    teacher access any more (.github#7 F).
     """
     return has_deployment_access(dep, user, db)
+
+
+def can_view_deployment(user: User, dep: Deployment, db: Session) -> bool:
+    """Whether ``user`` may open the deployment at all: member or owner view."""
+    return can_view_deployment_member(user, dep, db) or can_view_deployment_owner(user, dep, db)
+
+
+def ensure_view_deployment(user: User, dep: Deployment, db: Session) -> None:
+    if not can_view_deployment(user, dep, db):
+        raise _forbidden("deployment_view_forbidden")
 
 
 def ensure_view_deployment_member(user: User, dep: Deployment, db: Session) -> None:
@@ -160,24 +213,49 @@ def ensure_view_deployment_member(user: User, dep: Deployment, db: Session) -> N
         raise _forbidden("deployment_view_forbidden")
 
 
+def is_project_peer(user: User, dep: Deployment, db: Session) -> bool:
+    """Whether ``user`` holds an own verified credential for the VM deployment's project.
+
+    dhbw-appstore's peer model: whoever can reach the OpenStack project the
+    deployment lives in can see and run it anyway, so the app does not
+    pretend otherwise. Project ids come from Keystone tokens only
+    (``crud.openstack_credentials``), so this cannot be claimed.
+    """
+    project_id = getattr(dep, "os_project_id", None)
+    if not project_id:
+        return False
+    return crud_openstack_credentials.holds_project(db, user.userId, project_id)
+
+
 def can_view_deployment_owner(user: User, dep: Deployment, db: Session) -> bool:
     """Owner-view access — tasks, logs, terraform state, destroy.
 
-    Read access is granted to the deployment owner, admins, and
-    course-teachers of the deployment owner's course (inspect only).
-    Operate rights are separate — see :func:`can_operate_deployment`.
-    The course-teacher check is skipped when the owner has no course.
+    Read access is granted to the deployment owner, its project peers
+    (:func:`is_project_peer`), admins, and course-teachers of the owner's
+    course (inspect only) when the owner is a student. Operate rights are
+    separate — see :func:`can_operate_deployment`.
+
+    The course-teacher right never covers another teacher's or an admin's
+    deployment (.github#7 F, security review H-1): a teacher who manages a
+    course must not read a colleague's logs and files by putting them into
+    that course. Since only teachers and admins deploy, this leaves the
+    right for student deployments from before.
     """
     if user.role == UserRole.ADMIN:
         return True
     if str(dep.userId) == str(user.userId):
+        return True
+    if is_project_peer(user, dep, db):
         return True
 
     # Course-teacher inspect right applies only to teachers; other
     # roles are rejected by the role gate in ``is_course_teacher_id``.
     if user.role != UserRole.TEACHER:
         return False
-    owner_course_id = getattr(getattr(dep, "user", None), "courseId", None)
+    owner = getattr(dep, "user", None)
+    if owner is None or getattr(owner, "role", None) != UserRole.STUDENT:
+        return False
+    owner_course_id = getattr(owner, "courseId", None)
     if owner_course_id is None:
         return False
     return is_course_teacher_id(user, owner_course_id, db)
@@ -189,41 +267,22 @@ def ensure_view_deployment_owner(user: User, dep: Deployment, db: Session) -> No
 
 
 def can_operate_deployment(user: User, dep: Deployment, db: Session) -> bool:
-    """Pause / Resume / Destroy / Redeploy on a deployment. Owner or admin only."""
-    del db
-    return _is_admin(user) or _is_owner(user, dep.userId)
+    """Pause / Resume / Destroy / Redeploy / Cancel.
+
+    VM deployments: the owner or a project peer. Every action runs with the
+    caller's own credential for the deployment's project, never with the
+    owner's, so admins are read-only there unless they hold a credential
+    for the project themselves (dhbw-appstore's model). Pod deployments
+    need no credential: the owner or an admin.
+    """
+    if getattr(dep, "runtime", RUNTIME_VM) == RUNTIME_K8S:
+        return _is_owner(user, dep.userId) or _is_admin(user)
+    return _is_owner(user, dep.userId) or is_project_peer(user, dep, db)
 
 
 def ensure_operate_deployment(user: User, dep: Deployment, db: Session) -> None:
     if not can_operate_deployment(user, dep, db):
         raise _forbidden("deployment_operate_forbidden")
-
-
-def can_resend_access(
-    user: User,
-    dep: Deployment,
-    target_user_id: UUID | str,
-    db: Session,
-) -> bool:
-    """Resend access credentials for ``target_user_id`` on ``dep``.
-
-    A user may resend credentials to themself on any deployment they
-    can member-view; staff may resend credentials to anyone on a
-    deployment they can owner-view.
-    """
-    if str(target_user_id) == str(user.userId):
-        return can_view_deployment_member(user, dep, db)
-    return can_view_deployment_owner(user, dep, db)
-
-
-def ensure_resend_access(
-    user: User,
-    dep: Deployment,
-    target_user_id: UUID | str,
-    db: Session,
-) -> None:
-    if not can_resend_access(user, dep, target_user_id, db):
-        raise _forbidden("deployment_resend_forbidden")
 
 
 # ================================================================
@@ -290,6 +349,23 @@ def ensure_view_course_detail(user: User) -> None:
         raise _forbidden("role_required", [r.value for r in STAFF_ROLES])
 
 
+def can_view_course_roster(user: User, course: Course, db: Session) -> bool:
+    """Read a course's member list (e-mail addresses).
+
+    Staff only: any teacher may read any course's roster (an earlier team
+    decision, the team picker relies on it), students never (security
+    review M-2: ``GET /courses/{id}`` used to show every member to every
+    signed-in user). Changing the roster needs :func:`can_edit_course`.
+    """
+    del course, db
+    return _is_staff(user)
+
+
+def ensure_view_course_roster(user: User, course: Course, db: Session) -> None:
+    if not can_view_course_roster(user, course, db):
+        raise _forbidden("course_roster_forbidden")
+
+
 def can_edit_course(user: User, course: Course, db: Session) -> bool:
     """Edit / delete ``course``. Course-teacher of this course or admin."""
     if _is_admin(user):
@@ -339,21 +415,27 @@ __all__ = [
     "ensure_list_all_apps",
     "can_edit_app",
     "ensure_edit_app",
+    "can_publish_app",
+    "ensure_publish_app",
     "can_delete_app",
     "ensure_delete_app",
     "can_submit_app_version",
     "ensure_submit_app_version",
     "can_approve_app_version",
     "ensure_approve_app_version",
+    "can_register_app",
+    "ensure_register_app",
     # Deployments
+    "can_deploy",
+    "ensure_deploy",
+    "can_view_deployment",
+    "ensure_view_deployment",
     "can_view_deployment_member",
     "ensure_view_deployment_member",
     "can_view_deployment_owner",
     "ensure_view_deployment_owner",
     "can_operate_deployment",
     "ensure_operate_deployment",
-    "can_resend_access",
-    "ensure_resend_access",
     # Courses
     "is_course_teacher",
     "is_course_teacher_id",
@@ -362,6 +444,8 @@ __all__ = [
     "ensure_view_course_detail",
     "can_edit_course",
     "ensure_edit_course",
+    "can_view_course_roster",
+    "ensure_view_course_roster",
     # Users
     "can_view_user",
     "ensure_view_user",

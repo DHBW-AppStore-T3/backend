@@ -1,8 +1,7 @@
 """Generic Terraform-state parser for the deployment status pipeline.
 
-Reads the JSON blob persisted in ``Task.tf_state`` (produced by
-``terraform state pull`` in the worker — see
-``worker/app/tasks.py:collect_terraform_state``) and produces a flat,
+Reads the deployment's OpenTofu state (as stored by the HTTP state backend,
+see ``services/tf_state_store``) and produces a flat,
 typed list of resource entries the rest of the status pipeline can
 join with live OpenStack data.
 
@@ -72,9 +71,9 @@ class TfResource:
         category: Coarse UI category.
         provider_id: The OpenStack-side UUID of the resource.
                      Pulled from ``attributes.id``.
-        display_name: Human-friendly label for the card title.
-                      Compute → instance name; others → resource name
-                      or fallback to address.
+        display_name: Human-friendly label for the card title: the
+                      ``name`` attribute, for security groups without
+                      one the ``description``, else the address.
         team: Value of ``attributes.metadata.team`` for compute
               instances, otherwise None. The team-contract for
               app-authors is to set ``metadata = { team = each.key }``
@@ -95,7 +94,7 @@ class TfResource:
 def parse_tf_state(state_json: str | dict | None) -> list[TfResource]:
     """Parse a ``terraform state pull`` JSON blob into a typed list.
 
-    Accepts the raw string (as stored in ``Task.tf_state``) or an
+    Accepts the raw JSON string or an
     already-parsed dict. Returns an empty list for ``None`` / invalid
     JSON / empty state — callers don't need to special-case that, the
     Infrastructure tab simply renders "no resources yet" in those
@@ -107,11 +106,16 @@ def parse_tf_state(state_json: str | dict | None) -> list[TfResource]:
 
     out: list[TfResource] = []
     for resource_block in state.get("resources", []):
+        # Data sources (``data "openstack_networking_network_v2" "public"``)
+        # only read existing objects: not part of the deployment, and their
+        # address (``data.…``) is no valid -replace target.
+        if resource_block.get("mode", "managed") != "managed":
+            continue
         raw_type = resource_block.get("type")
         category = _TYPE_TO_CATEGORY.get(raw_type)
         if category is None:
-            # Not a UI-relevant type (random_password, data sources,
-            # whatever the app declares for internal use). Skip.
+            # Not a UI-relevant type (random_password, whatever the app
+            # declares for internal use). Skip.
             continue
         resource_name = resource_block.get("name") or "unnamed"
         for instance in resource_block.get("instances", []):
@@ -133,9 +137,9 @@ def _coerce_state(state_json: str | dict | None) -> dict | None:
     """Best-effort: return a state dict or None.
 
     Invalid JSON is logged at WARN and treated as empty — better than
-    a 500 in the resource endpoint. The TF-state column can be
-    surprisingly empty for failed-deploy tasks (no ``apply`` ever
-    succeeded), and we want a clean empty-list output in that case.
+    a 500 in the resource endpoint. There is no stored state at all
+    until an ``apply`` wrote one (e.g. after a failed first deploy), and
+    we want a clean empty-list output in that case.
     """
     if state_json is None:
         return None

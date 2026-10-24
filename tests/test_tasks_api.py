@@ -33,7 +33,7 @@ def _make_app(db, user_id):
         appId=uuid.uuid4(),
         name=f"App {uuid.uuid4().hex[:6]}",
         userId=user_id,
-        git_link="https://example.com/repo.git",
+        git_link="https://example.com/acme/repo.git",
     )
     db.add(a)
     db.commit()

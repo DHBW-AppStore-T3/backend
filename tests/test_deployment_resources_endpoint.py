@@ -6,7 +6,7 @@ Covers:
  * POST /deployments/{id}/resources/{address}/redeploy   (whitelist + dispatch)
 
 The OpenStack ``Connection`` is mocked end-to-end via
-``app.services.openstack_client.user_connection`` so tests don't need a
+``app.services.openstack_client.project_connection`` so tests don't need a
 real cloud — we control what the live-fetch returns, including the
 "server gone" case that drives ``drift=missing``.
 """
@@ -22,13 +22,14 @@ import pytest
 from app.models import (
     App,
     Deployment,
-    OpenStackAuthType,
     Task,
     TaskStatus,
     TaskType,
+    TerraformState,
     User,
-    UserOpenStackCredential,
 )
+from app.utils.crypto import encrypt
+from tests.conftest import TEST_PROJECT, add_credential
 
 # ----------------------------------------------------------------
 # Helpers / fixtures
@@ -76,20 +77,8 @@ _DEMO_STATE = {
 
 
 def _ensure_user_credentials(db, user):
-    """User needs credentials so ``user_connection`` doesn't 412."""
-    from app.utils import crypto
-
-    db.add(
-        UserOpenStackCredential(
-            credentialId=uuid.uuid4(),
-            userId=user.userId,
-            auth_type=OpenStackAuthType.APPLICATION_CREDENTIAL,
-            auth_url="https://keystone.example/v3",
-            encrypted_identifier=crypto.encrypt("test-id"),
-            encrypted_secret=crypto.encrypt("test-secret"),
-        )
-    )
-    db.commit()
+    """User needs an own credential for the project so ``project_connection`` doesn't 403."""
+    return add_credential(db, user)
 
 
 def _ensure_app(db, user) -> App:
@@ -97,7 +86,7 @@ def _ensure_app(db, user) -> App:
         appId=uuid.uuid4(),
         name=f"app-{uuid.uuid4().hex[:8]}",
         userId=user.userId,
-        git_link="https://example.com/repo.git",
+        git_link="https://example.com/acme/repo.git",
     )
     db.add(app)
     db.commit()
@@ -105,16 +94,18 @@ def _ensure_app(db, user) -> App:
     return app
 
 
-def _seed_deployment_with_state(db, user: User, app_row: App) -> Deployment:
-    """Create a deployment + a successful DEPLOY task carrying the
-    demo TF state. The resource endpoint reads from the most-recent
-    task with a non-null state, so one task is enough."""
+def _seed_deployment_with_state(db, user: User, app_row: App, *, legacy_state: bool = False) -> Deployment:
+    """Create a deployment with a successful DEPLOY task and the demo
+    state in the state backend's table, where the resource endpoints read
+    it; with ``legacy_state`` only as the copy a task took before the
+    switch (the fallback until ``app.import_pg_tfstate`` ran)."""
     deployment = Deployment(
         deploymentId=uuid.uuid4(),
         name="resource-test",
         appId=app_row.appId,
         userId=user.userId,
         releaseTag="main",
+        os_project_id=TEST_PROJECT,
     )
     db.add(deployment)
     db.commit()
@@ -126,9 +117,11 @@ def _seed_deployment_with_state(db, user: User, app_row: App) -> Deployment:
         celeryTaskId="fake-celery-id",
         type=TaskType.DEPLOY,
         status=TaskStatus.SUCCESS,
-        tf_state=json.dumps(_DEMO_STATE),
+        tf_state=json.dumps(_DEMO_STATE) if legacy_state else None,
     )
     db.add(task)
+    if not legacy_state:
+        db.add(TerraformState(deploymentId=deployment.deploymentId, state=encrypt(json.dumps(_DEMO_STATE))))
     db.commit()
     return deployment
 
@@ -169,20 +162,20 @@ def _make_server_mock(
 
 @pytest.fixture
 def patched_user_connection():
-    """Replace the ``user_connection`` contextmanager with a fake that
+    """Replace the ``project_connection`` contextmanager with a fake that
     yields a configured Mock-Connection. Tests can mutate
     ``conn.compute.find_server.side_effect`` per case."""
     conn = MagicMock()
 
     @contextmanager
-    def _fake_conn(_db, _user):
+    def _fake_conn(_db, _user, _project_id):
         yield conn
 
     # Patch both call sites — the resource endpoint and any other
     # importers — so the import-time binding doesn't slip past the
     # mock.
     with patch(
-        "app.services.deployment_status.user_connection", _fake_conn
+        "app.services.deployment_status.project_connection", _fake_conn
     ):
         yield conn
 
@@ -254,6 +247,36 @@ def test_list_resources_skip_refresh_returns_cached_only(
     # Cached fields survive without lifecycle/hardware enrichment
     for r in body["resources"]:
         assert r["lifecycle"] is None
+
+
+@pytest.mark.integration
+def test_list_resources_without_an_own_credential_shows_the_cached_state(
+    admin_client, db, mock_user, patched_user_connection
+):
+    """An admin reads with no credential for the project: no live data,
+    and never with the owner's credential."""
+    _ensure_user_credentials(db, mock_user)
+    deployment = _seed_deployment_with_state(db, mock_user, _ensure_app(db, mock_user))
+
+    response = admin_client.get(f"/deployments/{deployment.deploymentId}/resources")
+
+    assert response.status_code == 200
+    assert response.json()["live"] is False
+    assert {r["address"] for r in response.json()["resources"]} >= {ADDR_A, ADDR_B}
+    assert not patched_user_connection.compute.find_server.called
+
+
+@pytest.mark.integration
+def test_list_resources_falls_back_to_the_last_task_copy_before_the_import(
+    client, db, mock_user, patched_user_connection
+):
+    _ensure_user_credentials(db, mock_user)
+    deployment = _seed_deployment_with_state(db, mock_user, _ensure_app(db, mock_user), legacy_state=True)
+
+    response = client.get(f"/deployments/{deployment.deploymentId}/resources", params={"refresh": False})
+
+    assert response.status_code == 200
+    assert {r["address"] for r in response.json()["resources"]} >= {ADDR_A, ADDR_B}
 
 
 @pytest.mark.integration
@@ -397,15 +420,15 @@ def test_redeploy_resource_dispatches_celery_task(
     body = response.json()
     assert body["status"] == "redeploying"
 
-    # Celery was called with the redeploy task name and the address as
-    # the extra positional arg.
+    # Celery was called with the redeploy task name; the address travels
+    # as the task's ``resource_address`` keyword, next to the pinned commit.
     patched_celery_send.assert_called_once()
     name = patched_celery_send.call_args.args[0]
-    args = patched_celery_send.call_args.kwargs["args"]
+    kwargs = patched_celery_send.call_args.kwargs["kwargs"]
     assert name == "tasks.redeploy_resource"
-    # 7 standard args + 1 extra (resource_address)
-    assert len(args) == 8
-    assert args[-1] == ADDR_A
+    assert kwargs["resource_address"] == ADDR_A
+    assert kwargs["deployment_id"] == str(deployment.deploymentId)
+    assert len(kwargs["commit_sha"]) == 40
 
 
 @pytest.mark.integration
@@ -441,3 +464,72 @@ def test_redeploy_rejects_unknown_address(
     assert response.status_code == 404
     assert response.json()["detail"]["reason"] == "resource_not_in_state"
     assert not patched_celery_send.called
+
+
+# ----------------------------------------------------------------
+# Redeploy in the lifecycle matrix (.github#7 L)
+# ----------------------------------------------------------------
+def _add_task(db, deployment, task_type, task_status):
+    from datetime import datetime, timedelta
+
+    db.add(Task(
+        taskId=uuid.uuid4(), deploymentId=deployment.deploymentId, type=task_type,
+        status=task_status, created_at=datetime.utcnow() + timedelta(seconds=5),
+    ))
+    db.commit()
+
+
+@pytest.mark.integration
+def test_redeploy_refused_while_paused(client, db, mock_user, patched_user_connection, patched_celery_send):
+    _ensure_user_credentials(db, mock_user)
+    deployment = _seed_deployment_with_state(db, mock_user, _ensure_app(db, mock_user))
+    _add_task(db, deployment, TaskType.PAUSE, TaskStatus.SUCCESS)
+
+    response = client.post(f"/deployments/{deployment.deploymentId}/resources/{ADDR_A}/redeploy")
+
+    assert response.status_code == 409
+    assert "redeploy_failed" in response.json()["detail"]
+    patched_celery_send.assert_not_called()
+
+
+@pytest.mark.integration
+def test_redeploy_retry_allowed_after_redeploy_failed(
+    client, db, mock_user, patched_user_connection, patched_celery_send
+):
+    _ensure_user_credentials(db, mock_user)
+    deployment = _seed_deployment_with_state(db, mock_user, _ensure_app(db, mock_user))
+    _add_task(db, deployment, TaskType.REDEPLOY, TaskStatus.FAILED)
+
+    response = client.post(f"/deployments/{deployment.deploymentId}/resources/{ADDR_A}/redeploy")
+
+    assert response.status_code == 202, response.text
+
+
+@pytest.mark.integration
+def test_cancel_refused_while_a_redeploy_runs(client, db, mock_user, patched_celery_send):
+    """Cancel destroys the whole deployment: never for a running redeploy."""
+    _ensure_user_credentials(db, mock_user)
+    deployment = _seed_deployment_with_state(db, mock_user, _ensure_app(db, mock_user))
+    _add_task(db, deployment, TaskType.REDEPLOY, TaskStatus.RUNNING)
+
+    response = client.post(f"/deployments/{deployment.deploymentId}/cancel")
+
+    assert response.status_code == 409
+    patched_celery_send.assert_not_called()
+
+
+@pytest.mark.integration
+def test_delete_after_a_failed_redeploy_destroys_instead_of_hiding(
+    client, db, mock_user, patched_celery_send
+):
+    _ensure_user_credentials(db, mock_user)
+    deployment = _seed_deployment_with_state(db, mock_user, _ensure_app(db, mock_user))
+    _add_task(db, deployment, TaskType.REDEPLOY, TaskStatus.FAILED)
+
+    response = client.delete(f"/deployments/{deployment.deploymentId}")
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "destroying"
+    assert patched_celery_send.call_args.args[0] == "tasks.destroy_deployment"
+    db.expire_all()
+    assert db.get(Deployment, deployment.deploymentId).deleted_at is None

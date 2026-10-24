@@ -205,3 +205,29 @@ def test_reactivate_after_deactivation_restores_visibility(
     visible = admin_client.get("/apps/")
     assert visible.status_code == 200
     assert any(a["appId"] == str(app.appId) for a in visible.json())
+
+
+@pytest.mark.integration
+def test_the_owner_cannot_undo_an_admin_deactivation(admin_client, db, mock_user, mock_admin):
+    """``hidden_by_admin`` (.github#7 R): before, the owner made the app public
+    again with ``PUT /apps/{id}`` right after an admin hid it."""
+    app = create_app_in_db(db, mock_user, name="Suspicious", is_private=False)
+    _approve_version(db, app.appId, mock_admin.userId)
+
+    _as(mock_admin)
+    assert admin_client.put(f"/admin/apps/{app.appId}").json()["hidden_by_admin"] is True
+
+    _as(mock_user)
+    refused = admin_client.put(f"/apps/{app.appId}", json={"is_private": False})
+    assert refused.status_code == 403
+    assert refused.json()["detail"]["code"] == "app_hidden_by_admin"
+    # Other edits stay possible, the app stays private.
+    renamed = admin_client.put(f"/apps/{app.appId}", json={"name": "Renamed"})
+    assert renamed.status_code == 200
+    assert renamed.json()["is_private"] is True
+
+    _as(mock_admin)
+    lifted = admin_client.put(f"/apps/{app.appId}", json={"is_private": False})
+    assert lifted.status_code == 200
+    assert (lifted.json()["is_private"], lifted.json()["hidden_by_admin"]) == (False, False)
+

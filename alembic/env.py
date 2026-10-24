@@ -1,6 +1,7 @@
 from logging.config import fileConfig
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
+from sqlalchemy import text
 from alembic import context
 
 # this is the Alembic Config object, which provides
@@ -93,6 +94,11 @@ def run_migrations_online() -> None:
         )
 
         with context.begin_transaction():
+            # On Kubernetes every API replica migrates before it starts;
+            # when several start at once the lock makes them take turns,
+            # and the later ones find nothing left to do. Transaction-scoped,
+            # so it is released with the commit (or the rollback).
+            connection.execute(text("SELECT pg_advisory_xact_lock(hashtext('appstore-backend:migrations'))"))
             context.run_migrations()
 
 
