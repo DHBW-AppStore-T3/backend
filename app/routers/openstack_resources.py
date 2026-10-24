@@ -192,14 +192,6 @@ def refresh_resource_cache(
     ``network``, ``security_group``, ``availability_zone``); 422 for an
     unknown one. 404 for a credential that is not the caller's.
     """
-    """Drop the cached resource lists of this credential (204).
-
-    Triggered by the refresh button next to a wizard picker — the user has
-    just created a resource in Horizon and wants to see it. With ``kind``
-    only that kind is dropped (the ``@openstack:<kind>`` marker names, e.g.
-    ``network``, ``security_group``, ``availability_zone``); 422 for an
-    unknown one. 404 for a credential that is not the caller's.
-    """
     if settings.OPENSTACK_SIMULATE:
         return None
     cache_kind = None

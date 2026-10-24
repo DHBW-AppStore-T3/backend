@@ -109,3 +109,47 @@ def test_allowlist_matching():
     assert not keystone_urls.auth_url_allowed(None, allowlist, development=True)
     assert keystone_urls.auth_url_allowed("https://any.example", "", development=True)
     assert not keystone_urls.auth_url_allowed("https://any.example", "", development=False)
+
+
+def test_openstack_simulate_returns_fake_scope_without_connecting(monkeypatch):
+    monkeypatch.setattr(openstack_validator.settings, "OPENSTACK_SIMULATE", True)
+    with patch.object(openstack_validator.openstack, "connect") as connect:
+        scope = openstack_validator.validate(_password_payload(project_name="sim-proj"))
+    assert scope == openstack_validator.Scope(project_id="sim-project-001", project_name="Simulated Project")
+    connect.assert_not_called()
+
+
+def test_openstack_simulate_refused_in_production(monkeypatch):
+    from cryptography.fernet import Fernet
+
+    from app.config import Settings
+
+    key = Fernet.generate_key().decode()
+    with pytest.raises(ValidationError, match="OPENSTACK_SIMULATE must not be set in production"):
+        Settings(
+            _env_file=None,
+            APP_ENV="production",
+            OPENSTACK_SIMULATE=True,
+            DATABASE_URL="postgresql://u:p@db/x",
+            CREDENTIAL_ENCRYPTION_KEY=key,
+            LTI13_SESSION_SECRET="a" * 32,
+            HANDOFF_SESSION_SECRET="b" * 32,
+        )
+
+
+
+def test_openstack_resources_simulate_mode_returns_canned_resources(monkeypatch):
+    from app.routers import openstack_resources
+
+    monkeypatch.setattr(openstack_resources.settings, "OPENSTACK_SIMULATE", True)
+    cred = MagicMock()
+    with patch.object(openstack_resources.openstack_client, "cached_list") as cached_list:
+        networks = openstack_resources._list_with_oserror(cred, "networks", None, lambda _c: [])
+        assert len(networks) == 2
+        assert networks[0]["id"] == "net-sim-001"
+        cached_list.assert_not_called()
+
+    with patch.object(openstack_resources.openstack_client, "invalidate") as invalidate:
+        assert openstack_resources.refresh_resource_cache(kind="network", credential=cred) is None
+        invalidate.assert_not_called()
+
