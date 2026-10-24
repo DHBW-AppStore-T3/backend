@@ -78,6 +78,12 @@ class Course(Base):
 
     courseId = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String, nullable=False)
+    # The LTI context (``iss`` of the platform + ``context.id``) of a course an
+    # LTI launch created or adopted; the name is only its label (review S9).
+    lti_issuer = Column(String, nullable=True)
+    lti_context_id = Column(String, nullable=True)
+
+    __table_args__ = (UniqueConstraint("lti_issuer", "lti_context_id", name="uq_courses_lti_context"),)
 
     # Relationships
     users = relationship("User", back_populates="course")
@@ -104,9 +110,23 @@ class User(Base):
     username = Column(String, nullable=False)
     firstName = Column(String, nullable=True)
     lastName = Column(String, nullable=True)
+    # The effective role: the highest of the three sources below, recomputed
+    # whenever one of them changes (app.utils.roles, review S8).
     role = Column(Enum(UserRole), nullable=False, default=UserRole.STUDENT)
+    # What each source said last: the realm roles of the latest Keycloak
+    # token, the role of the latest LTI launch, and an admin's grant
+    # (``PUT /users/{id}``). NULL: that source never said anything.
+    keycloak_role = Column(Enum(UserRole), nullable=True)
+    lti_role = Column(Enum(UserRole), nullable=True)
+    granted_role = Column(Enum(UserRole), nullable=True)
+    # The LTI identity (``iss`` + ``sub`` of the platform's id_token) this
+    # account is linked to; the e-mail is only an attribute (review S9).
+    lti_issuer = Column(String, nullable=True)
+    lti_subject = Column(String, nullable=True)
     courseId = Column(UUID(as_uuid=True), ForeignKey("courses.courseId"), nullable=True, index=True)
     created_at = Column(DateTime, default=utcnow)
+
+    __table_args__ = (UniqueConstraint("lti_issuer", "lti_subject", name="uq_users_lti_identity"),)
 
     # Relationships
     course = relationship("Course", back_populates="users")
@@ -582,6 +602,25 @@ class LtiNonce(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 
     __table_args__ = (Index("ix_lti_nonces_created_at", "created_at"),)
+
+
+class LtiLoginCode(Base):
+    """A one-time code of an LTI launch, redeemed by the frontend for a session.
+
+    The launch hands the browser the code (in the URL fragment) and sets a
+    cookie with a random binding; only a request with both gets the session
+    token, so a link with somebody else's code signs nobody in (review S19).
+    Only hashes are stored. Redeemed once, within ``LTI_CODE_TTL``.
+    """
+
+    __tablename__ = "lti_login_codes"
+
+    code_hash = Column(String(64), primary_key=True)
+    binding_hash = Column(String(64), nullable=False)
+    userId = Column(UUID(as_uuid=True), ForeignKey("users.userId", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+
+    __table_args__ = (Index("ix_lti_login_codes_created_at", "created_at"),)
 
 
 # ----------------------------------------------------------------
