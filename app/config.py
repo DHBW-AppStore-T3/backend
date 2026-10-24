@@ -90,7 +90,7 @@ class Settings(BaseSettings):
     # Images in an appstore.yaml must come from these registries (prefixes,
     # D10: our own registry only) and every container stay within these
     # limits; the worker checks the same settings again.
-    APP_IMAGE_REGISTRY_ALLOWLIST: str = "ghcr.io/dhbw-appstore-t3/"
+    APP_IMAGE_REGISTRY_ALLOWLIST: str = "ghcr.io/dhbw-appstore-t3/apps/"
     APP_MAX_CPU: str = "2"
     APP_MAX_MEMORY: str = "4Gi"
     APP_MAX_STORAGE: str = "20Gi"

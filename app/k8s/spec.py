@@ -124,7 +124,8 @@ class SpecValidationError(ValueError):
 class PlatformLimits:
     """Upper bounds and allowlist the spec is validated against."""
 
-    image_registry_allowlist: tuple[str, ...] = ("ghcr.io/dhbw-appstore-t3/",)
+    # The apps' packages only, not every package of the organisation (backend, worker, ...).
+    image_registry_allowlist: tuple[str, ...] = ("ghcr.io/dhbw-appstore-t3/apps/",)
     max_cpu_millicores: int = 2000  # APP_MAX_CPU
     max_memory_mib: int = 4096  # APP_MAX_MEMORY
     max_storage_mib: int = 20 * 1024  # APP_MAX_STORAGE
