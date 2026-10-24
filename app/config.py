@@ -1,6 +1,7 @@
 import base64
 import binascii
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
@@ -67,6 +68,10 @@ class Settings(BaseSettings):
 
     # CORS
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:5173"]
+    # Origins of the UIs besides APP_BASE_URL and CORS_ORIGINS (comma-separated,
+    # e.g. the self-service-ui's https://self-service.<zone>). A browser write
+    # from any other origin is refused (app/utils/cross_site.py, review S3).
+    CSRF_TRUSTED_ORIGINS: str = ""
 
     # Symmetric Fernet key shared with the worker. Used to encrypt OpenStack
     # credentials at rest and to seal the envelope shipped through Celery.
@@ -181,6 +186,15 @@ class Settings(BaseSettings):
     @property
     def oidc_allowed_clients(self) -> frozenset[str]:
         return frozenset(c.strip() for c in self.OIDC_ALLOWED_CLIENTS.split(",") if c.strip())
+
+    @property
+    def trusted_write_origins(self) -> frozenset[str]:
+        """Origins whose pages may change state: the frontend, the CORS origins, CSRF_TRUSTED_ORIGINS."""
+        base = urlsplit(self.APP_BASE_URL)
+        origins = {f"{base.scheme}://{base.netloc}"} if base.scheme and base.netloc else set()
+        origins.update(o for o in self.CORS_ORIGINS if o != "*")
+        origins.update(o.strip() for o in self.CSRF_TRUSTED_ORIGINS.split(",") if o.strip())
+        return frozenset(o.rstrip("/").lower() for o in origins)
 
     @property
     def lti13_enabled(self) -> bool:
