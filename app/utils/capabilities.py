@@ -188,6 +188,22 @@ def ensure_deploy(user: User) -> None:
         raise _forbidden("role_required", [r.value for r in STAFF_ROLES])
 
 
+def can_deploy_app(user: User, app: App) -> bool:
+    """Start (or resume) a deployment of ``app``: not while an admin has
+    deactivated it (``hidden_by_admin``), except as an admin.
+
+    Deactivating makes the app private, and private apps skip the approval
+    gate, so without this check the owner could keep deploying an app an
+    admin took down, at any commit (review S7).
+    """
+    return _is_admin(user) or not getattr(app, "hidden_by_admin", False)
+
+
+def ensure_deploy_app(user: User, app: App) -> None:
+    if not can_deploy_app(user, app):
+        raise _forbidden("app_deactivated")
+
+
 def can_view_deployment_member(user: User, dep: Deployment, db: Session) -> bool:
     """Member-view access to a deployment.
 
@@ -428,6 +444,8 @@ __all__ = [
     # Deployments
     "can_deploy",
     "ensure_deploy",
+    "can_deploy_app",
+    "ensure_deploy_app",
     "can_view_deployment",
     "ensure_view_deployment",
     "can_view_deployment_member",
