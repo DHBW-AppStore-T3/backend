@@ -13,12 +13,15 @@ import threading
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from keycloak import KeycloakAdmin
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
 from app.models import User, UserRole
 from app.services import lti13_service
+from app.utils import roles
 from app.utils.oidc import IdentityProviderUnavailable, InvalidToken, OidcVerifier
 
 logger = logging.getLogger(__name__)
@@ -93,49 +96,42 @@ def verify_keycloak_token_offline(token: str) -> dict:
 
 
 # ----------------------------------------------------------------
-# ROLE MAPPING
-# ----------------------------------------------------------------
-def map_keycloak_roles_to_app_role(keycloak_roles: list) -> UserRole:
-    """Priority: admin > teacher > student"""
-    if "admin" in keycloak_roles:
-        return UserRole.ADMIN
-    if "teacher" in keycloak_roles:
-        return UserRole.TEACHER
-    return UserRole.STUDENT
-
-
-# Role privilege order. The app role is monotonic: a user's role is the
-# highest any source has ever asserted for them, and no login path lowers
-# it. Rationale: real (non-demo) users only ever carry a role in Moodle —
-# Keycloak federates them from bwIDM without a realm role, so a Keycloak /
-# self-service login would otherwise downgrade a Moodle-assigned TEACHER
-# back to STUDENT on every visit. Moodle is the authoritative role source;
-# every other path may only promote.
-_ROLE_RANK = {UserRole.STUDENT: 0, UserRole.TEACHER: 1, UserRole.ADMIN: 2}
-
-
-def higher_role(a: UserRole, b: UserRole) -> UserRole:
-    """Return whichever of the two roles carries more privilege."""
-    return a if _ROLE_RANK[a] >= _ROLE_RANK[b] else b
-
-
-# ----------------------------------------------------------------
 # USER SYNC (Just-in-Time Provisioning)
 # ----------------------------------------------------------------
-def sync_user_from_keycloak(db: Session, keycloak_user_data: dict) -> User:
+def account_by_email(db: Session, email: str, *, other_than=None) -> User | None:
+    """The account with ``email`` (ignoring case), optionally not ``other_than``'s."""
+    query = db.query(User).filter(func.lower(User.email) == email.strip().lower())
+    if other_than is not None:
+        query = query.filter(User.userId != other_than)
+    return query.first()
+
+
+def sync_user_from_keycloak(db: Session, keycloak_user_data: dict, *, _retry: bool = True) -> User:
     """
     Synchronize a Keycloak user into the local DB.
-    Creates the user if missing, updates role/name if changed.
+    Creates the user if missing, updates names and the Keycloak role if changed.
     Expects keys: id (or sub), username, email, roles (or realm_access.roles),
     firstName/given_name, lastName/family_name.
+
+    The token's realm roles are the Keycloak source of the role, and only
+    that source is overwritten; the effective role is recomputed from all
+    sources (:mod:`app.utils.roles`, review S8). Data without ``roles`` and
+    ``realm_access`` (a user search result) says nothing about the role and
+    leaves it as it is: a search must not demote whoever it finds.
+
+    A Keycloak account seen for the first time is linked to the account
+    with its e-mail address if there is one, e.g. the one a Moodle launch
+    created (F3: a second row with the same address was a 500). That is
+    safe on the Keycloak side: the realm allows each address once, and
+    people cannot change their own (no ``manage-account``).
     """
     keycloak_id = keycloak_user_data.get("id") or keycloak_user_data.get("sub")
     email = keycloak_user_data.get("email")
     username = keycloak_user_data.get("username") or keycloak_id
-    keycloak_roles = keycloak_user_data.get("roles") or keycloak_user_data.get(
-        "realm_access", {}
-    ).get("roles", [])
-    app_role = map_keycloak_roles_to_app_role(keycloak_roles)
+    keycloak_roles = keycloak_user_data.get("roles")
+    if keycloak_roles is None and "realm_access" in keycloak_user_data:
+        keycloak_roles = keycloak_user_data["realm_access"].get("roles", [])
+    keycloak_role = roles.from_keycloak(keycloak_roles) if keycloak_roles is not None else None
     first_name = keycloak_user_data.get("firstName") or keycloak_user_data.get("given_name")
     last_name = keycloak_user_data.get("lastName") or keycloak_user_data.get("family_name")
 
@@ -145,45 +141,59 @@ def sync_user_from_keycloak(db: Session, keycloak_user_data: dict) -> User:
             detail="Keycloak user has no email; refusing to provision.",
         )
 
-    user = db.query(User).filter(User.keycloak_id == keycloak_id).first()
-    if not user:
-        user = User(
-            keycloak_id=keycloak_id,
-            email=email,
-            username=username,
-            role=app_role,
-            firstName=first_name,
-            lastName=last_name,
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-        return user
-
     updated = False
-    # Email is the identifier used for display, search, and
-    # notifications; follow the Keycloak record when it changes.
-    if email and user.email != email:
-        user.email = email
+    user = db.query(User).filter(User.keycloak_id == keycloak_id).first()
+    if user is None:
+        user = account_by_email(db, email)
+        if user is not None:
+            logger.info(
+                "Linking Keycloak account %s to the existing account %s", keycloak_id, user.userId
+            )
+            user.keycloak_id = keycloak_id
+        else:
+            user = User(
+                keycloak_id=keycloak_id, email=email, username=username, role=UserRole.STUDENT
+            )
+            db.add(user)
         updated = True
+
+    # Email is the identifier used for display, search, and
+    # notifications; follow the Keycloak record when it changes (unless
+    # another account holds the new address: then both keep theirs).
+    if user.email != email:
+        if account_by_email(db, email, other_than=user.userId) is None:
+            user.email = email
+            updated = True
+        else:
+            logger.warning(
+                "Keycloak account %s changed its e-mail to one another account holds", keycloak_id
+            )
     # Username is the login identifier shown in the UI and in
     # Terraform-issued credentials; keep it in sync too.
     if username and user.username != username:
         user.username = username
         updated = True
-    promoted = higher_role(user.role, app_role)
-    if user.role != promoted:
-        user.role = promoted
+    if keycloak_role is not None and user.keycloak_role != keycloak_role:
+        user.keycloak_role = keycloak_role
         updated = True
+    updated = roles.refresh(user) or updated
     if first_name and user.firstName != first_name:
         user.firstName = first_name
         updated = True
     if last_name and user.lastName != last_name:
         user.lastName = last_name
         updated = True
-    if updated:
+    if not updated:
+        return user
+    try:
         db.commit()
-        db.refresh(user)
+    except IntegrityError:
+        # A parallel request of the same first sign-in created the row first.
+        db.rollback()
+        if not _retry:
+            raise
+        return sync_user_from_keycloak(db, keycloak_user_data, _retry=False)
+    db.refresh(user)
     return user
 
 
@@ -211,13 +221,13 @@ def get_current_user_keycloak(
 
     if settings.lti13_enabled:
         try:
-            email = lti13_service.verify_session_token(
+            user_id = lti13_service.verify_session_token(
                 credentials.credentials, settings.LTI13_SESSION_SECRET
             )
         except ValueError:
             pass  # not an LTI session token — fall through to Keycloak
         else:
-            user = db.query(User).filter(User.email == email).first()
+            user = db.get(User, user_id)
             if user:
                 return user
 
