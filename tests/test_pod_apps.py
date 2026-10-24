@@ -799,6 +799,68 @@ def test_an_app_without_bounds_ignores_no_choice(client, db, mock_user, pod_repo
 
 
 # ----------------------------------------------------------------
+# setup progress of an app (log line) and the last event of a ready workload
+# ----------------------------------------------------------------
+def test_parse_progress_takes_the_last_valid_line_and_checks_it():
+    log = "\n".join(
+        [
+            'appstore-progress {"percent": 10, "step": "Download"}',
+            "noise",
+            'appstore-progress {"percent": 250}',  # out of range: ignored
+            'appstore-progress {"percent": 42, "step": "Install\\nMATLAB", "etaSeconds": 600}',
+            "appstore-progress not json",
+        ]
+    )
+    assert k8s_status.parse_progress(log) == {"percent": 42, "step": "Install MATLAB", "etaSeconds": 600}
+    assert k8s_status.parse_progress("nothing here") is None
+    assert k8s_status.parse_progress('appstore-progress {"percent": true}') is None
+    assert k8s_status.parse_progress('appstore-progress {"percent": 5, "etaSeconds": -1}')["etaSeconds"] is None
+
+
+class _Core:
+    def __init__(self, log: str):
+        self.log, self.calls = log, []
+
+    def read_namespaced_pod_log(self, pod, namespace, **kwargs):
+        self.calls.append((pod, namespace, kwargs))
+        return self.log
+
+
+def test_a_running_workload_shows_its_setup_progress(live_pod_deployment):
+    deployment_id, kube, _ = live_pod_deployment
+    kube._core = _Core('appstore-progress {"percent": 37, "step": "MATLAB", "etaSeconds": 900}')
+    namespace = f"dep-{deployment_id.hex[:8]}"
+
+    rows = k8s_status.workload_views(deployment_id, namespace)
+
+    assert {r["workload"] for r in rows} and all(r["setup"] == {"percent": 37, "step": "MATLAB", "etaSeconds": 900} for r in rows)
+    assert kube._core.calls[0][2]["tail_lines"] == 100
+
+
+def test_a_finished_setup_shows_no_bar(live_pod_deployment):
+    deployment_id, kube, _ = live_pod_deployment
+    kube._core = _Core('appstore-progress {"percent": 100, "step": "done"}')
+    rows = k8s_status.workload_views(deployment_id, f"dep-{deployment_id.hex[:8]}")
+    assert all(r["setup"] is None for r in rows)
+
+
+def test_a_ready_workload_does_not_show_an_old_warning(live_pod_deployment):
+    from app.k8s.kube import EventInfo
+
+    deployment_id, kube, _ = live_pod_deployment
+    namespace = f"dep-{deployment_id.hex[:8]}"
+    original = kube.snapshot
+
+    def with_warning(ns):
+        snap = original(ns)
+        snap.events = [EventInfo(object=f"pod/{p.name}", reason="Unhealthy", message="Readiness probe failed: dial tcp") for p in snap.pods]
+        return snap
+
+    kube.snapshot = with_warning
+    rows = k8s_status.workload_views(deployment_id, namespace)
+    assert rows and all(r["ready"] and r["lastEvent"] is None for r in rows)
+
+
 # internet / pod network chosen in the wizard (userChoices)
 # ----------------------------------------------------------------
 def _networked_spec(**choices):

@@ -7,7 +7,9 @@ in the database; the namespace is the state. Ported from the pod MVP.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -37,6 +39,66 @@ def kube() -> Kube | None:
 
 def app_domain() -> str:
     return settings.K8S_APP_DOMAIN or (f"apps.{settings.K8S_ZONE}" if settings.K8S_ZONE else "")
+
+
+# An app that runs a setup after it started (an installer) tells the platform how
+# far it is with one log line: ``appstore-progress {"percent": 42, "step": "...",
+# "etaSeconds": 600}``. Only this line is read from the log, nothing else.
+PROGRESS_PREFIX = "appstore-progress "
+_LOG_TAIL_LINES = 100
+_LOG_LIMIT_BYTES = 64 * 1024
+_MAX_SETUP_WORKLOADS = 20  # logs are read per running workload; bound the cost
+
+
+def parse_progress(log: str) -> dict[str, Any] | None:
+    """The last valid progress report in ``log``, or None.
+
+    The text comes from the app: values are checked and cut, never trusted.
+    """
+    for line in reversed(log.splitlines()):
+        line = line.strip()
+        if not line.startswith(PROGRESS_PREFIX):
+            continue
+        try:
+            data = json.loads(line[len(PROGRESS_PREFIX) :])
+        except ValueError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        percent = data.get("percent")
+        if (
+            isinstance(percent, bool)
+            or not isinstance(percent, (int, float))
+            or not 0 <= percent <= 100
+        ):
+            continue
+        step = data.get("step")
+        eta = data.get("etaSeconds")
+        return {
+            "percent": int(percent),
+            "step": re.sub(r"[\x00-\x1f]", " ", step)[:80]
+            if isinstance(step, str) and step
+            else None,
+            "etaSeconds": int(eta)
+            if isinstance(eta, (int, float)) and not isinstance(eta, bool) and 0 <= eta <= 7 * 86400
+            else None,
+        }
+    return None
+
+
+def _setup_progress(client: Kube, namespace: str, pod: str) -> dict[str, Any] | None:
+    """The setup progress of a running pod, read from its log; None if there is none."""
+    core = getattr(client, "_core", None)  # the real client only; the fake has no logs
+    if core is None:
+        return None
+    try:
+        log = core.read_namespaced_pod_log(
+            pod, namespace, tail_lines=_LOG_TAIL_LINES, limit_bytes=_LOG_LIMIT_BYTES
+        )
+    except Exception:
+        logger.debug("no log of %s/%s", namespace, pod, exc_info=True)
+        return None
+    return parse_progress(log) if isinstance(log, str) else None
 
 
 def _phase(snap: Snapshot, workload: str, replicas: int) -> tuple[str, bool, int]:
@@ -72,9 +134,22 @@ def workload_views(deployment_id, namespace: str) -> list[dict[str, Any]] | None
     dep = DeploymentCtx(id=str(deployment_id))
     domain = app_domain()
     rows = []
-    for s in snap.statefulsets:
+    for index, s in enumerate(snap.statefulsets):
         phase, ready, restarts = _phase(snap, s.name, s.replicas)
-        event = next((f"{e.reason}: {e.message}" for e in reversed(snap.events) if s.name in e.object), None)
+        # Once the workload is ready, a warning from its start (a readiness probe that
+        # failed before the server listened) is history; the page says it started.
+        event = (
+            None
+            if ready
+            else next(
+                (f"{e.reason}: {e.message}" for e in reversed(snap.events) if s.name in e.object),
+                None,
+            )
+        )
+        setup = None
+        if phase == "Running" and index < _MAX_SETUP_WORKLOADS:
+            pod = next((p for p in snap.pods if p.workload == s.name), None)
+            setup = _setup_progress(client, namespace, pod.name) if pod is not None else None
         rows.append(
             {
                 "workload": s.name,
@@ -85,6 +160,7 @@ def workload_views(deployment_id, namespace: str) -> list[dict[str, Any]] | None
                 "phase": phase,
                 "url": f"https://{s.name}-{dep.short_id}.{domain}" if domain else None,
                 "lastEvent": event,
+                "setup": setup if setup is not None and setup["percent"] < 100 else None,
             }
         )
     return rows
