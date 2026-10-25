@@ -328,7 +328,7 @@ def _read_version(repo_path: str) -> _VersionScan:
         loaded = app_spec.read_spec_from_repo(repo_path)
     except HTTPException as exc:
         return _VersionScan(variables=[], spec=None, spec_error=exc.detail)
-    if loaded is not None and loaded.runtime == RUNTIME_K8S:
+    if loaded is not None and loaded.runtime in (RUNTIME_K8S, RUNTIME_KUBEVIRT):
         return _VersionScan(variables=app_spec.spec_variables(loaded.spec), spec=loaded)
 
     variables: list[dict[str, Any]] = []
@@ -548,6 +548,8 @@ def get_app_runtime(
     loaded = load_version_spec(app, version)
     if loaded is None:
         return AppRuntimeResponse(runtime=RUNTIME_VM)
+    if loaded.runtime == RUNTIME_KUBEVIRT:
+        return AppRuntimeResponse(runtime=RUNTIME_KUBEVIRT, scope=loaded.spec.scope)
     if loaded.runtime != RUNTIME_K8S:
         # A VM app may declare how members are grouped; ``user`` (the
         # Windows app: one VM per person) makes the wizard put everyone in
