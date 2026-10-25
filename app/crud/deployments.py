@@ -1,3 +1,4 @@
+import contextlib
 import json
 import uuid
 from datetime import datetime
@@ -516,12 +517,23 @@ def soft_delete_deployment(db: Session, deployment_id: UUID) -> bool:
     they're useful for audit and the partial-unique index on active
     tasks already prevents the deployment from accepting new work.
 
+    The uploaded files are dropped from ``userInputVar`` (name and size
+    stay): nothing reads them after the deployment is gone, and the row
+    would otherwise keep every upload for good.
+
     Returns ``False`` if the deployment doesn't exist (or was already
     deleted), ``True`` on a successful soft-delete.
     """
     db_deployment = get_deployment(db, deployment_id)
     if not db_deployment:
         return False
+    if db_deployment.userInputVar:
+        from app.services.deployment_input import strip_file_vars_from_user_input
+
+        with contextlib.suppress(json.JSONDecodeError):
+            db_deployment.userInputVar = json.dumps(
+                strip_file_vars_from_user_input(json.loads(db_deployment.userInputVar))
+            )
     db_deployment.deleted_at = utcnow()
     db.commit()
     return True

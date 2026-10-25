@@ -66,6 +66,7 @@ from app.services import (
 )
 from app.services.deployment_input import (
     attach_files_to_user_input,
+    log_rejected_upload,
     looks_like_file_var,
     parse_and_strip_user_input,
     validate_scoped_user_input,
@@ -444,11 +445,15 @@ def create_deployment(
     # the row never enters the DB. When variable definitions are
     # available, the helper also enforces the app author's declared
     # ``fileExtensions`` filter on each upload name.
-    deployment.userInputVar = attach_files_to_user_input(
-        deployment.userInputVar,
-        deployment.files,
-        variable_definitions or None,
-    )
+    try:
+        deployment.userInputVar = attach_files_to_user_input(
+            deployment.userInputVar,
+            deployment.files,
+            variable_definitions or None,
+        )
+    except HTTPException as exc:
+        log_rejected_upload(current_user.userId, exc)
+        raise
 
     # Enforce ``varScope = team|user`` contracts: each value must be a
     # map whose keys match the deployment's team / user roster. This
