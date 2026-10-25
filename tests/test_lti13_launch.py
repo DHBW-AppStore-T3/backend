@@ -414,3 +414,57 @@ def test_in_production_the_lti_cookies_carry_the_host_prefix(db):
         ):
             code = _fragment(client.post("/lti13/launch", data={"id_token": "fake-token", "state": state}))["code"]
         assert client.post("/lti13/session", json={"code": code}).status_code == 200
+
+
+def _set_cookies(response) -> dict[str, str]:
+    """The ``Set-Cookie`` headers of a response by cookie name."""
+    return {header.split("=", 1)[0]: header for header in response.headers.get_list("set-cookie")}
+
+
+@pytest.mark.parametrize(
+    ("env", "prefix", "secure"),
+    [("development", "", False), ("production", "__Host-", True)],
+)
+def test_lti_cookies_per_environment(db, env, prefix, secure):
+    """Every cookie of login, launch and session, in each environment, the ones that delete included.
+
+    The suite runs with ``APP_ENV=development`` (plain names, no ``Secure``); production adds the
+    ``__Host-`` prefix. A browser ignores a ``__Host-`` cookie, a deletion too, unless it is
+    ``Secure`` with ``Path=/`` and without ``Domain``, so the used state and binding cookies would
+    stay behind if a deletion missed one of these."""
+    state_name, binding_name = f"{prefix}lti13_state", f"{prefix}lti13_binding"
+    client = TestClient(app, base_url="https://testserver")
+
+    def assert_cookie(cookies, name, *, deletes):
+        header = cookies[name]
+        assert "Path=/" in header and "Domain" not in header and "HttpOnly" in header
+        assert ("Secure" in header) is secure
+        assert ("Max-Age=0" in header) is deletes
+
+    with (
+        patch.object(settings, "APP_ENV", env),
+        patch.object(settings, "LTI13_PLATFORM_ISSUER", ISS),
+        patch.object(settings, "LTI13_CLIENT_ID", "client-123"),
+        patch.object(settings, "LTI13_SESSION_SECRET", "s" * 40),
+    ):
+        login = client.get("/lti13/login", params={"iss": ISS}, follow_redirects=False)
+        cookies = _set_cookies(login)
+        assert set(cookies) == {state_name}
+        assert_cookie(cookies, state_name, deletes=False)
+
+        with (
+            patch("app.routers.lti13.lti13_service.validate_id_token", return_value={}),
+            patch("app.routers.lti13.lti13_service.extract_user_info", return_value=_info()),
+        ):
+            launch = client.post("/lti13/launch", data={"id_token": "fake-token", "state": login.cookies[state_name]})
+        assert launch.status_code == 200, launch.text
+        cookies = _set_cookies(launch)
+        assert set(cookies) == {state_name, binding_name}
+        assert_cookie(cookies, state_name, deletes=True)  # the state is used up
+        assert_cookie(cookies, binding_name, deletes=False)
+
+        session = client.post("/lti13/session", json={"code": _fragment(launch)["code"]})
+        assert session.status_code == 200
+        cookies = _set_cookies(session)
+        assert set(cookies) == {binding_name}
+        assert_cookie(cookies, binding_name, deletes=True)  # the code is redeemed
