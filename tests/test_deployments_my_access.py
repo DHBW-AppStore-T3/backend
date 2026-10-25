@@ -52,7 +52,7 @@ def _seed_deployment_with_outputs(db, owner, members, *, outputs=None, team_name
         appId=app.appId,
         userId=owner.userId,
         releaseTag="v1.0.0",
-        userInputVar=json.dumps({"terraform": {}, "packer": {}}),
+        userInputVar=json.dumps({"terraform": {}}),
     )
     db.add(deployment)
     db.flush()

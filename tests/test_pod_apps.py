@@ -28,7 +28,7 @@ from app.models import (
 )
 from app.models import Team as TeamRow
 from app.services import k8s_status
-from tests.conftest import _make_client, add_credential, approve_version_in_db
+from tests.conftest import _make_client
 
 pytestmark = pytest.mark.integration
 
@@ -114,10 +114,8 @@ def _student(db, name: str) -> User:
     return user
 
 
-def _deploy(client, app, *, teams=None, credential=None, tag="v1.0"):
+def _deploy(client, app, *, teams=None, tag="v1.0"):
     body = {"name": "d", "appId": str(app.appId), "releaseTag": tag, "teams": teams or []}
-    if credential is not None:
-        body["credentialId"] = str(credential.credentialId)
     return client.post("/deployments/", json=body)
 
 
@@ -219,35 +217,29 @@ def test_variables_and_runtime_come_from_the_spec(client, db, mock_user, pod_rep
     )
 
 
-def test_runtime_of_a_vm_app(client, db, mock_user, fake_git):
-    app = _app(db, mock_user)
-    assert client.get(f"/apps/{app.appId}/runtime", params={"version": "v1.0"}).json() == {
-        "runtime": "openstack-vm",
-        "scope": None,
-        "egress": None,
-        "access": [],
-        "resources": [],
-        "network": {},
-    }
-
-
-def test_a_vm_app_can_declare_one_vm_per_person(client, db, mock_user, pod_repo, fake_git):
-    pod_repo(
-        {"apiVersion": "appstore/v2", "name": "windows", "runtime": "openstack-vm", "scope": "user"}
-    )
-    fake_git.files["terraform/variables.tf"] = (
-        'variable "users" {\n  type = map(list(object({ email = string })))\n}\n'
-        'variable "flavor" {\n  type = string\n  default = "m1.large"\n}\n'
-    )
+def test_a_version_without_an_appstore_yaml_is_unusable(client, db, mock_user, fake_git):
+    del fake_git.files["appstore.yaml"]
     app = _app(db, mock_user)
 
-    runtime = client.get(f"/apps/{app.appId}/runtime", params={"version": "v1.0"}).json()
-    variables = client.get(f"/apps/{app.appId}/variables", params={"version": "v1.0"}).json()
-    submitted = client.post(f"/apps/{app.appId}/versions/v1.0/submit", json={}).json()
+    for response in (
+        client.get(f"/apps/{app.appId}/runtime", params={"version": "v1.0"}),
+        client.get(f"/apps/{app.appId}/variables", params={"version": "v1.0"}),
+        client.post(f"/apps/{app.appId}/versions/v1.0/submit", json={}),
+    ):
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"]["reason"] == "appstore_yaml_missing"
 
-    assert (runtime["runtime"], runtime["scope"]) == ("openstack-vm", "user")
-    assert [v["name"] for v in variables] == ["flavor"]  # its Terraform variables, as before
-    assert (submitted["runtime"], submitted["spec_sha256"]) == ("openstack-vm", None)
+
+def test_an_unknown_runtime_is_refused(client, db, mock_user, pod_repo):
+    pod_repo({"apiVersion": "appstore/v2", "name": "windows", "runtime": "openstack-vm", "scope": "user"})
+    app = _app(db, mock_user)
+
+    for response in (
+        client.get(f"/apps/{app.appId}/runtime", params={"version": "v1.0"}),
+        client.post(f"/apps/{app.appId}/versions/v1.0/submit", json={}),
+    ):
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"]["reason"] == "invalid_app_spec"
 
 
 def test_approving_checks_the_spec_is_the_submitted_one(
@@ -269,7 +261,7 @@ def test_approving_checks_the_spec_is_the_submitted_one(
 # ----------------------------------------------------------------
 # deploying
 # ----------------------------------------------------------------
-def test_a_pod_app_deploys_without_an_openstack_credential(client, db, mock_user, pod_repo, sent):
+def test_a_pod_app_deploys(client, db, mock_user, pod_repo, sent):
     alice, bob = _student(db, "alice"), _student(db, "bob")
     app = _app(db, mock_user)
     _submit_and_approve(client, db, app)
@@ -280,16 +272,13 @@ def test_a_pod_app_deploys_without_an_openstack_credential(client, db, mock_user
     deployment_id = uuid.UUID(response.json()["deploymentId"])
     name, kwargs = _job(sent)
     assert name == "pods.deploy_application"
-    assert kwargs["openstack_envelope"] == {}
-    assert "state_token_enc" not in kwargs
+    assert "openstack_envelope" not in kwargs and "state_token_enc" not in kwargs
     assert kwargs["spec"]["workload"]["containers"][0]["image"].endswith(DIGEST)
     assert kwargs["owner"] == str(mock_user.userId)
     assert {m["user_id"] for m in kwargs["teams"]["Team-1"]} == {str(alice.userId), str(bob.userId)}
     row = db.get(Deployment, deployment_id)
-    assert (row.runtime, row.os_project_id, row.k8s_workloads) == ("kubernetes", None, 2)
+    assert (row.runtime, row.k8s_workloads) == ("kubernetes", 2)
     assert row.k8s_namespace == f"dep-{deployment_id.hex[:8]}"
-    task = db.query(Task).filter(Task.deploymentId == deployment_id).one()
-    assert task.state_token_hash is None
     assert response.json()["runtime"] == "kubernetes"
 
 
@@ -323,11 +312,11 @@ def test_a_kubevirt_app_is_submitted_deployed_and_kept_as_a_cluster_app(
     assert response.status_code == 201, response.text
     name, kwargs = _job(sent)
     assert name == "pods.deploy_vm_application"
-    assert kwargs["openstack_envelope"] == {}
+    assert "openstack_envelope" not in kwargs and "state_token_enc" not in kwargs
     assert kwargs["spec"]["vm"]["imageRef"] == "windows11-matlab-golden"
     deployment_id = uuid.UUID(response.json()["deploymentId"])
     row = db.get(Deployment, deployment_id)
-    assert (row.runtime, row.os_project_id, row.k8s_workloads) == ("kubevirt-vm", None, 1)
+    assert (row.runtime, row.k8s_workloads) == ("kubevirt-vm", 1)
     # Without its namespace the orphan sweep would delete the running VM.
     assert row.k8s_namespace == f"dep-{deployment_id.hex[:8]}"
     assert response.json()["runtime"] == "kubevirt-vm"
@@ -409,16 +398,6 @@ def test_a_vm_size_outside_the_bounds_is_refused(client, db, mock_user, pod_repo
     sent.assert_not_called()
 
 
-def test_a_supplied_credential_is_ignored_for_pods(client, db, mock_user, pod_repo, sent):
-    app = _app(db, mock_user, is_private=True)
-    response = _deploy(
-        client, app, teams=[_team("T", _student(db, "c"))], credential=add_credential(db, mock_user)
-    )
-    assert response.status_code == 201, response.text
-    assert _job(sent)[1]["openstack_envelope"] == {}
-    assert response.json()["os_project_id"] is None
-
-
 def test_a_changed_spec_after_approval_is_not_deployable(client, db, mock_user, pod_repo, sent):
     app = _app(db, mock_user)
     _submit_and_approve(client, db, app)
@@ -431,19 +410,6 @@ def test_a_changed_spec_after_approval_is_not_deployable(client, db, mock_user, 
     assert response.status_code == 403
     assert response.json()["detail"]["code"] == "version_not_approved"
     sent.assert_not_called()
-
-
-def test_a_vm_app_still_needs_a_credential(client, db, mock_user, fake_git, sent):
-    app = _app(db, mock_user)
-    approve_version_in_db(db, app, "v1.0")
-
-    assert _deploy(client, app).status_code == 412
-    response = _deploy(client, app, credential=add_credential(db, mock_user))
-
-    assert response.status_code == 201, response.text
-    name, kwargs = _job(sent)
-    assert name == "tasks.deploy_application" and kwargs["openstack_envelope"]
-    assert "state_token_enc" in kwargs and "spec" not in kwargs
 
 
 @pytest.mark.parametrize(
@@ -542,7 +508,7 @@ def live_pod_deployment(client, db, mock_user, pod_repo, sent):
     k8s_status.set_kube_factory(None)
 
 
-def test_pause_resume_destroy_need_no_credential(client, db, live_pod_deployment, sent):
+def test_pause_resume_destroy_dispatch_pod_jobs(client, db, live_pod_deployment, sent):
     deployment_id, _kube, _ = live_pod_deployment
 
     response = client.post(f"/deployments/{deployment_id}/pause")
@@ -550,7 +516,7 @@ def test_pause_resume_destroy_need_no_credential(client, db, live_pod_deployment
     assert response.status_code == 202, response.text
     name, kwargs = _job(sent)
     assert name == "pods.pause_deployment"
-    assert kwargs["openstack_envelope"] == {} and "state_token_enc" not in kwargs
+    assert "openstack_envelope" not in kwargs and "state_token_enc" not in kwargs
 
 
 def test_admins_operate_pod_deployments(db, live_pod_deployment, admin_client, sent):
@@ -617,7 +583,7 @@ def test_resources_of_a_pod_deployment_list_its_workloads(client, live_pod_deplo
 
     body = client.get(f"/deployments/{deployment_id}/resources").json()
 
-    assert body["runtime"] == "kubernetes" and body["live"] is True and body["resources"] == []
+    assert body["runtime"] == "kubernetes" and body["live"] is True and "resources" not in body
     rows = {w["workload"]: w for w in body["workloads"]}
     assert set(rows) == {"team-1-anna", "team-1-ben"}
     assert rows["team-1-anna"]["ready"] is True and rows["team-1-anna"]["phase"] == "Running"
@@ -675,12 +641,24 @@ def test_restart_refuses_unknown_or_malformed_workloads(
     sent.assert_not_called()
 
 
-def test_vm_resource_endpoints_refuse_pod_deployments(client, live_pod_deployment):
+def test_the_vm_resource_endpoints_are_gone(client, live_pod_deployment):
     deployment_id, _kube, _ = live_pod_deployment
-    response = client.post(
-        f"/deployments/{deployment_id}/resources/openstack_compute_instance_v2.x/redeploy"
-    )
-    assert response.status_code == 422 and response.json()["detail"]["reason"] == "pod_deployment"
+    assert client.get(f"/deployments/{deployment_id}/resources/x.y").status_code in (404, 405)
+    assert client.post(f"/deployments/{deployment_id}/resources/x.y/redeploy").status_code in (404, 405)
+
+
+def test_deleting_a_row_of_the_removed_vm_path_just_hides_it(client, db, mock_user, pod_repo, sent):
+    app = _app(db, mock_user, is_private=True)
+    row = Deployment(name="old", appId=app.appId, userId=mock_user.userId, runtime="openstack-vm", releaseTag="v1")
+    db.add(row)
+    db.commit()
+
+    response = client.delete(f"/deployments/{row.deploymentId}")
+
+    assert response.status_code == 204, response.text
+    db.expire_all()
+    assert db.get(Deployment, row.deploymentId).deleted_at is not None
+    sent.assert_not_called()
 
 
 def test_cancel_ends_the_deploy_and_queues_the_cleanup(client, db, mock_user, pod_repo, sent):

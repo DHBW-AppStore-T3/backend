@@ -1,11 +1,11 @@
 """The app contract v2 (``appstore.yaml``) as the API uses it (.github#4).
 
-An app version either has an ``appstore.yaml`` at its commit (it runs as
-pods) or not (it is a Terraform/Packer app that runs as VMs). The file is read
-from exactly the commit being submitted, approved or deployed, validated
-against the platform limits, and turned into what the rest of the API needs:
-the runtime, the spec hash and image digests a review covers, and the wizard
-variables. Ported from the pod MVP.
+An app version has an ``appstore.yaml`` at its commit (it runs as pods); a
+version without a valid one cannot be submitted, approved or deployed. The
+file is read from exactly the commit being submitted, approved or deployed,
+validated against the platform limits, and turned into what the rest of the
+API needs: the runtime, the spec hash and image digests a review covers, and
+the wizard variables. Ported from the pod MVP.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from app.k8s.spec import (
     limits_from,
     parse_spec,
 )
-from app.models import RUNTIME_K8S, RUNTIME_KUBEVIRT, RUNTIME_VM
+from app.models import RUNTIME_K8S, RUNTIME_KUBEVIRT
 from app.utils import safe_yaml
 
 SPEC_FILE = "appstore.yaml"
@@ -44,7 +44,7 @@ class LoadedSpec:
 
     @property
     def runtime(self) -> str:
-        return {"kubernetes": RUNTIME_K8S, "kubevirt-vm": RUNTIME_KUBEVIRT}.get(self.spec.runtime, RUNTIME_VM)
+        return RUNTIME_KUBEVIRT if self.spec.runtime == "kubevirt-vm" else RUNTIME_K8S
 
     def payload(self) -> dict[str, Any]:
         """The spec as the pod worker gets it in the job (it validates it again)."""
@@ -141,25 +141,28 @@ def with_network_overrides(loaded: LoadedSpec, choice: Any) -> LoadedSpec:
     return dataclasses.replace(loaded, spec=spec)
 
 
-def read_spec_from_repo(repo_path: str) -> LoadedSpec | None:
-    """The validated spec in a cloned commit, or None for a VM app."""
+def read_spec_from_repo(repo_path: str) -> LoadedSpec:
+    """The validated spec in a cloned commit; 422 ``appstore_yaml_missing`` without one."""
     path = os.path.join(repo_path, SPEC_FILE)
     if not os.path.isfile(path):
-        return None
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "appstore_yaml_missing", "message": f"the repository has no {SPEC_FILE}"},
+        )
     with open(path, "rb") as fh:
         return parse_checked(fh.read())
 
 
-def digests_json(loaded: LoadedSpec | None) -> str | None:
+def digests_json(loaded: LoadedSpec) -> str:
     """The image digests as stored on an approval."""
-    return json.dumps(list(loaded.image_digests)) if loaded is not None else None
+    return json.dumps(list(loaded.image_digests))
 
 
 def spec_variables(spec: AppSpec) -> list[dict[str, Any]]:
     """The spec's variables in the shape ``GET /apps/{id}/variables`` returns.
 
-    Same keys as the Terraform variables, so the wizard renders them with the
-    same components and the API validates them with the same code: values
+    The keys are the ones the wizard renders and the API validates
+    (``osType`` and friends are historical names): values
     travel in ``userInputVar.terraform`` (``source``), a file variable is
     ``osType`` ``file`` with scope ``all`` or ``team``, an enum has ``osType``
     ``enum`` with its ``values``.
@@ -180,8 +183,6 @@ def spec_variables(spec: AppSpec) -> list[dict[str, Any]]:
             "osScope": None,
             "varScope": scope,
             "fileExtensions": None,
-            "markerError": None,
-            "template_key": None,
         }
         if v.type == "file":
             file_scope = scope or "all"

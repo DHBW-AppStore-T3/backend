@@ -138,13 +138,12 @@ def test_privileged_port_rejected():
     assert "workload.containers[0].expose.port" in errors_of(data)
 
 
-def test_kubernetes_requires_workload_and_vm_forbids_it():
+def test_kubernetes_requires_workload():
     assert any("requires 'workload'" in m for m in errors_of(spec_with(lambda d: d.pop("workload"))).values())
-    assert any("not allowed" in m for m in errors_of(spec_with(lambda d: d.update(runtime="openstack-vm"))).values())
 
 
-def test_openstack_vm_spec_without_workload_is_valid():
-    assert parse_spec({"apiVersion": "appstore/v2", "name": "win", "runtime": "openstack-vm"}).workload is None
+def test_unknown_runtime_is_rejected():
+    assert "runtime" in errors_of(spec_with(lambda d: d.update(runtime="openstack-vm")))
 
 
 def test_large_file_variable_rejected():

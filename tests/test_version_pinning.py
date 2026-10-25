@@ -21,9 +21,7 @@ from app.models import (
     TaskType,
 )
 from tests.conftest import (
-    TEST_PROJECT,
     FakeGitRemote,
-    add_credential,
     approve_version_in_db,
     create_app_in_db,
 )
@@ -41,14 +39,10 @@ def sent():
         yield m
 
 
-def _credential(db, user):
-    return add_credential(db, user)
-
-
-def _deploy(client, app, cred, tag="v1.0.0"):
+def _deploy(client, app, user, tag="v1.0.0"):
     return client.post("/deployments/", json={
-        "name": "pinned", "appId": str(app.appId), "releaseTag": tag, "teams": [],
-        "credentialId": str(cred.credentialId),
+        "name": "pinned", "appId": str(app.appId), "releaseTag": tag,
+        "teams": [{"name": "T", "userIds": [str(user.userId)]}],
     })
 
 
@@ -62,7 +56,7 @@ def test_submit_records_the_commit_the_tag_points_to(client, db, mock_user, fake
 
     assert resp.status_code == 201, resp.text
     assert resp.json()["commit_sha"] == FakeGitRemote.sha_for("v1.0.0")
-    # The marker scan read exactly that commit.
+    # The scan read exactly that commit.
     assert fake_git.clones[-1][2] == FakeGitRemote.sha_for("v1.0.0")
 
 
@@ -122,9 +116,8 @@ def test_registration_stores_the_normalised_url(client):
 def test_deploy_of_an_approved_commit_pins_it(client, db, mock_user, mock_admin, sent, fake_git):
     app = create_app_in_db(db, mock_admin)
     approve_version_in_db(db, app, "v1.0.0")
-    cred = _credential(db, mock_user)
 
-    resp = _deploy(client, app, cred)
+    resp = _deploy(client, app, mock_user)
 
     assert resp.status_code == 201, resp.text
     assert resp.json()["commit_sha"] == FakeGitRemote.sha_for("v1.0.0")
@@ -134,9 +127,8 @@ def test_deploy_of_an_approved_commit_pins_it(client, db, mock_user, mock_admin,
 def test_deploy_refuses_an_unapproved_version_of_a_public_app(client, db, mock_user, mock_admin, sent):
     app = create_app_in_db(db, mock_admin)
     approve_version_in_db(db, app, "v1.0.0")
-    cred = _credential(db, mock_user)
 
-    resp = _deploy(client, app, cred, tag="v2.0.0")
+    resp = _deploy(client, app, mock_user, tag="v2.0.0")
 
     assert resp.status_code == 403
     assert resp.json()["detail"]["code"] == "version_not_approved"
@@ -147,9 +139,8 @@ def test_deploy_refuses_a_tag_moved_after_approval(client, db, mock_user, mock_a
     app = create_app_in_db(db, mock_admin)
     approve_version_in_db(db, app, "v1.0.0")
     fake_git.move("v1.0.0")
-    cred = _credential(db, mock_user)
 
-    resp = _deploy(client, app, cred)
+    resp = _deploy(client, app, mock_user)
 
     assert resp.status_code == 403
     assert resp.json()["detail"]["code"] == "version_not_approved"
@@ -164,9 +155,8 @@ def test_deploy_needs_a_version(client, db, mock_user, sent):
 
 def test_owner_deploys_any_tag_of_a_private_app_pinned(client, db, mock_user, sent, fake_git):
     app = create_app_in_db(db, mock_user, is_private=True)
-    cred = _credential(db, mock_user)
 
-    resp = _deploy(client, app, cred, tag="feature-x")
+    resp = _deploy(client, app, mock_user, tag="feature-x")
 
     assert resp.status_code == 201, resp.text
     assert resp.json()["commit_sha"] == FakeGitRemote.sha_for("feature-x")
@@ -174,10 +164,9 @@ def test_owner_deploys_any_tag_of_a_private_app_pinned(client, db, mock_user, se
 
 def test_deploy_fails_closed_without_the_repository(client, db, mock_user, sent, fake_git):
     app = create_app_in_db(db, mock_user, is_private=True)
-    cred = _credential(db, mock_user)
     fake_git.readable = False
 
-    resp = _deploy(client, app, cred)
+    resp = _deploy(client, app, mock_user)
 
     assert resp.status_code == 502
     assert db.query(Deployment).count() == 0
@@ -186,10 +175,9 @@ def test_deploy_fails_closed_without_the_repository(client, db, mock_user, sent,
 
 def test_deploy_of_an_unknown_tag_is_404(client, db, mock_user, sent, fake_git):
     app = create_app_in_db(db, mock_user, is_private=True)
-    cred = _credential(db, mock_user)
     fake_git.any_tag = False
 
-    resp = _deploy(client, app, cred, tag="nope")
+    resp = _deploy(client, app, mock_user, tag="nope")
 
     assert resp.status_code == 404
     assert resp.json()["detail"]["reason"] == "version_not_found"
@@ -201,7 +189,7 @@ def test_deploy_of_an_unknown_tag_is_404(client, db, mock_user, sent, fake_git):
 def _deployment(db, user, app, *, commit_sha):
     dep = Deployment(
         deploymentId=uuid.uuid4(), name="d", appId=app.appId, userId=user.userId,
-        releaseTag="v1.0.0", commit_sha=commit_sha, os_project_id=TEST_PROJECT,
+        releaseTag="v1.0.0", commit_sha=commit_sha, runtime="kubernetes",
         userInputVar=json.dumps({"terraform": {}}),
     )
     db.add(dep)
@@ -214,7 +202,6 @@ def _deployment(db, user, app, *, commit_sha):
 
 def test_lifecycle_jobs_carry_the_pinned_commit_even_if_the_tag_moved(client, db, mock_user, sent, fake_git):
     app = create_app_in_db(db, mock_user, is_private=True)
-    _credential(db, mock_user)
     pinned = FakeGitRemote.sha_for("v1.0.0")
     dep = _deployment(db, mock_user, app, commit_sha=pinned)
     fake_git.move("v1.0.0")
@@ -223,17 +210,3 @@ def test_lifecycle_jobs_carry_the_pinned_commit_even_if_the_tag_moved(client, db
 
     assert resp.status_code == 202, resp.text
     assert sent.call_args.kwargs["kwargs"]["commit_sha"] == pinned
-
-
-def test_a_legacy_deployment_is_pinned_on_its_next_job(client, db, mock_user, sent, fake_git):
-    app = create_app_in_db(db, mock_user, is_private=True)
-    _credential(db, mock_user)
-    dep = _deployment(db, mock_user, app, commit_sha=None)
-
-    resp = client.post(f"/deployments/{dep.deploymentId}/pause")
-
-    assert resp.status_code == 202, resp.text
-    db.expire_all()
-    stored = db.get(Deployment, dep.deploymentId)
-    assert stored.commit_sha == FakeGitRemote.sha_for("v1.0.0")
-    assert sent.call_args.kwargs["kwargs"]["commit_sha"] == stored.commit_sha

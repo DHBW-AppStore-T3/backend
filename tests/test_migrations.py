@@ -141,15 +141,11 @@ def test_worker_role_has_only_its_rights(scratch_db):
             "UPDATE celery_queue SET visible_after = now(), claimed_by = NULL,"
             " delivery_count = delivery_count, after_task = NULL WHERE false"
         )
-        # App and project of live deployments, for the image cleanup on destroy.
-        assert worker.execute('SELECT "appId", os_project_id FROM worker_live_deployments').fetchall()
 
         denied = [
             "SELECT * FROM users",
             "SELECT * FROM apps",
-            "SELECT * FROM user_openstack_credentials",
             "SELECT * FROM deployments",
-            "SELECT * FROM terraform_states",
             "SELECT logs FROM tasks",
             "SELECT tf_state FROM tasks",
             "UPDATE tasks SET tf_state = 'x'",

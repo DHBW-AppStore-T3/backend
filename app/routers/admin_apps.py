@@ -6,11 +6,9 @@ from sqlalchemy.orm import Session
 from app.crud import app_version_approvals as crud_approvals
 from app.crud import apps as crud_apps
 from app.database import get_db
-from app.models import RUNTIME_K8S, RUNTIME_KUBEVIRT, AppVersionApprovalStatus, User
+from app.models import AppVersionApprovalStatus, User
 from app.routers.apps import (
     _serialize_app,
-    ensure_no_marker_errors,
-    load_variable_definitions,
     load_version_spec,
     resolve_version_commit,
 )
@@ -46,7 +44,7 @@ def list_pending_versions(
 def approve_submitted_version(db: Session, app, version_tag: str, admin_id: UUID):
     """The checks and the state change of an approval, shared by the endpoint
     and the management command (``python -m app.cli``): the submitted commit
-    must still be the tag's, its markers valid and its spec unchanged."""
+    must still be the tag's and its spec unchanged."""
     submitted = crud_approvals.get_approval(db, app.appId, version_tag)
     if submitted is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version approval entry not found")
@@ -60,14 +58,11 @@ def approve_submitted_version(db: Session, app, version_tag: str, admin_id: UUID
             },
         )
     if submitted.commit_sha:
-        ensure_no_marker_errors(load_variable_definitions(app, version_tag, commit_sha), "approved")
-        # A pod version is approved only with the spec and images that were
+        # A version is approved only with the spec and images that were
         # submitted (.github#4): a commit cannot change, but the platform
-        # limits can, and then the scan above already failed with 422.
+        # limits can, and then loading the spec fails with 422.
         loaded = load_version_spec(app, version_tag, commit_sha)
-        is_cluster = loaded is not None and loaded.runtime in (RUNTIME_K8S, RUNTIME_KUBEVIRT)
-        spec_sha256 = loaded.sha256 if is_cluster else None
-        if spec_sha256 != submitted.spec_sha256:
+        if loaded.sha256 != submitted.spec_sha256:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"reason": "spec_changed", "message": "The version's appstore.yaml is not the submitted one"},
@@ -98,8 +93,7 @@ def approve_version(
       commit; the admin would approve code that was not submitted.
     - 409: the version is already approved, or was submitted before
       versions were pinned to commits.
-    - 422: invalid ``@openstack`` markers in the submitted commit's
-      Terraform/Packer variable files (``marker_errors`` lists them).
+    - 422: the submitted commit has no valid appstore.yaml.
     - 502: the repository cannot be read; nothing is approved unchecked.
     """
     return approve_submitted_version(db, _require_app(db, app_id), version_tag, current_user.userId)

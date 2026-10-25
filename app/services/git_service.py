@@ -75,13 +75,9 @@ class GitService:
     """
 
     # Sparse-checkout allowlist (non-cone mode, ``.gitignore`` pathspecs).
-    # ``appstore.yaml`` makes a version a pod app (.github#4); ``packer/``
-    # matches the whole subtree so both the flat layout and the
-    # per-template layout are fetched; of ``terraform/`` only the variables.
+    # Only the ``appstore.yaml`` is read (.github#4).
     SPARSE_CHECKOUT_FILES = [
         'appstore.yaml',
-        'terraform/variables.tf',
-        'packer/',
     ]
 
     def __init__(self) -> None:

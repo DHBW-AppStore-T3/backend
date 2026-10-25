@@ -47,7 +47,7 @@ VAR_PDF = {
 @pytest.mark.unit
 def test_file_extension_filter_accepts_matching_suffix():
     out = attach_files_to_user_input(
-        user_input_var={"terraform": {}, "packer": {}},
+        user_input_var={"terraform": {}},
         files={"task_pdf": {"all": _payload("aufgabe.pdf", b"%PDF-1.4...")}},
         variable_definitions=[VAR_PDF],
     )
@@ -59,7 +59,7 @@ def test_file_extension_filter_accepts_matching_suffix():
 def test_file_extension_filter_rejects_mismatched_suffix():
     with pytest.raises(HTTPException) as exc:
         attach_files_to_user_input(
-            user_input_var={"terraform": {}, "packer": {}},
+            user_input_var={"terraform": {}},
             files={"task_pdf": {"all": _payload("malware.exe", b"\x4d\x5a")}},
             variable_definitions=[VAR_PDF],
         )
@@ -73,7 +73,7 @@ def test_file_extension_filter_is_case_insensitive():
     """``Aufgabe.PDF`` matches a ``pdf`` filter — uploaders shouldn't
     care about file-extension case."""
     out = attach_files_to_user_input(
-        user_input_var={"terraform": {}, "packer": {}},
+        user_input_var={"terraform": {}},
         files={"task_pdf": {"all": _payload("Aufgabe.PDF", b"%PDF-1.4...")}},
         variable_definitions=[VAR_PDF],
     )
@@ -86,7 +86,7 @@ def test_file_extension_filter_skipped_without_definitions():
     to its pre-change behavior — no filter applied. Keeps the helper
     usable from older code paths that don't yet load definitions."""
     out = attach_files_to_user_input(
-        user_input_var={"terraform": {}, "packer": {}},
+        user_input_var={"terraform": {}},
         files={"some_var": {"all": _payload("anything.dat", b"...")}},
         variable_definitions=None,
     )

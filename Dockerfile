@@ -76,7 +76,6 @@ ENV PYTHONUNBUFFERED=1 \
 ARG APT_REFRESH=""
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     git \
-    openssh-client \
     postgresql-client \
     curl \
     ca-certificates \

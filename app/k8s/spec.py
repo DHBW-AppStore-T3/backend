@@ -434,7 +434,7 @@ class VmSpec(_Strict):
 class AppSpec(_Strict):
     api_version: Literal["appstore/v2"] = Field(alias="apiVersion")
     name: str
-    runtime: Literal["kubernetes", "openstack-vm", "kubevirt-vm"]
+    runtime: Literal["kubernetes", "kubevirt-vm"]
     scope: Literal["team", "user"] = "team"
     workload: Workload | None = None
     vm: VmSpec | None = None
@@ -450,8 +450,6 @@ class AppSpec(_Strict):
             raise ValueError(f"invalid app name {self.name!r} (lowercase letters, digits, '-')")
         if self.runtime == "kubernetes" and self.workload is None:
             raise ValueError("runtime 'kubernetes' requires 'workload'")
-        if self.runtime == "openstack-vm" and self.workload is not None:
-            raise ValueError("runtime 'openstack-vm' uses terraform/ + packer/, 'workload' is not allowed")
         if self.runtime == "kubevirt-vm" and self.vm is None:
             raise ValueError("runtime 'kubevirt-vm' requires 'vm'")
         if self.runtime != "kubevirt-vm" and self.vm is not None:

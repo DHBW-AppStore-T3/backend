@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.k8s.render import DeploymentCtx
 from app.models import (
     CLUSTER_RUNTIMES,
-    RUNTIME_VM,
+    RUNTIME_K8S,
     Deployment,
     Task,
     TaskStatus,
@@ -33,36 +33,6 @@ def _is_destroyed_subq():
         & (Task.type == TaskType.DESTROY)
         & (Task.status == TaskStatus.SUCCESS)
     )
-
-
-def count_active_user_deployments(
-    db: Session, user_id: UUID, project_id: str | None = None, *, unplaced: bool = False
-) -> int:
-    """Number of *active* deployments owned by ``user_id``.
-
-    "Active" here matches what the user sees on the Deployments page:
-
-      * Owned by them (``Deployment.userId == user_id``).
-      * Not soft-deleted (``deleted_at IS NULL``).
-      * Has not been fully destroyed (no successful DESTROY task) —
-        soft-delete happens after destroy completes, so the check
-        covers the destroy-in-flight window too.
-
-    With ``project_id`` only those in that OpenStack project; with
-    ``unplaced`` only VM deployments whose project is not known yet (made
-    before projects were verified).
-    """
-    query = (
-        db.query(Deployment)
-        .filter(Deployment.userId == user_id)
-        .filter(Deployment.deleted_at.is_(None))
-        .filter(~_is_destroyed_subq())
-    )
-    if project_id is not None:
-        query = query.filter(Deployment.os_project_id == project_id)
-    elif unplaced:
-        query = query.filter(Deployment.os_project_id.is_(None), Deployment.runtime == RUNTIME_VM)
-    return query.count()
 
 
 def get_deployment(
@@ -370,7 +340,6 @@ def get_deployments(
     limit: int = 100,
     user_id: UUID | None = None,
     member_user_id: UUID | None = None,
-    peer_project_ids: list[str] | None = None,
     app_id: UUID | None = None,
     status: str | None = None,
     include_deleted: bool = False,
@@ -383,8 +352,7 @@ def get_deployments(
     matches when the user is the creator OR appears in any team's
     ``UserToTeam`` row OR has a direct ``UserToDeployment`` mapping.
     Mutually exclusive with ``user_id``; if both are set ``user_id``
-    wins. ``peer_project_ids`` widens either to every deployment in those
-    OpenStack projects (the caller's verified credentials: project peers).
+    wins.
     """
     query = db.query(Deployment)
 
@@ -392,9 +360,8 @@ def get_deployments(
         # Backed by the partial index ix_deployments_live so this stays
         # cheap even with many rows.
         query = query.filter(Deployment.deleted_at.is_(None))
-    in_peer_project = Deployment.os_project_id.in_(peer_project_ids or [])
     if user_id:
-        query = query.filter((Deployment.userId == user_id) | in_peer_project)
+        query = query.filter(Deployment.userId == user_id)
     elif member_user_id:
         # Owner OR team member OR direct mapping, via a subquery on the
         # user's teamIds so the OR doesn't explode into a cartesian.
@@ -412,7 +379,6 @@ def get_deployments(
             (Deployment.userId == member_user_id)
             | (Deployment.deploymentId.in_(member_deployment_ids_via_teams))
             | (Deployment.deploymentId.in_(member_deployment_ids_direct))
-            | in_peer_project
         )
     if app_id:
         query = query.filter(Deployment.appId == app_id)
@@ -509,8 +475,7 @@ def create_deployment(
     user_id: UUID,
     commit_sha: str,
     *,
-    os_project_id: str | None = None,
-    runtime: str = RUNTIME_VM,
+    runtime: str = RUNTIME_K8S,
     k8s_workloads: int | None = None,
 ) -> Deployment:
     """Insert a deployment row in the current transaction.
@@ -518,9 +483,8 @@ def create_deployment(
     Does NOT commit — the caller is expected to also insert teams/tasks
     in the same TX and commit once at the end. This is necessary so the
     advisory lock acquired at the start of the request stays held across
-    all related inserts. ``os_project_id``: the OpenStack project of the
-    credential a VM deployment is made with. A pod deployment (``runtime``
-    ``kubernetes``) gets its namespace and the number of its workloads.
+    all related inserts. A pod deployment (``runtime`` ``kubernetes``) gets
+    its namespace and the number of its workloads.
     """
     # Convert userInputVar dict to JSON string for database storage
     user_input_var_json = None
@@ -535,7 +499,6 @@ def create_deployment(
         userId=user_id,
         releaseTag=deployment.releaseTag,
         commit_sha=commit_sha,
-        os_project_id=os_project_id,
         runtime=runtime,
         k8s_namespace=namespace,
         k8s_workloads=k8s_workloads,

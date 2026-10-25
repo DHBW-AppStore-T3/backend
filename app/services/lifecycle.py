@@ -7,7 +7,7 @@ canonical mapping.
 Status values follow ``crud_deployments.get_deployment_status``:
 
 * ``pending`` / ``running`` — a deploy task is in flight
-* ``success`` — deploy finished, resources live in OpenStack
+* ``success`` — deploy finished, resources live in the cluster
 * ``failed`` — last task ended in error (deploy / destroy / pause / resume)
 * ``cancelled`` — last task was revoked
 * ``destroying`` — a destroy task is in flight (synthetic)
@@ -36,21 +36,19 @@ class DeploymentAction(str, Enum):
 
     DESTROY = "destroy"
     DELETE = "delete"
-    # Pause halts compute (``openstack server stop`` for every server);
-    # volumes and networks stay so resume restores the same instances.
+    # Pause scales the workloads to zero; volumes stay so resume restores
+    # the same data.
     PAUSE = "pause"
     # Resume reverses pause. Only valid in the synthetic ``paused``
     # state so the matrix stays unambiguous.
     RESUME = "resume"
     # Cancel stops a deploy that is still in flight. It is the only
     # action permitted while a worker task is running, and it is not a
-    # plain "forget about it": the worker task is revoked and a destroy
-    # follows that also reaps the Packer build instance, which lives
-    # outside Terraform state and would otherwise be left running.
+    # plain "forget about it": the worker task is stopped and a destroy
+    # follows that removes the namespace.
     CANCEL = "cancel"
-    # Rebuild one compute instance (``apply -replace``) or restart one pod
-    # workload. Only while the deployment's resources are up, so it cannot
-    # race a pause or run against SHUTOFF instances (.github#7 L).
+    # Restart or reset one pod workload. Only while the deployment's
+    # resources are up, so it cannot race a pause (.github#7 L).
     REDEPLOY = "redeploy"
 
 
@@ -88,7 +86,7 @@ _ALLOWED: dict[str, set[DeploymentAction]] = {
     # deployment, so that status only exists transiently (sub-second).
     "cancelled": {DeploymentAction.DELETE},
     # Paused — Resume is the obvious action; Destroy stays available so
-    # the user needn't resume first (terraform-destroy works on SHUTOFF).
+    # the user needn't resume first.
     "paused": {DeploymentAction.RESUME, DeploymentAction.DESTROY},
     # Pause failed: the deployment is still running. Allow PAUSE retry,
     # RESUME (harmless), and DESTROY.

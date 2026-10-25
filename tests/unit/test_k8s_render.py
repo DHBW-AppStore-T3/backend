@@ -242,13 +242,10 @@ def test_colliding_team_names_rejected():
         workload_refs(parse_spec({**VALID, "scope": "team"}), [Team("A b"), Team("a-b")])
 
 
-def test_missing_password_and_vm_runtime_rejected():
+def test_missing_password_rejected():
     spec = parse_spec(VALID)
     with pytest.raises(ValueError, match="missing passwords"):
         render(spec, DEP, TEAMS, SETTINGS, {})
-    vm = parse_spec({"apiVersion": "appstore/v2", "name": "win", "runtime": "openstack-vm"})
-    with pytest.raises(ValueError, match="kubernetes"):
-        render(vm, DEP, TEAMS, SETTINGS, {})
 
 
 def test_file_variables_become_a_secret_mounted_as_a_single_file():

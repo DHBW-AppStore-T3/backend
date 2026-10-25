@@ -24,8 +24,6 @@ PostgreSQL, SQLAlchemy 2.0, Alembic für Migrationen (`alembic/versions/`,
   `task_events_notify` sendet `NOTIFY task_events`; 7 Tage nach Task-Ende
   gelöscht
 - `Team` — Gruppierung von Nutzern, über `UserToTeam`
-- `UserOpenStackCredential` — verschlüsselte OpenStack-Zugangsdaten pro
-  Nutzer (`CREDENTIAL_ENCRYPTION_KEY`, geteilt mit dem Worker)
 
 ## Migrationsstrategie
 

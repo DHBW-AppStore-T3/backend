@@ -5,6 +5,8 @@ Jede Session liest dieses Dokument zu Beginn und aktualisiert es vor dem Abschlu
 
 ---
 
+> **Stand Oktober 2026 (.github#12):** Der OpenStack-VM-Pfad (Credentials, Quotas, Ressourcen-Picker, Terraform-State, Infrastructure-Tab) ist aus diesem Repo entfernt; alle Apps laufen als Pods (`appstore.yaml`), die Windows-App folgt über KubeVirt. Abschnitte unten können noch den alten Stand beschreiben.
+
 ## 1. Status & Fokus
 
 - **Stack:** FastAPI, SQLAlchemy 2.0, PostgreSQL, Celery Producer (auf `spike/dev` über den Postgres-Transport `pgq` statt RabbitMQ/Redis, .github#5), python-keycloak.

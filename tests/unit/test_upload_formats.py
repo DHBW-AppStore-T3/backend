@@ -18,7 +18,6 @@ from app.config import settings
 from app.schemas import DeploymentFileUpload
 from app.services import malware_scan
 from app.services.app_spec import parse_checked
-from app.services.clouds_yaml_parser import parse as parse_clouds
 from app.services.deployment_input import attach_files_to_user_input
 from app.services.upload_validation import UploadRejected, inspect_upload
 from app.utils import safe_yaml
@@ -244,7 +243,7 @@ def test_an_infected_upload_is_refused_with_the_signature(clamd):
     clamd.reply = b"stream: Eicar-Signature FOUND\0"
     with pytest.raises(HTTPException) as exc:
         attach_files_to_user_input(
-            {"terraform": {}, "packer": {}}, {"notes": {"all": _upload("a.txt", b"hello")}}, [VAR]
+            {"terraform": {}}, {"notes": {"all": _upload("a.txt", b"hello")}}, [VAR]
         )
     assert exc.value.status_code == 422
     assert (
@@ -258,7 +257,7 @@ def test_an_upload_is_refused_with_503_while_the_scanner_is_down(clamd):
     settings.CLAMD_PORT = 1
     with pytest.raises(HTTPException) as exc:
         attach_files_to_user_input(
-            {"terraform": {}, "packer": {}}, {"notes": {"all": _upload("a.txt", b"hello")}}, [VAR]
+            {"terraform": {}}, {"notes": {"all": _upload("a.txt", b"hello")}}, [VAR]
         )
     assert exc.value.status_code == 503 and exc.value.detail["reason"] == "upload_scan_unavailable"
 
@@ -266,7 +265,7 @@ def test_an_upload_is_refused_with_503_while_the_scanner_is_down(clamd):
 @pytest.mark.unit
 def test_a_clean_upload_passes_when_the_scanner_is_up(clamd):
     out = attach_files_to_user_input(
-        {"terraform": {}, "packer": {}}, {"notes": {"all": _upload("a.txt", b"hello")}}, [VAR]
+        {"terraform": {}}, {"notes": {"all": _upload("a.txt", b"hello")}}, [VAR]
     )
     assert out["terraform"]["notes"]["all"]["name"] == "a.txt"
     assert clamd.received == [b"hello"]
@@ -292,10 +291,7 @@ def test_safe_yaml_refuses_alias_bombs_big_and_deeply_nested_documents():
 
 
 @pytest.mark.unit
-def test_clouds_yaml_and_appstore_yaml_use_the_safe_loader():
-    with pytest.raises(HTTPException) as exc:
-        parse_clouds("clouds:\n  a: &x {auth: {}}\n  b: *x\n")
-    assert exc.value.status_code == 422 and "alias" in exc.value.detail
+def test_appstore_yaml_uses_the_safe_loader():
     with pytest.raises(HTTPException) as exc:
         parse_checked(b"a: &x [1]\nb: *x\n")
     assert exc.value.status_code == 422
