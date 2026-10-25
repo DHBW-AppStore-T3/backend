@@ -4,7 +4,6 @@ import pytest
 
 from app.k8s.render import (
     DEPLOYMENT_LABEL,
-    WORKLOAD_LABEL,
     DeploymentCtx,
     Member,
     RenderSettings,
@@ -131,7 +130,7 @@ def test_render_vm_namespace_is_privileged():
     _, objs, _ = _build_vm()
     ns = next(o for o in objs if o["kind"] == "Namespace")
     assert ns["metadata"]["labels"]["pod-security.kubernetes.io/enforce"] == "privileged"
-    assert ns["metadata"]["labels"][f"appstore.dhbw/vm-namespace"] == "true"
+    assert ns["metadata"]["labels"]["appstore.dhbw/vm-namespace"] == "true"
 
 
 def test_render_vm_pvc_uses_cinder_and_clones_image():

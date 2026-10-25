@@ -1065,9 +1065,10 @@ def _dispatch_lifecycle_task(
             members = crud_deployments.get_team_members(db, team.teamId)
             teams_dict[team.name] = [_member_entry(m) for m in members]
 
+    is_cluster_app = deployment.runtime in (RUNTIME_K8S, RUNTIME_KUBEVIRT)
     is_pods = deployment.runtime == RUNTIME_K8S
-    # Pods use no OpenStack credential; VM jobs the caller's own for the project.
-    openstack_envelope = {} if is_pods else _fetch_dispatch_envelope(db, current_user, deployment)
+    # Cluster apps use no OpenStack credential; VM jobs use the caller's own for the project.
+    openstack_envelope = {} if is_cluster_app else _fetch_dispatch_envelope(db, current_user, deployment)
     _pin_legacy_commit(db, deployment)
 
     task = _commit_and_dispatch(
