@@ -172,6 +172,9 @@ class App(Base):
     # an admin may make it public again, so the owner cannot undo the
     # deactivation (.github#7 R, dhbw-appstore).
     hidden_by_admin = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    # Set by an admin: the app is highlighted in the catalog. Only the admin
+    # endpoint ``PUT /admin/apps/{id}/recommended`` changes it.
+    recommended = Column(Boolean, nullable=False, default=False, server_default=text("false"))
     userId = Column(UUID(as_uuid=True), ForeignKey("users.userId"), nullable=False, index=True)
     created_at = Column(DateTime, default=utcnow)
     # Soft-delete marker. When set, the app is hidden from default

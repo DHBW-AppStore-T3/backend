@@ -135,11 +135,17 @@ class AppResponse(AppBase):
     is_private: bool
     # An admin deactivated the app; only an admin can make it public again.
     hidden_by_admin: bool = False
+    # Highlighted by an admin in the catalog.
+    recommended: bool = False
     # Data-URL or null. Populated from ``app.image`` + ``app.image_mime``
     # by ``serialize_app_image``; the raw bytes never leave the backend.
     image: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class AppRecommendedUpdate(BaseModel):
+    recommended: bool
 
 
 class AppWithUser(AppResponse):
