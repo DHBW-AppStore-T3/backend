@@ -548,15 +548,13 @@ def get_app_runtime(
     loaded = load_version_spec(app, version)
     if loaded is None:
         return AppRuntimeResponse(runtime=RUNTIME_VM)
-    if loaded.runtime == RUNTIME_KUBEVIRT:
-        return AppRuntimeResponse(runtime=RUNTIME_KUBEVIRT, scope=loaded.spec.scope)
-    if loaded.runtime != RUNTIME_K8S:
+    if loaded.runtime != RUNTIME_K8S and loaded.runtime != RUNTIME_KUBEVIRT:
         # A VM app may declare how members are grouped; ``user`` (the
         # Windows app: one VM per person) makes the wizard put everyone in
         # a team of their own.
         return AppRuntimeResponse(runtime=RUNTIME_VM, scope=loaded.spec.scope)
     return AppRuntimeResponse(
-        runtime=RUNTIME_K8S,
+        runtime=loaded.runtime,
         scope=loaded.spec.scope,
         egress=loaded.spec.egress,
         access=[a.model_dump(by_alias=True, exclude_none=True) for a in loaded.spec.access],

@@ -440,7 +440,6 @@ def create_deployment(
     spec_runtime = loaded_spec.runtime if loaded_spec is not None else None
     is_cluster_app = spec_runtime in (RUNTIME_K8S, RUNTIME_KUBEVIRT)
     is_pods = spec_runtime == RUNTIME_K8S
-    is_kubevirt = spec_runtime == RUNTIME_KUBEVIRT
     credential = None
     if is_cluster_app:
         approval = crud_approvals.get_approval(db, target_app.appId, deployment.releaseTag)
@@ -497,17 +496,17 @@ def create_deployment(
         )
 
     workloads = None
-    if is_pods:
-        _check_pod_files(loaded_spec, deployment.userInputVar)
-        # What the person chose for cpu/memory (only where the app allows it).
+    if is_cluster_app:
+        if is_pods:
+            _check_pod_files(loaded_spec, deployment.userInputVar)
+        # What the person chose for cpu/memory (vCPU/RAM of a VM) and the
+        # network (only where the app allows it), for pods and VMs alike.
         loaded_spec = app_spec.with_resource_overrides(
             loaded_spec, deployment.userInputVar.get("resources")
         )
         loaded_spec = app_spec.with_network_overrides(
             loaded_spec, deployment.userInputVar.get("network")
         )
-        workloads = _check_pod_workloads(db, current_user, loaded_spec, deployment.teams or [])
-    elif is_kubevirt:
         workloads = _check_pod_workloads(db, current_user, loaded_spec, deployment.teams or [])
 
     db_deployment = crud_deployments.create_deployment(
@@ -516,7 +515,7 @@ def create_deployment(
         current_user.userId,
         commit_sha,
         os_project_id=credential.project_id if credential is not None else None,
-        runtime=(RUNTIME_KUBEVIRT if is_kubevirt else (RUNTIME_K8S if is_pods else RUNTIME_VM)),
+        runtime=spec_runtime if is_cluster_app else RUNTIME_VM,
         k8s_workloads=workloads,
     )
 

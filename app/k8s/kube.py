@@ -12,6 +12,7 @@ Identical in backend and worker (``test_shared_files``).
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -22,6 +23,7 @@ from app.k8s.render import (
     MANAGED_BY_LABEL,
     TEAM_LABEL,
     USER_LABEL,
+    VM_NAMESPACE_LABEL,
     WORKLOAD_LABEL,
     label_value,
 )
@@ -52,6 +54,22 @@ class StatefulSetInfo:
 
 
 @dataclass
+class DeploymentInfo:
+    name: str
+    replicas: int
+    ready_replicas: int
+
+
+@dataclass
+class VmiInfo:
+    """A running KubeVirt VirtualMachineInstance (``phase``: Pending, Scheduling, Running, Failed, ...)."""
+
+    name: str
+    phase: str = "Pending"
+    ready: bool = False
+
+
+@dataclass
 class EventInfo:
     object: str
     reason: str
@@ -68,6 +86,9 @@ class Snapshot:
     # The namespace's labels; ``DEPLOYMENT_LABEL`` says whose it is.
     labels: dict[str, str] = field(default_factory=dict)
     statefulsets: list[StatefulSetInfo] = field(default_factory=list)
+    # kubevirt-vm namespaces: the noVNC proxies and the VMs.
+    deployments: list[DeploymentInfo] = field(default_factory=list)
+    vmis: list[VmiInfo] = field(default_factory=list)
     # Names of the volume claims, with the workload each belongs to.
     pvcs: list[tuple[str, str]] = field(default_factory=list)
     pods: list[PodInfo] = field(default_factory=list)
@@ -80,6 +101,7 @@ class Snapshot:
 
 class Kube(Protocol):
     def apply(self, obj: dict[str, Any]) -> None: ...
+    def delete_object(self, api_version: str, kind: str, namespace: str, name: str) -> None: ...
     def delete_namespace(self, name: str) -> None: ...
     def namespaces(self, label_selector: str) -> list[str]: ...
     def snapshot(self, namespace: str) -> Snapshot: ...
@@ -115,6 +137,13 @@ class KubeApi:
             field_manager=FIELD_MANAGER,
             force_conflicts=True,
         )
+
+    def delete_object(self, api_version: str, kind: str, namespace: str, name: str) -> None:
+        from kubernetes.dynamic.exceptions import NotFoundError
+
+        resource = self._dyn.resources.get(api_version=api_version, kind=kind)
+        with contextlib.suppress(NotFoundError):
+            self._dyn.delete(resource, name=name, namespace=namespace)
 
     def delete_namespace(self, name: str) -> None:
         from kubernetes.client.rest import ApiException
@@ -155,6 +184,12 @@ class KubeApi:
                     labels.get(USER_LABEL, ""),
                 )
             )
+        if snap.labels.get(VM_NAMESPACE_LABEL) == "true":
+            for d in self._apps.list_namespaced_deployment(namespace).items:
+                snap.deployments.append(
+                    DeploymentInfo(d.metadata.name, d.spec.replicas or 0, d.status.ready_replicas or 0)
+                )
+            snap.vmis.extend(self._vmis(namespace))
         for c in self._core.list_namespaced_persistent_volume_claim(namespace).items:
             snap.pvcs.append((c.metadata.name, (c.metadata.labels or {}).get(WORKLOAD_LABEL, "")))
         for p in self._core.list_namespaced_pod(namespace).items:
@@ -169,6 +204,16 @@ class KubeApi:
                     )
                 )
         return snap
+
+    def _vmis(self, namespace: str) -> list[VmiInfo]:
+        resource = self._dyn.resources.get(api_version="kubevirt.io/v1", kind="VirtualMachineInstance")
+        out = []
+        for item in resource.get(namespace=namespace).items:
+            status = item.get("status") or {}
+            conditions = status.get("conditions") or []
+            ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions)
+            out.append(VmiInfo(item["metadata"]["name"], status.get("phase") or "Pending", ready))
+        return out
 
     def scale(self, namespace: str, statefulset: str, replicas: int) -> None:
         self._apps.patch_namespaced_stateful_set_scale(statefulset, namespace, {"spec": {"replicas": replicas}})

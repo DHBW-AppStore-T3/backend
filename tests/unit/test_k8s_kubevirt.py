@@ -13,7 +13,15 @@ from app.k8s.render import (
     render_vm,
     workload_refs,
 )
-from app.k8s.spec import SpecValidationError, parse_spec
+from app.k8s.spec import (
+    PlatformLimits,
+    SpecValidationError,
+    apply_network_overrides,
+    apply_resource_overrides,
+    network_choices,
+    parse_spec,
+    resource_choices,
+)
 from tests.unit.test_k8s_spec import VALID
 
 pytestmark = pytest.mark.unit
@@ -200,9 +208,9 @@ def test_render_vm_deployment_label_on_all_objects():
     for obj in objs:
         labels = obj.get("metadata", {}).get("labels", {})
         if obj["kind"] != "Namespace":
-            assert (
-                DEPLOYMENT_LABEL in labels
-            ), f"{obj['kind']} {obj['metadata']['name']} missing deployment label"
+            assert DEPLOYMENT_LABEL in labels, (
+                f"{obj['kind']} {obj['metadata']['name']} missing deployment label"
+            )
 
 
 def test_render_vm_network_policies_include_default_deny():
@@ -212,3 +220,175 @@ def test_render_vm_network_policies_include_default_deny():
     assert "default-deny" in names
     assert "allow-dns" in names
     assert "allow-ingress-controller" in names
+
+
+# ── clone access, VNC proxy, network ───────────────────────────────────────────
+
+
+def _vm_objects(spec=None, settings=SETTINGS):
+    parsed = parse_spec(copy.deepcopy(spec or VALID_VM_SPEC))
+    refs = workload_refs(parsed, TEAMS)
+    return render_vm(parsed, DEP, TEAMS, settings, {r.name: "pw" for r in refs})
+
+
+def _by_kind(objects, kind):
+    return [o for o in objects if o["kind"] == kind]
+
+
+def test_render_vm_grants_the_clone_to_exactly_this_namespace():
+    (grant,) = _by_kind(_vm_objects(), "ReferenceGrant")
+
+    assert grant["metadata"]["namespace"] == "vm-poc"  # the image namespace, not the deployment's
+    assert grant["metadata"]["name"] == f"clone-{DEP.namespace}"
+    assert grant["spec"]["from"] == [
+        {"group": "", "kind": "PersistentVolumeClaim", "namespace": DEP.namespace}
+    ]
+    assert grant["spec"]["to"] == [
+        {"group": "", "kind": "PersistentVolumeClaim", "name": "windows11-matlab-golden"}
+    ]
+    (pvc,) = _by_kind(_vm_objects(), "PersistentVolumeClaim")
+    assert pvc["spec"]["dataSourceRef"]["namespace"] == "vm-poc"
+
+
+def test_render_vm_applies_the_grant_before_the_claim_that_needs_it():
+    kinds = [o["kind"] for o in _vm_objects()]
+    assert kinds.index("ReferenceGrant") < kinds.index("PersistentVolumeClaim")
+    assert kinds.index("ServiceAccount") < kinds.index("Deployment")
+
+
+def test_render_vm_has_no_vnc_service_because_qemu_listens_on_no_pod_port():
+    objects = _vm_objects()
+    assert not _by_kind(objects, "Service") or all(
+        s["metadata"]["name"].endswith("-novnc") for s in _by_kind(objects, "Service")
+    )
+    (proxy,) = _by_kind(objects, "Deployment")
+    pod = proxy["spec"]["template"]["spec"]
+    env = {e["name"]: e for e in pod["containers"][0]["env"]}
+    assert pod["serviceAccountName"] == "vnc-proxy" and pod["automountServiceAccountToken"] is True
+    assert env["VM_NAME"]["value"] == proxy["metadata"]["name"].removesuffix("-novnc")
+    assert {"PROXY_USER", "PROXY_PASSWORD"} <= set(env) and "VNC_HOST" not in env
+    (secret,) = _by_kind(objects, "Secret")
+    assert secret["stringData"] == {"password": "pw", "username": "alice"}
+
+
+def _policy_names(objects):
+    return {o["metadata"]["name"] for o in _by_kind(objects, "NetworkPolicy")}
+
+
+def test_render_vm_network_is_closed_unless_the_app_opens_it():
+    names = _policy_names(_vm_objects())
+    assert names == {
+        "default-deny",
+        "allow-ingress-controller",
+        "allow-dns",
+        "allow-vnc-proxy-to-apiserver",
+    }
+
+
+def test_render_vm_internet_and_pod_network_follow_the_spec():
+    spec = {**VALID_VM_SPEC, "egress": "internet", "podNetwork": "namespace"}
+    objects = _vm_objects(spec)
+    policies = {o["metadata"]["name"]: o for o in _by_kind(objects, "NetworkPolicy")}
+
+    assert {"allow-egress-internet", "allow-intra-namespace"} <= set(policies)
+    # Only the VMs get the internet and see each other, never the proxies.
+    for name in ("allow-egress-internet", "allow-intra-namespace"):
+        assert policies[name]["spec"]["podSelector"] == {
+            "matchLabels": {"appstore.dhbw/role": "vm"}
+        }
+    internet = policies["allow-egress-internet"]["spec"]["egress"][0]["to"][0]["ipBlock"]
+    assert "10.0.0.0/8" in internet["except"]
+
+
+def test_the_vm_image_namespace_must_be_one_the_platform_allows():
+    spec = copy.deepcopy(VALID_VM_SPEC)
+    spec["vm"]["imageNamespace"] = "kube-system"
+
+    with pytest.raises(SpecValidationError) as exc:
+        parse_spec(spec, PlatformLimits())
+
+    assert [e["loc"] for e in exc.value.errors] == ["vm.imageNamespace"]
+    spec["vm"]["imageNamespace"] = "vm-images"
+    parse_spec(spec, PlatformLimits(vm_image_namespaces=("vm-images",)))
+
+
+# ── vCPU / RAM chosen in the wizard ────────────────────────────────────────────
+
+BOUNDED = {
+    **VALID_VM_SPEC,
+    "vm": {
+        **VALID_VM_SPEC["vm"],
+        "bounds": {"cpuCores": {"min": 2, "max": 8}, "memoryGiB": {"min": 4, "max": 16}},
+    },
+}
+
+
+def test_a_vm_offers_its_bounds_to_the_wizard_like_a_container():
+    assert resource_choices(parse_spec(BOUNDED)) == [
+        {
+            "container": "vm",
+            "cpu": {"default": "4", "min": "2", "max": "8"},
+            "memory": {"default": "8Gi", "min": "4Gi", "max": "16Gi"},
+        }
+    ]
+    assert resource_choices(parse_spec(VALID_VM_SPEC)) == []
+
+
+def test_a_person_may_choose_vcpus_and_memory_within_the_bounds():
+    chosen = apply_resource_overrides(parse_spec(BOUNDED), {"vm": {"cpu": "6", "memory": "12Gi"}})
+    assert (chosen.vm.cpu_cores, chosen.vm.memory_gib) == (6, 12)
+    only_cpu = apply_resource_overrides(parse_spec(BOUNDED), {"vm": {"cpu": "2"}})
+    assert (only_cpu.vm.cpu_cores, only_cpu.vm.memory_gib) == (2, 8)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "loc"),
+    [
+        ({"vm": {"cpu": "9"}}, "resources.vm.cpu"),
+        ({"vm": {"memory": "2Gi"}}, "resources.vm.memory"),
+        ({"vm": {"cpu": "1500m"}}, "resources.vm"),
+        ({"vm": {"memory": "1536Mi"}}, "resources.vm"),
+        ({"vm": {"disk": "1Ti"}}, "resources.vm"),
+        ({"desktop": {"cpu": "2"}}, "resources"),
+    ],
+)
+def test_a_choice_outside_the_bounds_is_refused_with_its_field(overrides, loc):
+    with pytest.raises(SpecValidationError) as exc:
+        apply_resource_overrides(parse_spec(BOUNDED), overrides)
+    assert exc.value.errors[0]["loc"] == loc
+
+
+def test_a_vm_without_bounds_cannot_be_resized():
+    with pytest.raises(SpecValidationError) as exc:
+        apply_resource_overrides(parse_spec(VALID_VM_SPEC), {"vm": {"cpu": "2"}})
+    assert exc.value.errors[0]["msg"] == "this VM's resources cannot be changed"
+
+
+def test_the_defaults_must_lie_within_the_bounds():
+    spec = copy.deepcopy(BOUNDED)
+    spec["vm"]["cpuCores"] = 12
+    with pytest.raises(SpecValidationError):
+        parse_spec(spec)
+
+
+def test_a_vm_follows_the_network_choices_the_author_released():
+    spec = {**VALID_VM_SPEC, "userChoices": {"internet": True, "podNetwork": True}}
+    parsed = parse_spec(spec)
+    assert network_choices(parsed) == {
+        "internet": {"default": False},
+        "podNetwork": {"default": False},
+    }
+
+    chosen = apply_network_overrides(parsed, {"internet": True, "podNetwork": True})
+    names = _policy_names(
+        render_vm(
+            chosen.model_copy(deep=True),
+            DEP,
+            TEAMS,
+            SETTINGS,
+            {r.name: "pw" for r in workload_refs(chosen, TEAMS)},
+        )
+    )
+    assert {"allow-egress-internet", "allow-intra-namespace"} <= names
+    with pytest.raises(SpecValidationError):
+        apply_network_overrides(parse_spec(VALID_VM_SPEC), {"internet": True})

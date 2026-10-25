@@ -41,6 +41,14 @@ MANAGED_BY_LABEL = "app.kubernetes.io/managed-by"
 ENVIRONMENT_LABEL = f"{LABEL_PREFIX}/environment"
 FIELD_MANAGER = "appstore"
 PASSWORD_KEY = "password"
+USERNAME_KEY = "username"
+VM_NAMESPACE_LABEL = f"{LABEL_PREFIX}/vm-namespace"
+REFERENCE_GRANT_API = "gateway.networking.k8s.io/v1beta1"
+# Pod roles inside a kubevirt-vm namespace, for the network policies.
+ROLE_LABEL = f"{LABEL_PREFIX}/role"
+ROLE_VM = "vm"
+ROLE_VNC_PROXY = "vnc-proxy"
+VNC_PROXY_ACCOUNT = "vnc-proxy"
 
 # Never reachable from student pods: pod/service/node networks, RFC1918,
 # link-local (incl. metadata service 169.254.169.254), ULA and IPv6 link-local.
@@ -631,25 +639,56 @@ def _vm_namespace(dep: DeploymentCtx, settings: RenderSettings) -> dict[str, Any
         # privileged PSS so virt-launcher can run
         "pod-security.kubernetes.io/enforce": "privileged",
         "pod-security.kubernetes.io/enforce-version": "latest",
-        f"{LABEL_PREFIX}/vm-namespace": "true",
+        VM_NAMESPACE_LABEL: "true",
     }
     if settings.environment:
         meta["labels"][ENVIRONMENT_LABEL] = label_value(settings.environment)
     return {"apiVersion": "v1", "kind": "Namespace", "metadata": meta}
 
 
-def _vm_network_policies(dep: DeploymentCtx, settings: RenderSettings) -> list[dict[str, Any]]:
-    """Default-deny + ingress-controller + DNS for VM namespaces (no pod port known upfront)."""
+def vm_clone_grant_name(dep: DeploymentCtx) -> str:
+    return f"clone-{dep.namespace}"
 
-    def policy(name: str, body: dict[str, Any]) -> dict[str, Any]:
+
+def _vm_clone_grant(spec: AppSpec, dep: DeploymentCtx) -> dict[str, Any]:
+    """Lets this deployment's PVCs clone the golden image of another namespace.
+
+    The grant lives in the image namespace and names the one deployment namespace
+    it is for (a ReferenceGrant has no wildcards); the worker removes it with the deployment.
+    """
+    assert spec.vm is not None
+    meta = _meta(vm_clone_grant_name(dep), dep, namespaced=False)
+    meta["namespace"] = spec.vm.image_namespace
+    return {
+        "apiVersion": REFERENCE_GRANT_API,
+        "kind": "ReferenceGrant",
+        "metadata": meta,
+        "spec": {
+            "from": [{"group": "", "kind": "PersistentVolumeClaim", "namespace": dep.namespace}],
+            "to": [{"group": "", "kind": "PersistentVolumeClaim", "name": spec.vm.image_ref}],
+        },
+    }
+
+
+def _vm_network_policies(spec: AppSpec, dep: DeploymentCtx, settings: RenderSettings) -> list[dict[str, Any]]:
+    """Default-deny, then only what a VM namespace needs.
+
+    The browser reaches the VNC proxy through the ingress controller; the proxy
+    reaches the VM through the Kubernetes API (KubeVirt's VNC subresource), never
+    through a pod port. The VM itself gets DNS, and internet / the other VMs of
+    the namespace when the app (or the person, see ``userChoices``) allows it.
+    """
+
+    def policy(name: str, body: dict[str, Any], role: str | None = None) -> dict[str, Any]:
+        selector = {"matchLabels": {ROLE_LABEL: role}} if role else {}
         return {
             "apiVersion": "networking.k8s.io/v1",
             "kind": "NetworkPolicy",
             "metadata": _meta(name, dep),
-            "spec": {"podSelector": {}, **body},
+            "spec": {"podSelector": selector, **body},
         }
 
-    return [
+    policies = [
         policy("default-deny", {"policyTypes": ["Ingress", "Egress"]}),
         policy(
             "allow-ingress-controller",
@@ -668,6 +707,7 @@ def _vm_network_policies(dep: DeploymentCtx, settings: RenderSettings) -> list[d
                     }
                 ],
             },
+            ROLE_VNC_PROXY,
         ),
         policy(
             "allow-dns",
@@ -689,20 +729,49 @@ def _vm_network_policies(dep: DeploymentCtx, settings: RenderSettings) -> list[d
                 ],
             },
         ),
-        # The noVNC proxy pod needs to reach the VM's VNC port inside the namespace
+        # The proxy talks to the API server (kubernetes.default: service port 443, node port 6443).
         policy(
-            "allow-novnc-to-vm-vnc",
+            "allow-vnc-proxy-to-apiserver",
             {
                 "policyTypes": ["Egress"],
                 "egress": [
                     {
-                        "to": [{"podSelector": {"matchLabels": {"vm.kubevirt.io/name": "desktop"}}}],
-                        "ports": [{"protocol": "TCP", "port": 5900}],
+                        "to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}, {"ipBlock": {"cidr": "::/0"}}],
+                        "ports": [{"protocol": "TCP", "port": 443}, {"protocol": "TCP", "port": 6443}],
                     }
                 ],
             },
+            ROLE_VNC_PROXY,
         ),
     ]
+    if spec.egress == "internet":
+        extra = list(settings.extra_egress_except)
+        v4 = _EGRESS_EXCEPT_V4 + [c for c in extra if ":" not in c]
+        v6 = _EGRESS_EXCEPT_V6 + [c for c in extra if ":" in c]
+        policies.append(
+            policy(
+                "allow-egress-internet",
+                {
+                    "policyTypes": ["Egress"],
+                    "egress": [
+                        {"to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": v4}}]},
+                        {"to": [{"ipBlock": {"cidr": "::/0", "except": v6}}]},
+                    ],
+                },
+                ROLE_VM,
+            )
+        )
+    if spec.pod_network == "namespace":
+        # The VMs of this namespace see each other (any port); the proxies are not part of it.
+        peer = [{"podSelector": {"matchLabels": {ROLE_LABEL: ROLE_VM}}}]
+        policies.append(
+            policy(
+                "allow-intra-namespace",
+                {"policyTypes": ["Ingress", "Egress"], "ingress": [{"from": peer}], "egress": [{"to": peer}]},
+                ROLE_VM,
+            )
+        )
+    return policies
 
 
 def _vm_workload_objects(
@@ -721,9 +790,9 @@ def _vm_workload_objects(
     namespace = dep.namespace
 
     labels = _labels(dep, workload_name)
-    novnc_labels = {**labels, WORKLOAD_LABEL: novnc_name}
+    novnc_labels = {**labels, WORKLOAD_LABEL: novnc_name, ROLE_LABEL: ROLE_VNC_PROXY}
 
-    # PVC — clone from the golden image in namespace vm-images
+    # PVC — a clone of the golden image; the platform grants the access (see _vm_clone_grant)
     pvc: dict[str, Any] = {
         "apiVersion": "v1",
         "kind": "PersistentVolumeClaim",
@@ -752,7 +821,7 @@ def _vm_workload_objects(
         "spec": {
             "runStrategy": "Always",
             "template": {
-                "metadata": {"labels": {**labels, "vm.kubevirt.io/name": workload_name}},
+                "metadata": {"labels": {**labels, "vm.kubevirt.io/name": workload_name, ROLE_LABEL: ROLE_VM}},
                 "spec": {
                     "domain": {
                         "cpu": {"cores": vm.cpu_cores},
@@ -780,32 +849,16 @@ def _vm_workload_objects(
     if ref.user:
         virtual_machine["metadata"]["labels"][USER_LABEL] = label_value(ref.user.user_id)
 
-    # Service: internal VNC + RDP targeting the virt-launcher pod
-    vm_service: dict[str, Any] = {
-        "apiVersion": "v1",
-        "kind": "Service",
-        "metadata": _meta(f"{workload_name}-vm", dep, workload_name),
-        "spec": {
-            "type": "ClusterIP",
-            "selector": {"vm.kubevirt.io/name": workload_name},
-            "ports": [
-                {"name": "vnc", "port": 5900, "targetPort": 5900},
-                {"name": "rdp", "port": 3389, "targetPort": 3389},
-            ],
-        },
-    }
-
-    # VNC password secret
+    # What the person signs in to the proxy with (HTTP basic auth, see docker/novnc-proxy).
     vnc_secret: dict[str, Any] = {
         "apiVersion": "v1",
         "kind": "Secret",
         "metadata": _meta(workload_name, dep, workload_name),
         "type": "Opaque",
-        "stringData": {PASSWORD_KEY: vnc_password},
+        "stringData": {PASSWORD_KEY: vnc_password, USERNAME_KEY: ref.user.name if ref.user else ref.team},
     }
 
-    # noVNC proxy deployment — browser-accessible VNC over WebSocket
-    vnc_host = f"{workload_name}-vm.{namespace}.svc.cluster.local"
+    # noVNC proxy deployment: noVNC in the browser, bridged to KubeVirt's VNC subresource of this VM
     novnc_deploy: dict[str, Any] = {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -816,7 +869,8 @@ def _vm_workload_objects(
             "template": {
                 "metadata": {"labels": novnc_labels},
                 "spec": {
-                    "automountServiceAccountToken": False,
+                    "serviceAccountName": VNC_PROXY_ACCOUNT,
+                    "automountServiceAccountToken": True,
                     "enableServiceLinks": False,
                     "securityContext": {
                         "runAsNonRoot": True,
@@ -836,16 +890,15 @@ def _vm_workload_objects(
                                 }
                             ],
                             "env": [
-                                {"name": "VNC_HOST", "value": vnc_host},
-                                {"name": "VNC_PORT", "value": "5900"},
+                                {"name": "VM_NAME", "value": workload_name},
+                                {"name": "VM_NAMESPACE", "value": namespace},
                                 {
-                                    "name": "VNC_PASSWORD",
-                                    "valueFrom": {
-                                        "secretKeyRef": {
-                                            "name": workload_name,
-                                            "key": PASSWORD_KEY,
-                                        }
-                                    },
+                                    "name": "PROXY_USER",
+                                    "valueFrom": {"secretKeyRef": {"name": workload_name, "key": USERNAME_KEY}},
+                                },
+                                {
+                                    "name": "PROXY_PASSWORD",
+                                    "valueFrom": {"secretKeyRef": {"name": workload_name, "key": PASSWORD_KEY}},
                                 },
                             ],
                             "securityContext": {
@@ -927,7 +980,6 @@ def _vm_workload_objects(
         vnc_secret,
         pvc,
         virtual_machine,
-        vm_service,
         novnc_deploy,
         novnc_service,
         ingress,
@@ -956,7 +1008,9 @@ def render_vm(
 
     objects: list[dict[str, Any]] = [
         _vm_namespace(dep, settings),
-        *_vm_network_policies(dep, settings),
+        *_vm_network_policies(spec, dep, settings),
+        _vm_clone_grant(spec, dep),
+        {"apiVersion": "v1", "kind": "ServiceAccount", "metadata": _meta(VNC_PROXY_ACCOUNT, dep)},
     ]
     for ref in refs:
         objects.extend(_vm_workload_objects(spec, dep, ref, passwords[ref.name], settings))
