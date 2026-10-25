@@ -23,11 +23,13 @@ from sqlalchemy.orm import relationship
 from app.database import Base
 from app.utils.time import utcnow
 
-# How a deployment runs: OpenTofu/Packer on OpenStack VMs (Windows apps), or
-# pods in the cluster rendered from the app's appstore.yaml (.github#4). The
-# values are the ``runtime`` names of the appstore.yaml contract.
+# How a deployment runs: OpenTofu/Packer on OpenStack VMs (Windows apps),
+# pods in the cluster rendered from the app's appstore.yaml (.github#4), or
+# KubeVirt VMs rendered from the app's appstore.yaml. The values are the
+# ``runtime`` names of the appstore.yaml contract.
 RUNTIME_VM = "openstack-vm"
 RUNTIME_K8S = "kubernetes"
+RUNTIME_KUBEVIRT = "kubevirt-vm"
 
 
 # ----------------------------------------------------------------
@@ -83,7 +85,9 @@ class Course(Base):
     lti_issuer = Column(String, nullable=True)
     lti_context_id = Column(String, nullable=True)
 
-    __table_args__ = (UniqueConstraint("lti_issuer", "lti_context_id", name="uq_courses_lti_context"),)
+    __table_args__ = (
+        UniqueConstraint("lti_issuer", "lti_context_id", name="uq_courses_lti_context"),
+    )
 
     # Relationships
     users = relationship("User", back_populates="course")
@@ -159,7 +163,9 @@ class App(Base):
     name = Column(String, nullable=False)
     description = Column(String, nullable=True)
     image = Column(LargeBinary, nullable=True)  # raw bytes of the uploaded logo
-    image_mime = Column(String(64), nullable=True)  # e.g. "image/png" — needed to build a data-URL on read
+    image_mime = Column(
+        String(64), nullable=True
+    )  # e.g. "image/png" — needed to build a data-URL on read
     git_link = Column(String, nullable=True)
     is_private = Column(Boolean, nullable=False, default=False)
     # Set by an admin's emergency deactivation: the app is private and only
@@ -226,7 +232,11 @@ class Deployment(Base):
 
     __table_args__ = (
         # Default queries hide soft-deleted deployments.
-        Index("ix_deployments_live", "deploymentId", postgresql_where=text("deleted_at IS NULL")),
+        Index(
+            "ix_deployments_live",
+            "deploymentId",
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
         Index(
             "uq_deployments_k8s_namespace",
             "k8s_namespace",
@@ -345,8 +355,17 @@ class CeleryQueueMessage(Base):
 
     __table_args__ = (
         Index("ix_celery_queue_ready", "queue", "visible_after", "id"),
-        Index("uq_celery_queue_task_id", "task_id", unique=True, postgresql_where=text("task_id IS NOT NULL")),
-        Index("ix_celery_queue_after_task", "after_task", postgresql_where=text("after_task IS NOT NULL")),
+        Index(
+            "uq_celery_queue_task_id",
+            "task_id",
+            unique=True,
+            postgresql_where=text("task_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_celery_queue_after_task",
+            "after_task",
+            postgresql_where=text("after_task IS NOT NULL"),
+        ),
     )
 
 
@@ -578,9 +597,7 @@ class AppVersionApproval(Base):
     spec_sha256 = Column(String(64), nullable=True)
     image_digests = Column(Text, nullable=True)
 
-    __table_args__ = (
-        UniqueConstraint("appId", "version_tag", name="uq_app_version_approval"),
-    )
+    __table_args__ = (UniqueConstraint("appId", "version_tag", name="uq_app_version_approval"),)
 
     # Relationships
     app = relationship("App", back_populates="version_approvals")
@@ -617,7 +634,12 @@ class LtiLoginCode(Base):
 
     code_hash = Column(String(64), primary_key=True)
     binding_hash = Column(String(64), nullable=False)
-    userId = Column(UUID(as_uuid=True), ForeignKey("users.userId", ondelete="CASCADE"), nullable=False, index=True)
+    userId = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.userId", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 
     __table_args__ = (Index("ix_lti_login_codes_created_at", "created_at"),)

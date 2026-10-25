@@ -16,7 +16,13 @@ from app.k8s.render import DEPLOYMENT_LABEL, TEAM_LABEL, USER_LABEL, WORKLOAD_LA
 
 
 class FakeKube:
-    def __init__(self, *, fail_reason: str | None = None, ready_after_polls: int = 1, delete_polls: int = 1):
+    def __init__(
+        self,
+        *,
+        fail_reason: str | None = None,
+        ready_after_polls: int = 1,
+        delete_polls: int = 1,
+    ):
         self.objects: dict[tuple[str, str, str | None, str], dict[str, Any]] = {}
         self.replicas: dict[tuple[str, str], int] = {}
         self.deleted_pods: list[str] = []
@@ -78,7 +84,11 @@ class FakeKube:
         if namespace in self._terminating:
             if self._terminating[namespace] > 0:
                 self._terminating[namespace] -= 1
-                return Snapshot(exists=True, terminating=True, labels=dict(self.namespace_labels[namespace]))
+                return Snapshot(
+                    exists=True,
+                    terminating=True,
+                    labels=dict(self.namespace_labels[namespace]),
+                )
             self._purge(namespace)
         if namespace not in self.namespace_labels:
             return Snapshot(exists=False)
@@ -99,7 +109,11 @@ class FakeKube:
             labels = self.objects[("StatefulSet", name, ns, "apps/v1")]["metadata"]["labels"]
             snap.statefulsets.append(
                 StatefulSetInfo(
-                    name, replicas, 1 if ready else 0, labels.get(TEAM_LABEL, ""), labels.get(USER_LABEL, "")
+                    name,
+                    replicas,
+                    1 if ready else 0,
+                    labels.get(TEAM_LABEL, ""),
+                    labels.get(USER_LABEL, ""),
                 )
             )
             if up:
@@ -111,7 +125,10 @@ class FakeKube:
                 )
                 pod.uid = f"{name}-uid-{self._generation[(ns, name)]}"
                 if self.fail_reason == "Unschedulable":
-                    pod.unschedulable, pod.message = True, "0/1 nodes are available: Insufficient memory."
+                    pod.unschedulable, pod.message = (
+                        True,
+                        "0/1 nodes are available: Insufficient memory.",
+                    )
                 elif self.fail_reason:
                     pod.waiting_reason, pod.restarts = self.fail_reason, 3
                 snap.pods.append(pod)

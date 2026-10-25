@@ -162,7 +162,11 @@ class KubeApi:
         for ev in self._core.list_namespaced_event(namespace).items:
             if ev.type == "Warning":
                 snap.events.append(
-                    EventInfo(f"{ev.involved_object.kind}/{ev.involved_object.name}", ev.reason or "", ev.message or "")
+                    EventInfo(
+                        f"{ev.involved_object.kind}/{ev.involved_object.name}",
+                        ev.reason or "",
+                        ev.message or "",
+                    )
                 )
         return snap
 

@@ -361,12 +361,31 @@ class UserChoices(_Strict):
     pod_network: StrictBool = Field(default=False, alias="podNetwork")
 
 
+class VmSpec(_Strict):
+    """KubeVirt VM spec for runtime kubevirt-vm."""
+
+    cpu_cores: int = Field(default=4, ge=1, le=16, alias="cpuCores")
+    memory_gib: int = Field(default=8, ge=2, le=32, alias="memoryGiB")
+    disk_gib: int = Field(default=80, ge=40, le=200, alias="diskGiB")
+    # PVC name in the vm-images namespace used as clone source
+    image_ref: str = Field(alias="imageRef")
+    storage_class: str = Field(default="cinder", alias="storageClass")
+    vnc_access: bool = Field(default=True, alias="vncAccess")
+
+    @model_validator(mode="after")
+    def _check(self) -> VmSpec:
+        if not re.match(r"^[a-z][a-z0-9-]{0,62}$", self.image_ref):
+            raise ValueError(f"invalid imageRef {self.image_ref!r} (lowercase letters, digits, '-')")
+        return self
+
+
 class AppSpec(_Strict):
     api_version: Literal["appstore/v2"] = Field(alias="apiVersion")
     name: str
-    runtime: Literal["kubernetes", "openstack-vm"]
+    runtime: Literal["kubernetes", "openstack-vm", "kubevirt-vm"]
     scope: Literal["team", "user"] = "team"
     workload: Workload | None = None
+    vm: VmSpec | None = None
     egress: Literal["none", "internet"] = "none"
     pod_network: Literal["none", "namespace"] = Field(default="none", alias="podNetwork")
     user_choices: UserChoices | None = Field(default=None, alias="userChoices")
@@ -381,6 +400,10 @@ class AppSpec(_Strict):
             raise ValueError("runtime 'kubernetes' requires 'workload'")
         if self.runtime == "openstack-vm" and self.workload is not None:
             raise ValueError("runtime 'openstack-vm' uses terraform/ + packer/, 'workload' is not allowed")
+        if self.runtime == "kubevirt-vm" and self.vm is None:
+            raise ValueError("runtime 'kubevirt-vm' requires 'vm'")
+        if self.runtime != "kubevirt-vm" and self.vm is not None:
+            raise ValueError("'vm' is only for runtime 'kubevirt-vm'")
         names = [v.name for v in self.variables]
         if len(set(names)) != len(names):
             raise ValueError("variable names must be unique")
@@ -411,7 +434,12 @@ def _limit_errors(spec: AppSpec, limits: PlatformLimits) -> list[dict[str, str]]
     if spec.workload is None:
         return errors
     if len(spec.workload.containers) > limits.max_containers:
-        errors.append({"loc": "workload.containers", "msg": f"at most {limits.max_containers} containers"})
+        errors.append(
+            {
+                "loc": "workload.containers",
+                "msg": f"at most {limits.max_containers} containers",
+            }
+        )
     for i, c in enumerate(spec.workload.containers):
         base = f"workload.containers[{i}]"
         if not c.image.startswith(limits.image_registry_allowlist):
@@ -593,7 +621,11 @@ def resource_choices(spec: AppSpec, limits: PlatformLimits | None = None) -> lis
         out.append(
             {
                 "container": c.name,
-                "cpu": {"default": c.resources.cpu, "min": b.cpu.min, "max": _format_cpu(cpu_max)},
+                "cpu": {
+                    "default": c.resources.cpu,
+                    "min": b.cpu.min,
+                    "max": _format_cpu(cpu_max),
+                },
                 "memory": {
                     "default": c.resources.memory,
                     "min": b.memory.min,
