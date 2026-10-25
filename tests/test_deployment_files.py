@@ -396,7 +396,6 @@ def test_download_endpoint_member_403(
 def test_rejected_upload_is_logged_as_a_security_event(
     client, db, mock_user, patched_celery, caplog
 ):
-    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     evil = b"MZ" + b"\x00" * 200  # a Windows program
@@ -407,7 +406,6 @@ def test_rejected_upload_is_logged_as_a_security_event(
                 "name": "rejected",
                 "appId": str(app.appId),
                 "releaseTag": "v1",
-                "credentialId": str(cred.credentialId),
                 "files": {"task_pdf": {"all": {
                     "name": "evil\nupload_rejected user=forged.exe",
                     "content_b64": _b64(evil),
@@ -430,7 +428,6 @@ def test_soft_delete_drops_the_uploaded_bytes_but_keeps_the_metadata(
 ):
     from app.crud import deployments as crud_deployments
 
-    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
     pdf = b"%PDF-1.4\n" + b"PDF data" * 100
     created = client.post(
@@ -439,7 +436,7 @@ def test_soft_delete_drops_the_uploaded_bytes_but_keeps_the_metadata(
             "name": "to-delete",
             "appId": str(app.appId),
             "releaseTag": "v1",
-            "credentialId": str(cred.credentialId),
+            "teams": _teams(mock_user),
             "files": {"task_pdf": {"all": {
                 "name": "x.pdf", "content_b64": _b64(pdf), "size": len(pdf),
             }}},
@@ -462,7 +459,6 @@ def test_soft_delete_drops_the_uploaded_bytes_but_keeps_the_metadata(
 def test_stored_file_carries_a_mac_the_worker_can_check(client, db, mock_user, patched_celery):
     from app.utils import upload_mac
 
-    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
     pdf = b"%PDF-1.4\n" + b"PDF data" * 100
     created = client.post(
@@ -471,7 +467,7 @@ def test_stored_file_carries_a_mac_the_worker_can_check(client, db, mock_user, p
             "name": "sealed",
             "appId": str(app.appId),
             "releaseTag": "v1",
-            "credentialId": str(cred.credentialId),
+            "teams": _teams(mock_user),
             "files": {"task_pdf": {"all": {"name": "x.pdf", "content_b64": _b64(pdf), "size": len(pdf)}}},
         },
     ).json()
