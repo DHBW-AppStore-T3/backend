@@ -652,7 +652,7 @@ class OpenStackCredentialUpsert(OpenStackCredentialBase):
 class OpenStackCredentialFromYaml(BaseModel):
     """Convenience body: paste/upload a `clouds.yaml` and let the server pick it apart."""
 
-    clouds_yaml: str = Field(..., min_length=1, description="raw clouds.yaml file contents")
+    clouds_yaml: str = Field(..., min_length=1, max_length=65536, description="raw clouds.yaml file contents")
     cloud_name: str | None = Field(
         None,
         description="Pick a specific cloud from the YAML; required when there is more than one",

@@ -20,9 +20,10 @@ from app.services import upload_validation as uv
 from app.services.deployment_input import attach_files_to_user_input
 from app.services.upload_validation import UploadRejected, inspect_upload
 from app.utils.app_image import parse_image_data_url
+from tests.unit import upload_samples as samples
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
-JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+PNG = samples.png()
+JPEG = samples.jpeg()
 PDF = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n%%EOF\n"
 ELF = b"\x7fELF" + b"\x00" * 60
 

@@ -17,6 +17,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+import yaml
 from fastapi import HTTPException, status
 
 from app.config import settings
@@ -30,6 +31,7 @@ from app.k8s.spec import (
     parse_spec,
 )
 from app.models import RUNTIME_K8S, RUNTIME_VM
+from app.utils import safe_yaml
 
 SPEC_FILE = "appstore.yaml"
 
@@ -67,7 +69,15 @@ def platform_limits() -> PlatformLimits:
 def parse_checked(raw: bytes) -> LoadedSpec:
     """Parse and validate ``raw``; 422 with one field path per problem (``errors``)."""
     try:
-        spec = parse_spec(raw, platform_limits())
+        # The file comes from somebody else's repository: no aliases, no huge or deeply nested
+        # documents (they would be expanded or recursed into before any field is checked).
+        try:
+            document: Any = safe_yaml.load(raw)
+        except safe_yaml.UnsafeYaml as exc:
+            raise SpecValidationError([{"loc": "<root>", "msg": str(exc)}]) from exc
+        except yaml.YAMLError as exc:
+            raise SpecValidationError([{"loc": "<root>", "msg": f"invalid YAML: {exc}"}]) from exc
+        spec = parse_spec(document if isinstance(document, dict) else raw, platform_limits())
     except SpecValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

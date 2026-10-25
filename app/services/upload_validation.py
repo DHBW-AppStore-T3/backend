@@ -16,6 +16,8 @@ PDF or image is opened there. The rules, in order of importance:
   ``..`` paths, backslashes, control characters, symbolic links or device
   files, encrypted entries and exotic compression methods reject the whole
   archive: rejecting beats guessing what an unpacker would do with them.
+* **PDFs and images are looked into** (``upload_formats``): no encryption or active content in a PDF,
+  a walkable container and a bounded pixel count in an image, nothing appended after its end.
 * **A claimed type must match.** ``x.pdf`` has to be a PDF, ``x.zip`` a ZIP, and
   so on; text-like files must be text (no NUL bytes).
 * **Programs are refused** (ELF, PE, Mach-O, whatever the file is called), and so
@@ -36,6 +38,8 @@ import re
 import stat
 import zipfile
 from dataclasses import dataclass
+
+from app.services import upload_formats
 
 # ---------------------------------------------------------------- limits
 
@@ -387,6 +391,22 @@ def inspect_zip(data: bytes) -> tuple[int, int]:
 # --------------------------------------------------------------- the API
 
 
+_IMAGE_CHECKS = {
+    "png": upload_formats.inspect_png,
+    "jpeg": upload_formats.inspect_jpeg,
+    "gif": upload_formats.inspect_gif,
+    "webp": upload_formats.inspect_webp,
+}
+
+
+def _inside(check, data: bytes) -> None:
+    """Run a structure check of ``upload_formats`` and report its refusal as an upload refusal."""
+    try:
+        check(data)
+    except upload_formats.FormatRejected as rejected:
+        raise UploadRejected(rejected.code, rejected.message) from None
+
+
 def _extension(name: str) -> str:
     base = (name or "").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
     dot = base.rfind(".")
@@ -432,8 +452,10 @@ def inspect_upload(name: str, data: bytes, declared_exts: list[str] | None = Non
         check_svg(data)
         return Inspected("svg", _KIND_MIME["svg"])
     if kind == "pdf":
+        _inside(upload_formats.inspect_pdf, data)
         return Inspected("pdf", _KIND_MIME["pdf"])
-    if kind in ("png", "jpeg", "gif", "webp"):
+    if kind in _IMAGE_CHECKS:
+        _inside(_IMAGE_CHECKS[kind], data)
         return Inspected(kind, _KIND_MIME[kind])
     if kind == "text":
         return Inspected("text", _KIND_MIME["text"])

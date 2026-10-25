@@ -23,6 +23,7 @@ import json
 
 from fastapi import HTTPException, status
 
+from app.services import malware_scan
 from app.services.upload_validation import UploadRejected, inspect_upload
 from app.utils.filenames import safe_filename
 
@@ -209,6 +210,27 @@ def attach_files_to_user_input(
                         "slot": slot_key,
                         "filename": safe_filename(upload.name),
                     },
+                )
+
+            # Virus scan (only if a ClamAV daemon is configured; then it is mandatory).
+            try:
+                malware_scan.scan(decoded)
+            except malware_scan.Infected as infected:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "reason": "file_content_rejected",
+                        "code": "malware_detected",
+                        "message": f"the virus scanner found {infected.signature}",
+                        "variable": var_name,
+                        "slot": slot_key,
+                        "filename": safe_filename(upload.name),
+                    },
+                )
+            except malware_scan.ScanFailed as failed:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={"reason": "upload_scan_unavailable", "message": str(failed)},
                 )
 
             encoded_slots[slot_key] = {
