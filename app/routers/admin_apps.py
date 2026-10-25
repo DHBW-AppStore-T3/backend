@@ -15,6 +15,7 @@ from app.routers.apps import (
     resolve_version_commit,
 )
 from app.schemas import (
+    AppRecommendedUpdate,
     AppResponse,
     AppVersionApprovalDecision,
     AppVersionApprovalResponse,
@@ -166,6 +167,30 @@ def deactivate_app(
     """
     _require_app(db, app_id)
     updated = crud_apps.set_hidden_by_admin(db, app_id, True)
+    return _serialize_app(updated)
+
+
+# ----------------------------------------------------------------
+# RECOMMENDATION
+# ----------------------------------------------------------------
+@router.put(
+    "/apps/{app_id}/recommended",
+    response_model=AppResponse,
+    tags=["Admin"],
+)
+def set_app_recommended(
+    app_id: UUID,
+    body: AppRecommendedUpdate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Mark an app as recommended or not. Admin only.
+
+    The flag only highlights the app in the catalog; it does not change who
+    may see or deploy it.
+    """
+    _require_app(db, app_id)
+    updated = crud_apps.set_recommended(db, app_id, body.recommended)
     return _serialize_app(updated)
 
 
