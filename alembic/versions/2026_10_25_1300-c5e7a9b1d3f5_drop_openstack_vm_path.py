@@ -1,7 +1,7 @@
 """Drop what only the OpenStack VM path used
 
 Revision ID: c5e7a9b1d3f5
-Revises: b4d6f8a0c2e4
+Revises: e7a9b1d3f5c7
 Create Date: 2026-10-25 13:00:00.000000
 
 Every app runs as pods now (.github#12); the Windows app will run on KubeVirt
@@ -28,7 +28,7 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision: str = "c5e7a9b1d3f5"
-down_revision: Union[str, None] = "b4d6f8a0c2e4"
+down_revision: Union[str, None] = "e7a9b1d3f5c7"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
