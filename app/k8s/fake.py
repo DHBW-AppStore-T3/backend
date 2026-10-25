@@ -16,7 +16,13 @@ from app.k8s.render import DEPLOYMENT_LABEL, TEAM_LABEL, USER_LABEL, WORKLOAD_LA
 
 
 class FakeKube:
-    def __init__(self, *, fail_reason: str | None = None, ready_after_polls: int = 1, delete_polls: int = 1):
+    def __init__(
+        self,
+        *,
+        fail_reason: str | None = None,
+        ready_after_polls: int = 1,
+        delete_polls: int = 1,
+    ):
         self.objects: dict[tuple[str, str, str | None, str], dict[str, Any]] = {}
         self.replicas: dict[tuple[str, str], int] = {}
         self.deleted_pods: list[str] = []
@@ -35,7 +41,11 @@ class FakeKube:
     def apply(self, obj: dict[str, Any]) -> None:
         meta = obj["metadata"]
         ns = meta.get("namespace")
-        if obj["kind"] != "Namespace" and ns is not None and ns not in self.namespace_labels:
+        if (
+            obj["kind"] != "Namespace"
+            and ns is not None
+            and ns not in self.namespace_labels
+        ):
             raise RuntimeError(f"namespace {ns} not found")
         self.objects[(obj["kind"], meta["name"], ns, obj["apiVersion"])] = obj
         if obj["kind"] == "Namespace":
@@ -68,17 +78,29 @@ class FakeKube:
     # --- reads ---------------------------------------------------------
     def namespaces(self, label_selector: str) -> list[str]:
         """Equality selectors only (``k=v[,k=v...]``), as the platform uses them."""
-        wanted = [part.partition("=")[::2] for part in label_selector.split(",") if part]
-        return [n for n, labels in self.namespace_labels.items() if all(labels.get(k) == v for k, v in wanted)]
+        wanted = [
+            part.partition("=")[::2] for part in label_selector.split(",") if part
+        ]
+        return [
+            n
+            for n, labels in self.namespace_labels.items()
+            if all(labels.get(k) == v for k, v in wanted)
+        ]
 
     def kinds(self, namespace: str | None = None) -> list[str]:
-        return sorted(k for k, _n, ns, _v in self.objects if namespace is None or ns == namespace)
+        return sorted(
+            k for k, _n, ns, _v in self.objects if namespace is None or ns == namespace
+        )
 
     def snapshot(self, namespace: str) -> Snapshot:
         if namespace in self._terminating:
             if self._terminating[namespace] > 0:
                 self._terminating[namespace] -= 1
-                return Snapshot(exists=True, terminating=True, labels=dict(self.namespace_labels[namespace]))
+                return Snapshot(
+                    exists=True,
+                    terminating=True,
+                    labels=dict(self.namespace_labels[namespace]),
+                )
             self._purge(namespace)
         if namespace not in self.namespace_labels:
             return Snapshot(exists=False)
@@ -96,10 +118,16 @@ class FakeKube:
                 continue
             up = replicas >= 1
             ready = up and polls > self.ready_after_polls and not self.fail_reason
-            labels = self.objects[("StatefulSet", name, ns, "apps/v1")]["metadata"]["labels"]
+            labels = self.objects[("StatefulSet", name, ns, "apps/v1")]["metadata"][
+                "labels"
+            ]
             snap.statefulsets.append(
                 StatefulSetInfo(
-                    name, replicas, 1 if ready else 0, labels.get(TEAM_LABEL, ""), labels.get(USER_LABEL, "")
+                    name,
+                    replicas,
+                    1 if ready else 0,
+                    labels.get(TEAM_LABEL, ""),
+                    labels.get(USER_LABEL, ""),
                 )
             )
             if up:
@@ -111,18 +139,29 @@ class FakeKube:
                 )
                 pod.uid = f"{name}-uid-{self._generation[(ns, name)]}"
                 if self.fail_reason == "Unschedulable":
-                    pod.unschedulable, pod.message = True, "0/1 nodes are available: Insufficient memory."
+                    pod.unschedulable, pod.message = (
+                        True,
+                        "0/1 nodes are available: Insufficient memory.",
+                    )
                 elif self.fail_reason:
                     pod.waiting_reason, pod.restarts = self.fail_reason, 3
                 snap.pods.append(pod)
         if self.fail_reason == "quota":
-            snap.events.append(EventInfo("StatefulSet/x", "FailedCreate", "exceeded quota: appstore-quota"))
+            snap.events.append(
+                EventInfo(
+                    "StatefulSet/x", "FailedCreate", "exceeded quota: appstore-quota"
+                )
+            )
         return snap
 
     def _purge(self, namespace: str) -> None:
         self._terminating.pop(namespace, None)
         self.namespace_labels.pop(namespace, None)
-        self.objects = {k: v for k, v in self.objects.items() if k[2] != namespace and k[1] != namespace}
+        self.objects = {
+            k: v
+            for k, v in self.objects.items()
+            if k[2] != namespace and k[1] != namespace
+        }
         self.replicas = {k: v for k, v in self.replicas.items() if k[0] != namespace}
 
     def workloads(self, namespace: str) -> set[str]:

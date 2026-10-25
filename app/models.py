@@ -85,7 +85,9 @@ class Course(Base):
     lti_issuer = Column(String, nullable=True)
     lti_context_id = Column(String, nullable=True)
 
-    __table_args__ = (UniqueConstraint("lti_issuer", "lti_context_id", name="uq_courses_lti_context"),)
+    __table_args__ = (
+        UniqueConstraint("lti_issuer", "lti_context_id", name="uq_courses_lti_context"),
+    )
 
     # Relationships
     users = relationship("User", back_populates="course")
@@ -107,7 +109,9 @@ class User(Base):
     __tablename__ = "users"
 
     userId = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    keycloak_id = Column(String, unique=True, index=True, nullable=True)  # Keycloak User ID (sub)
+    keycloak_id = Column(
+        String, unique=True, index=True, nullable=True
+    )  # Keycloak User ID (sub)
     email = Column(String, unique=True, index=True, nullable=False)
     username = Column(String, nullable=False)
     firstName = Column(String, nullable=True)
@@ -125,10 +129,14 @@ class User(Base):
     # account is linked to; the e-mail is only an attribute (review S9).
     lti_issuer = Column(String, nullable=True)
     lti_subject = Column(String, nullable=True)
-    courseId = Column(UUID(as_uuid=True), ForeignKey("courses.courseId"), nullable=True, index=True)
+    courseId = Column(
+        UUID(as_uuid=True), ForeignKey("courses.courseId"), nullable=True, index=True
+    )
     created_at = Column(DateTime, default=utcnow)
 
-    __table_args__ = (UniqueConstraint("lti_issuer", "lti_subject", name="uq_users_lti_identity"),)
+    __table_args__ = (
+        UniqueConstraint("lti_issuer", "lti_subject", name="uq_users_lti_identity"),
+    )
 
     # Relationships
     course = relationship("Course", back_populates="users")
@@ -161,14 +169,20 @@ class App(Base):
     name = Column(String, nullable=False)
     description = Column(String, nullable=True)
     image = Column(LargeBinary, nullable=True)  # raw bytes of the uploaded logo
-    image_mime = Column(String(64), nullable=True)  # e.g. "image/png" — needed to build a data-URL on read
+    image_mime = Column(
+        String(64), nullable=True
+    )  # e.g. "image/png" — needed to build a data-URL on read
     git_link = Column(String, nullable=True)
     is_private = Column(Boolean, nullable=False, default=False)
     # Set by an admin's emergency deactivation: the app is private and only
     # an admin may make it public again, so the owner cannot undo the
     # deactivation (.github#7 R, dhbw-appstore).
-    hidden_by_admin = Column(Boolean, nullable=False, default=False, server_default=text("false"))
-    userId = Column(UUID(as_uuid=True), ForeignKey("users.userId"), nullable=False, index=True)
+    hidden_by_admin = Column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    userId = Column(
+        UUID(as_uuid=True), ForeignKey("users.userId"), nullable=False, index=True
+    )
     created_at = Column(DateTime, default=utcnow)
     # Soft-delete marker. When set, the app is hidden from default
     # queries but the row stays so existing deployments keep their FK
@@ -210,7 +224,9 @@ class Deployment(Base):
     # deployments made before projects were verified until their owner's
     # old credential is re-checked (``crud.openstack_credentials``).
     os_project_id = Column(String, nullable=True, index=True)
-    runtime = Column(String(16), nullable=False, default=RUNTIME_VM, server_default=RUNTIME_VM)
+    runtime = Column(
+        String(16), nullable=False, default=RUNTIME_VM, server_default=RUNTIME_VM
+    )
     # Pod deployments: their namespace (``dep-<first 8 hex of the id>``),
     # unique across all deployments, deleted ones included, so a destroy can
     # never reach another deployment's namespace; and how many workloads
@@ -218,8 +234,12 @@ class Deployment(Base):
     k8s_namespace = Column(String(63), nullable=True)
     k8s_workloads = Column(Integer, nullable=True)
     userInputVar = Column(Text, nullable=True)  # could also be JSON
-    userId = Column(UUID(as_uuid=True), ForeignKey("users.userId"), nullable=False, index=True)
-    appId = Column(UUID(as_uuid=True), ForeignKey("apps.appId"), nullable=False, index=True)
+    userId = Column(
+        UUID(as_uuid=True), ForeignKey("users.userId"), nullable=False, index=True
+    )
+    appId = Column(
+        UUID(as_uuid=True), ForeignKey("apps.appId"), nullable=False, index=True
+    )
     # Soft-delete marker. Set to hide the deployment from default
     # queries while keeping the row for audit/restore. DELETE is only
     # allowed in terminal states, so OpenStack resources are already
@@ -228,7 +248,11 @@ class Deployment(Base):
 
     __table_args__ = (
         # Default queries hide soft-deleted deployments.
-        Index("ix_deployments_live", "deploymentId", postgresql_where=text("deleted_at IS NULL")),
+        Index(
+            "ix_deployments_live",
+            "deploymentId",
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
         Index(
             "uq_deployments_k8s_namespace",
             "k8s_namespace",
@@ -340,15 +364,28 @@ class CeleryQueueMessage(Base):
     task_id = Column(UUID(as_uuid=True), nullable=True)  # = tasks.taskId
     # Parked until this task's worker let go of it (destroy after cancel).
     after_task = Column(UUID(as_uuid=True), nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
-    visible_after = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+    visible_after = Column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
     claimed_by = Column(Text, nullable=True)
     delivery_count = Column(Integer, nullable=False, server_default=text("0"))
 
     __table_args__ = (
         Index("ix_celery_queue_ready", "queue", "visible_after", "id"),
-        Index("uq_celery_queue_task_id", "task_id", unique=True, postgresql_where=text("task_id IS NOT NULL")),
-        Index("ix_celery_queue_after_task", "after_task", postgresql_where=text("after_task IS NOT NULL")),
+        Index(
+            "uq_celery_queue_task_id",
+            "task_id",
+            unique=True,
+            postgresql_where=text("task_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_celery_queue_after_task",
+            "after_task",
+            postgresql_where=text("after_task IS NOT NULL"),
+        ),
     )
 
 
@@ -366,7 +403,9 @@ class TaskEvent(Base):
     )
     type = Column(Text, nullable=False)
     payload = Column(JSONB, nullable=False)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
 
     __table_args__ = (Index("ix_task_events_task", "task_id", "id"),)
 
@@ -404,7 +443,9 @@ class TerraformState(Base):
 class UserToDeployment(Base):
     __tablename__ = "user_to_deployments"
 
-    userToDeploymentId = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    userToDeploymentId = Column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     userId = Column(
         UUID(as_uuid=True),
         ForeignKey("users.userId", ondelete="CASCADE"),
@@ -511,7 +552,9 @@ class UserOpenStackCredential(Base):
     # before projects were taken from Keystone carry whatever the user typed
     # (an application credential ignores it entirely), so they are False
     # until re-checked and count for nobody's project.
-    project_verified = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    project_verified = Column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
 
     # Encrypted (Fernet ciphertext) — never logged, never returned via API
     encrypted_identifier = Column(LargeBinary, nullable=False)
@@ -576,7 +619,9 @@ class AppVersionApproval(Base):
     # What the review covered besides the commit (.github#4): how the version
     # runs and, for pods, the SHA-256 of its appstore.yaml and the image
     # digests it names (JSON list). A deploy refuses a spec that differs.
-    runtime = Column(String(16), nullable=False, default=RUNTIME_VM, server_default=RUNTIME_VM)
+    runtime = Column(
+        String(16), nullable=False, default=RUNTIME_VM, server_default=RUNTIME_VM
+    )
     spec_sha256 = Column(String(64), nullable=True)
     image_digests = Column(Text, nullable=True)
 
@@ -601,7 +646,9 @@ class LtiNonce(Base):
 
     state = Column(String(128), primary_key=True)
     nonce = Column(String(128), nullable=False)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
 
     __table_args__ = (Index("ix_lti_nonces_created_at", "created_at"),)
 
@@ -619,8 +666,15 @@ class LtiLoginCode(Base):
 
     code_hash = Column(String(64), primary_key=True)
     binding_hash = Column(String(64), nullable=False)
-    userId = Column(UUID(as_uuid=True), ForeignKey("users.userId", ondelete="CASCADE"), nullable=False, index=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+    userId = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.userId", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
 
     __table_args__ = (Index("ix_lti_login_codes_created_at", "created_at"),)
 
