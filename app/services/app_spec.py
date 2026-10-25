@@ -30,7 +30,7 @@ from app.k8s.spec import (
     limits_from,
     parse_spec,
 )
-from app.models import RUNTIME_K8S, RUNTIME_VM
+from app.models import RUNTIME_K8S, RUNTIME_KUBEVIRT, RUNTIME_VM
 from app.utils import safe_yaml
 
 SPEC_FILE = "appstore.yaml"
@@ -44,7 +44,7 @@ class LoadedSpec:
 
     @property
     def runtime(self) -> str:
-        return RUNTIME_K8S if self.spec.runtime == "kubernetes" else RUNTIME_VM
+        return {"kubernetes": RUNTIME_K8S, "kubevirt-vm": RUNTIME_KUBEVIRT}.get(self.spec.runtime, RUNTIME_VM)
 
     def payload(self) -> dict[str, Any]:
         """The spec as the pod worker gets it in the job (it validates it again)."""

@@ -22,7 +22,7 @@ from app.config import settings
 from app.database import SessionLocal
 from app.k8s.kube import KubeApi, managed_selector
 from app.k8s.render import DEPLOYMENT_LABEL
-from app.models import RUNTIME_K8S, Deployment, Task, TaskStatus, TaskType
+from app.models import CLUSTER_RUNTIMES, Deployment, Task, TaskStatus, TaskType
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ def _live(db, deployment_id: str, namespace: str) -> bool:
     except ValueError:
         return False
     dep = db.get(Deployment, dep_uuid)
-    if dep is None or dep.deleted_at is not None or dep.runtime != RUNTIME_K8S or dep.k8s_namespace != namespace:
+    if dep is None or dep.deleted_at is not None or dep.runtime not in CLUSTER_RUNTIMES or dep.k8s_namespace != namespace:
         return False
     destroyed = (
         db.query(Task.taskId)

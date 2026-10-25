@@ -30,6 +30,8 @@ from app.utils.time import utcnow
 RUNTIME_VM = "openstack-vm"
 RUNTIME_K8S = "kubernetes"
 RUNTIME_KUBEVIRT = "kubevirt-vm"
+# Runtimes whose objects live in this cluster (no OpenStack, no OpenTofu state).
+CLUSTER_RUNTIMES = (RUNTIME_K8S, RUNTIME_KUBEVIRT)
 
 
 # ----------------------------------------------------------------
