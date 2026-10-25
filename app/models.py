@@ -175,6 +175,10 @@ class App(Base):
     # Set by an admin: the app is highlighted in the catalog. Only the admin
     # endpoint ``PUT /admin/apps/{id}/recommended`` changes it.
     recommended = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    # The version tag teachers deploy; set by an admin, only to an approved
+    # version. NULL: nothing set. Cleared when that version's approval ends
+    # (revoked, or replaced by a new submission).
+    deploy_version = Column(String, nullable=True)
     userId = Column(UUID(as_uuid=True), ForeignKey("users.userId"), nullable=False, index=True)
     created_at = Column(DateTime, default=utcnow)
     # Soft-delete marker. When set, the app is hidden from default
