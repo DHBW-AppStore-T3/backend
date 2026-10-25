@@ -13,7 +13,7 @@ import pytest
 from app.main import app as fastapi_app
 from app.models import AppVersionApproval, AppVersionApprovalStatus
 from app.utils.keycloak_auth import get_current_user_keycloak
-from tests.conftest import approve_version_in_db, create_app_in_db
+from tests.conftest import FakeGitRemote, approve_version_in_db, create_app_in_db
 
 
 def _as(user):
@@ -33,7 +33,9 @@ def _deploy_version(client, app_id):
 
 
 @pytest.fixture
-def app_with_v1(db, mock_user):
+def app_with_v1(db, mock_user, fake_git):
+    # The detail endpoint only reports a deploy version whose tag still exists.
+    fake_git.tags.update({tag: FakeGitRemote.sha_for(tag) for tag in ("v1.0.0", "v2.0.0")})
     app = create_app_in_db(db, mock_user, name="Pinned")
     approve_version_in_db(db, app, "v1.0.0")
     return app
@@ -206,3 +208,48 @@ def test_resubmitting_a_moved_tag_clears_it(admin_client, app_with_v1, fake_git)
     assert resubmitted.json()["status"] == "pending"
 
     assert _deploy_version(admin_client, app_with_v1.appId) is None
+
+
+@pytest.mark.integration
+def test_detail_hides_a_deploy_version_whose_tag_moved(
+    admin_client, app_with_v1, mock_student, fake_git
+):
+    assert _set(admin_client, app_with_v1.appId, "v1.0.0").status_code == 200
+    fake_git.move("v1.0.0")
+
+    # Teachers can no longer deploy it (the approval covers the old commit):
+    # the detail does not offer it, neither to the admin nor to a student.
+    assert _deploy_version(admin_client, app_with_v1.appId) is None
+    _as(mock_student)
+    assert _deploy_version(admin_client, app_with_v1.appId) is None
+
+
+@pytest.mark.integration
+def test_detail_hides_a_deploy_version_whose_tag_is_gone(admin_client, app_with_v1, fake_git):
+    assert _set(admin_client, app_with_v1.appId, "v1.0.0").status_code == 200
+    del fake_git.tags["v1.0.0"]
+
+    assert _deploy_version(admin_client, app_with_v1.appId) is None
+
+
+@pytest.mark.integration
+def test_detail_keeps_the_deploy_version_when_the_repository_is_unreadable(
+    admin_client, app_with_v1, fake_git
+):
+    assert _set(admin_client, app_with_v1.appId, "v1.0.0").status_code == 200
+    fake_git.readable = False
+
+    # Nothing can be checked then; the stored setting is not hidden because of an outage.
+    assert _deploy_version(admin_client, app_with_v1.appId) == "v1.0.0"
+
+
+@pytest.mark.integration
+def test_detail_does_not_write_the_hidden_value(admin_client, db, app_with_v1, fake_git):
+    assert _set(admin_client, app_with_v1.appId, "v1.0.0").status_code == 200
+    fake_git.move("v1.0.0")
+    assert _deploy_version(admin_client, app_with_v1.appId) is None
+
+    # Hiding is on the way out only: a read never changes the stored setting.
+    # (The next review of the version clears it.)
+    db.refresh(app_with_v1)
+    assert app_with_v1.deploy_version == "v1.0.0"

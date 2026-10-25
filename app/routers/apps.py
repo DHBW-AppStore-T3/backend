@@ -11,6 +11,7 @@ import git
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.crud import app_version_approvals as crud_approvals
 from app.crud import apps as crud_apps
@@ -67,6 +68,20 @@ def _serialize_app(app):
     if isinstance(raw_bytes, (bytes, memoryview, bytearray)):
         app.image = build_image_data_url(bytes(raw_bytes), getattr(app, "image_mime", None))
     return app
+
+
+def _effective_deploy_version(app, all_versions: list, approved: dict[str, str]) -> str | None:
+    """The app's deploy version if it can still be deployed, else None.
+
+    The setting is checked when it is made; a tag moved or deleted since
+    then leaves it behind (it is cleared when the approval ends). Teachers
+    can no longer deploy such a version, so the app data does not offer it.
+    """
+    tag = app.deploy_version
+    if tag is None:
+        return None
+    sha = next((v.get("sha") for v in all_versions if _version_tag(v) == tag), None)
+    return tag if sha is not None and approved.get(tag) == sha else None
 
 
 def _version_tag(version) -> str:
@@ -225,6 +240,10 @@ def get_app(
     The owner and admins see every tag. Everyone else sees the approved
     versions whose tag still points to the approved commit; a moved tag
     disappears until it is submitted and approved again.
+
+    ``deploy_version`` is only reported while that version can still be
+    deployed (its tag exists and points to the approved commit). If the
+    repository cannot be read, the stored value is reported as it is.
     """
     app = crud_apps.get_app(db, app_id, include_deleted=True)
     if not app:
@@ -252,14 +271,16 @@ def get_app(
     if app.git_link and app.deleted_at is None:
         try:
             all_versions = git_service.get_versions(app.git_link)
+            approved = crud_approvals.approved_commits(db, app.appId)
             if is_owner_or_admin:
                 app.versions = all_versions
             else:
-                approved = crud_approvals.approved_commits(db, app.appId)
                 app.versions = [
                     v for v in all_versions
                     if approved.get(_version_tag(v)) == v.get("sha")
                 ]
+            # Not assigned: this is a read, the stored value must stay untouched.
+            set_committed_value(app, "deploy_version", _effective_deploy_version(app, all_versions, approved))
         except Exception as e:
             app.versions = []
             logger.warning("Could not fetch the versions of app %s: %s", app.appId, e)
