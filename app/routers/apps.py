@@ -17,7 +17,7 @@ from app.crud import apps as crud_apps
 from app.database import get_db
 from app.git_urls import GitHostNotAllowed
 from app.k8s.spec import network_choices, resource_choices
-from app.models import RUNTIME_K8S, RUNTIME_VM, User, UserRole
+from app.models import RUNTIME_K8S, RUNTIME_KUBEVIRT, RUNTIME_VM, User, UserRole
 from app.schemas import (
     AppCreate,
     AppResponse,
@@ -559,6 +559,8 @@ def _submit_at(db: Session, app, version_tag: str, commit_sha: str, diff_url=Non
     # these images (.github#4); served from the scan above.
     loaded = load_version_spec(app, version_tag, commit_sha)
     is_pods = loaded is not None and loaded.runtime == RUNTIME_K8S
+    is_kubevirt = loaded is not None and loaded.runtime == RUNTIME_KUBEVIRT
+    is_cluster = is_pods or is_kubevirt
     return crud_approvals.submit_version(
         db,
         app_id=app.appId,
@@ -566,8 +568,8 @@ def _submit_at(db: Session, app, version_tag: str, commit_sha: str, diff_url=Non
         commit_sha=commit_sha,
         diff_url=diff_url,
         notes=notes,
-        runtime=RUNTIME_K8S if is_pods else RUNTIME_VM,
-        spec_sha256=loaded.sha256 if is_pods else None,
+        runtime=RUNTIME_K8S if is_pods else (RUNTIME_KUBEVIRT if is_kubevirt else RUNTIME_VM),
+        spec_sha256=loaded.sha256 if is_cluster else None,
         image_digests=app_spec.digests_json(loaded) if is_pods else None,
     )
 

@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.crud import app_version_approvals as crud_approvals
 from app.crud import apps as crud_apps
 from app.database import get_db
-from app.models import RUNTIME_K8S, User
+from app.models import RUNTIME_K8S, RUNTIME_KUBEVIRT, User
 from app.routers.apps import (
     _serialize_app,
     ensure_no_marker_errors,
@@ -63,7 +63,8 @@ def approve_submitted_version(db: Session, app, version_tag: str, admin_id: UUID
         # submitted (.github#4): a commit cannot change, but the platform
         # limits can, and then the scan above already failed with 422.
         loaded = load_version_spec(app, version_tag, commit_sha)
-        spec_sha256 = loaded.sha256 if loaded is not None and loaded.runtime == RUNTIME_K8S else None
+        is_cluster = loaded is not None and loaded.runtime in (RUNTIME_K8S, RUNTIME_KUBEVIRT)
+        spec_sha256 = loaded.sha256 if is_cluster else None
         if spec_sha256 != submitted.spec_sha256:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
