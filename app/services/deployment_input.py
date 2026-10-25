@@ -510,6 +510,11 @@ def strip_file_vars_from_user_input(user_input_var: dict | None) -> dict | None:
     for var_name, value in tf_block.items():
         if looks_like_file_var(value):
             stripped_tf[var_name] = _file_var_metadata_only(value)
+        elif _looks_like_scoped_file_var(value):
+            # scope=team|user: {slot: {"uploaded": {name, content_b64, ...}}}
+            stripped_tf[var_name] = {
+                slot: _file_var_metadata_only(inner) for slot, inner in value.items()
+            }
         else:
             stripped_tf[var_name] = value
     out["terraform"] = stripped_tf
@@ -564,6 +569,15 @@ def looks_like_file_var(value) -> bool:
         if "content_b64" not in slot:
             return False
     return True
+
+
+def _looks_like_scoped_file_var(value) -> bool:
+    """``scope=team|user`` shape: every slot wraps a file-shape map (``{"uploaded": {...}}``)."""
+    return (
+        isinstance(value, dict)
+        and bool(value)
+        and all(looks_like_file_var(inner) for inner in value.values())
+    )
 
 
 def _file_var_metadata_only(value: dict) -> dict:

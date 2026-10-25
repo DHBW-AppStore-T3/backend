@@ -487,3 +487,16 @@ def test_stored_file_carries_a_mac_the_worker_can_check(client, db, mock_user, p
     # the seal is for the worker, not for API responses
     detail = client.get(f"/deployments/{created['deploymentId']}").json()
     assert "mac" not in detail["userInputVar"]["terraform"]["task_pdf"]["all"]
+
+
+@pytest.mark.unit
+def test_strip_covers_team_and_user_scoped_file_vars():
+    from app.services.deployment_input import strip_file_vars_from_user_input
+
+    slot = {"name": "x.pdf", "content_b64": "QQ==", "size": 1, "content_type": "application/pdf", "mac": "ab"}
+    out = strip_file_vars_from_user_input(
+        {"terraform": {"f": {"Team-1": {"uploaded": dict(slot)}}, "g": {"all": dict(slot)}}}
+    )["terraform"]
+    for entry in (out["f"]["Team-1"]["uploaded"], out["g"]["all"]):
+        assert "content_b64" not in entry and "mac" not in entry
+        assert entry["name"] == "x.pdf"
