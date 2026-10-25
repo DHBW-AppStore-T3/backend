@@ -20,7 +20,8 @@ undone):
     admin); a version without any review entry is submitted and approved.
     A version an admin rejected or revoked stays so, and a submission of
     somebody else waits for its review. An app somebody deleted is not
-    registered again
+    registered again, and an app of the same name that a teacher owns is
+    left alone
 """
 
 import argparse
@@ -137,7 +138,15 @@ def seed_apps(db: Session, owner: User, apps: list[dict]) -> None:
     from app.routers.apps import _submit_at, ensure_allowed_git_link, resolve_version_commit
 
     for a in apps:
-        rows = db.query(App).filter(App.name == a["name"]).all()
+        # Only an admin's app is the demo app: names are not unique, and the
+        # versions of a teacher's app of the same name must not be approved here.
+        rows = (
+            db.query(App)
+            .join(User, App.userId == User.userId)
+            .filter(App.name == a["name"], User.role == UserRole.ADMIN)
+            .order_by(App.created_at)
+            .all()
+        )
         row = next((r for r in rows if r.deleted_at is None), None)
         if row is None and rows:
             log.info("app %s was deleted, not registered again", a["name"])

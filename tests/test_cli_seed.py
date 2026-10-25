@@ -166,6 +166,21 @@ def test_seed_keeps_using_a_live_app_of_the_same_name(db, pod_repo):
     assert db.query(App).filter(App.deleted_at.is_(None)).count() == 1
 
 
+def test_seed_never_approves_a_teachers_app_of_the_same_name(db, pod_repo):
+    cli.seed(db, {"apps": []}, _realm())
+    teacher = db.query(User).filter_by(username="dozent").one()
+    theirs = App(name="ide", userId=teacher.userId, git_link="https://github.com/someone/ide", is_private=True)
+    db.add(theirs)
+    db.commit()
+
+    cli.seed(db, CFG, _realm())
+
+    assert db.query(AppVersionApproval).filter_by(appId=theirs.appId).count() == 0
+    ours = db.query(App).filter(App.appId != theirs.appId).one()
+    assert db.get(User, ours.userId).role == UserRole.ADMIN
+    assert db.query(AppVersionApproval).filter_by(appId=ours.appId).one().status == AppVersionApprovalStatus.APPROVED
+
+
 def test_seed_skips_apps_whose_repository_is_not_allowed(db, pod_repo):
     cfg = {"apps": [{"name": "evil", "gitLink": "https://evil.example.org/x/y", "versions": ["v1"]}]}
 
