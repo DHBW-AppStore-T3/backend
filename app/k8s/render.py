@@ -736,7 +736,7 @@ def _vm_workload_objects(
                 "apiGroup": "",
                 "kind": "PersistentVolumeClaim",
                 "name": vm.image_ref,
-                "namespace": "vm-images",
+                "namespace": vm.image_namespace,
             },
         },
     }

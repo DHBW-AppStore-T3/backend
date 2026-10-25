@@ -150,7 +150,7 @@ def test_render_vm_pvc_uses_cinder_and_clones_image():
     assert pvc["spec"]["resources"]["requests"]["storage"] == "80Gi"
     ds = pvc["spec"]["dataSourceRef"]
     assert ds["name"] == "windows11-matlab-golden"
-    assert ds["namespace"] == "vm-images"
+    assert ds["namespace"] == "vm-poc"
 
 
 def test_render_vm_virtual_machine_has_correct_resources():
