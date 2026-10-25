@@ -138,6 +138,8 @@ class AppResponse(AppBase):
     # Highlighted by an admin in the catalog.
     recommended: bool = False
     # The version tag teachers deploy, set by an admin; None until one is set.
+    # ``GET /apps/{id}`` reports it only while that version can still be
+    # deployed (its tag exists and points to the approved commit).
     deploy_version: str | None = None
     # Data-URL or null. Populated from ``app.image`` + ``app.image_mime``
     # by ``serialize_app_image``; the raw bytes never leave the backend.
