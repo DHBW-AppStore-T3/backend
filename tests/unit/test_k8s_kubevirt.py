@@ -1,5 +1,7 @@
 """Tests for kubevirt-vm runtime in spec.py and render.py."""
 
+import copy
+
 import pytest
 
 from app.k8s.render import (
@@ -12,6 +14,7 @@ from app.k8s.render import (
     workload_refs,
 )
 from app.k8s.spec import SpecValidationError, parse_spec
+from tests.unit.test_k8s_spec import VALID
 
 pytestmark = pytest.mark.unit
 
@@ -60,10 +63,6 @@ def test_kubevirt_vm_without_vm_block_is_rejected():
 
 
 def test_kubernetes_runtime_with_vm_block_is_rejected():
-    from tests.unit.test_k8s_spec import VALID
-
-    import copy
-
     data = copy.deepcopy(VALID)
     data["vm"] = {"cpuCores": 4, "memoryGiB": 8, "diskGiB": 80, "imageRef": "x", "storageClass": "cinder"}
     with pytest.raises(SpecValidationError) as exc:
