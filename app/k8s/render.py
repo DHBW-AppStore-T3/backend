@@ -24,7 +24,13 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from app.k8s.spec import AppSpec, Container, parse_cpu_millicores, parse_memory_mib, parse_storage_mib
+from app.k8s.spec import (
+    AppSpec,
+    Container,
+    parse_cpu_millicores,
+    parse_memory_mib,
+    parse_storage_mib,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping

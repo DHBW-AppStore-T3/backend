@@ -23,7 +23,7 @@ SHARED = {
     "k8s/__init__.py": "500314b04df7e61475d0e29efb5c22a3b7bd2d4b6df7f0ebf3ab55f150d53274",
     "k8s/fake.py": "723c36ec725922ff45937c9b9df61019730ef8b7123c39dd69413f753bd647d5",
     "k8s/kube.py": "c9aafff959cb13b8deb49b4c546a48421ecaca5a41f29d301a229c6cb66229e3",
-    "k8s/render.py": "12e2ebac69756647998d9cedfc270a4fbe9a083b1cfddfea412dbd099d5a13fe",
+    "k8s/render.py": "23c951486972f2173aa4d6b9634ac562babedd6b766a768ccfbd04a0ab0053b6",
     "k8s/spec.py": "9574cac5d95854af2e90d9ccac44486efe4493825453d22a8dbb1cd044634af5",
     "pgq.py": "57f323480984fbad424662810cfec1ebc39256fa2ec7b77680863b1f416b62e4",
     "task_contract.py": "4c77d4e3d5e986ab61bf3eb497a34f34c27c97881522660d2871b1faf58a7ad1",
