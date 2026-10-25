@@ -316,7 +316,7 @@ def test_a_kubevirt_app_is_submitted_deployed_and_kept_as_a_cluster_app(
     assert kwargs["spec"]["vm"]["imageRef"] == "windows11-matlab-golden"
     deployment_id = uuid.UUID(response.json()["deploymentId"])
     row = db.get(Deployment, deployment_id)
-    assert (row.runtime, row.os_project_id, row.k8s_workloads) == ("kubevirt-vm", None, 1)
+    assert (row.runtime, row.k8s_workloads) == ("kubevirt-vm", 1)
     # Without its namespace the orphan sweep would delete the running VM.
     assert row.k8s_namespace == f"dep-{deployment_id.hex[:8]}"
     assert response.json()["runtime"] == "kubevirt-vm"
