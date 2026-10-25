@@ -243,7 +243,7 @@ def test_an_infected_upload_is_refused_with_the_signature(clamd):
     clamd.reply = b"stream: Eicar-Signature FOUND\0"
     with pytest.raises(HTTPException) as exc:
         attach_files_to_user_input(
-            {"terraform": {}, "packer": {}}, {"notes": {"all": _upload("a.txt", b"hello")}}, [VAR]
+            {"terraform": {}}, {"notes": {"all": _upload("a.txt", b"hello")}}, [VAR]
         )
     assert exc.value.status_code == 422
     assert (
@@ -257,7 +257,7 @@ def test_an_upload_is_refused_with_503_while_the_scanner_is_down(clamd):
     settings.CLAMD_PORT = 1
     with pytest.raises(HTTPException) as exc:
         attach_files_to_user_input(
-            {"terraform": {}, "packer": {}}, {"notes": {"all": _upload("a.txt", b"hello")}}, [VAR]
+            {"terraform": {}}, {"notes": {"all": _upload("a.txt", b"hello")}}, [VAR]
         )
     assert exc.value.status_code == 503 and exc.value.detail["reason"] == "upload_scan_unavailable"
 
@@ -265,7 +265,7 @@ def test_an_upload_is_refused_with_503_while_the_scanner_is_down(clamd):
 @pytest.mark.unit
 def test_a_clean_upload_passes_when_the_scanner_is_up(clamd):
     out = attach_files_to_user_input(
-        {"terraform": {}, "packer": {}}, {"notes": {"all": _upload("a.txt", b"hello")}}, [VAR]
+        {"terraform": {}}, {"notes": {"all": _upload("a.txt", b"hello")}}, [VAR]
     )
     assert out["terraform"]["notes"]["all"]["name"] == "a.txt"
     assert clamd.received == [b"hello"]

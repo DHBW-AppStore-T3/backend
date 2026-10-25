@@ -1397,9 +1397,8 @@ async def stream_deployment_events(
     if not deployment:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deployment not found")
     # Inspect-only view via capabilities. The live stream surfaces
-    # task-log lines (raw worker stdout incl. terraform output, packer
-    # build chatter, etc.); course-teachers of the deployment-owner's
-    # course are in the inspect set, owners and admins keep their access,
+    # task-log lines (raw worker stdout); course-teachers of the
+    # deployment-owner's course are in the inspect set, owners and admins keep their access,
     # and plain members still see metadata only.
     ensure_view_deployment_owner(current_user, deployment, db)
 

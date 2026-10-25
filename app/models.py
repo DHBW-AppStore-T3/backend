@@ -199,8 +199,7 @@ class Deployment(Base):
     appId = Column(UUID(as_uuid=True), ForeignKey("apps.appId"), nullable=False, index=True)
     # Soft-delete marker. Set to hide the deployment from default
     # queries while keeping the row for audit/restore. DELETE is only
-    # allowed in terminal states, so OpenStack resources are already
-    # gone by the time this is set.
+    # allowed in terminal states.
     deleted_at = Column(DateTime, nullable=True)
 
     __table_args__ = (

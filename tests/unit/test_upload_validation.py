@@ -346,7 +346,7 @@ ZIP_VAR = {
 def test_upload_path_rejects_a_hostile_zip_with_a_structured_error():
     with pytest.raises(HTTPException) as exc:
         attach_files_to_user_input(
-            {"terraform": {}, "packer": {}},
+            {"terraform": {}},
             {"assignments": {"team1": _payload("a.zip", make_zip({"../x": b"x"}))}},
             [ZIP_VAR],
         )
@@ -360,7 +360,7 @@ def test_upload_path_rejects_a_hostile_zip_with_a_structured_error():
 @pytest.mark.unit
 def test_upload_path_stores_the_content_type_derived_from_the_bytes():
     out = attach_files_to_user_input(
-        {"terraform": {}, "packer": {}},
+        {"terraform": {}},
         {
             "assignments": {
                 "team1": _payload("a.zip", make_zip({"ok.txt": b"x"}), content_type="text/html")
@@ -377,7 +377,7 @@ def test_upload_path_checks_content_even_without_an_extension_filter():
     var = {**ZIP_VAR, "fileExtensions": []}
     with pytest.raises(HTTPException) as exc:
         attach_files_to_user_input(
-            {"terraform": {}, "packer": {}},
+            {"terraform": {}},
             {"assignments": {"team1": _payload("x.dat", ELF)}},
             [var],
         )
