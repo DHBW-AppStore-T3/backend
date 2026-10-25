@@ -17,15 +17,28 @@ import re
 
 from fastapi import HTTPException, status
 
+from app.services.upload_validation import UploadRejected, inspect_upload
+
 # 2 MiB on the decoded byte payload; enforced on the decoded length so
 # the limit is independent of base64 encoding overhead.
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
 
-# Permissive on the mime side — anything an HTML5 ``<img>`` can render
-# is accepted. Only the obviously-not-an-image case is rejected.
+# The shape is checked by the regex; which types are accepted by ``_MIME_EXTENSION``
+# below, and the bytes must really be that type.
 _DATA_URL_RE = re.compile(
     r"^data:(?P<mime>image/[a-zA-Z0-9.+-]+);base64,(?P<payload>[A-Za-z0-9+/=\s]+)$"
 )
+
+
+# Image types an app logo may have, and the extension the content check knows them by.
+_MIME_EXTENSION = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/svg+xml": "svg",
+}
 
 
 def parse_image_data_url(data_url: str | None) -> tuple[bytes | None, str | None]:
@@ -66,6 +79,25 @@ def parse_image_data_url(data_url: str | None) -> tuple[bytes | None, str | None
                 "max_bytes": MAX_IMAGE_BYTES,
                 "actual_bytes": len(payload),
             },
+        )
+    extension = _MIME_EXTENSION.get(mime)
+    if extension is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "reason": "unsupported_image_type",
+                "message": "the logo must be a PNG, JPEG, GIF, WebP or SVG image",
+                "allowed": sorted(_MIME_EXTENSION),
+            },
+        )
+    # The bytes must be what the mime says (and an SVG must not carry script): the
+    # logo is served to every visitor of the store.
+    try:
+        inspect_upload(f"logo.{extension}", payload, [extension])
+    except UploadRejected as rejected:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "image_content_rejected", "code": rejected.code, "message": rejected.message},
         )
     return payload, mime
 

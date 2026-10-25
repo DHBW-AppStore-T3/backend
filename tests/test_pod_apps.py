@@ -709,6 +709,18 @@ def _file(content: bytes, name="a.zip"):
     return {"name": name, "content_b64": base64.b64encode(content).decode(), "size": len(content)}
 
 
+def _zip(size: int) -> bytes:
+    """A valid ZIP whose single stored entry makes the archive about ``size`` bytes long."""
+    import io
+    import os
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+        z.writestr("data.bin", os.urandom(size))
+    return buf.getvalue()
+
+
 def test_team_files_of_a_pod_app_are_refused_beyond_the_secret_limit(client, db, mock_user, pod_repo, sent):
     spec = {**SPEC, "scope": "team", "variables": [
         {"name": "assignment", "type": "file", "scope": "team", "ext": ["zip"], "maxSize": "1Mi",
@@ -721,7 +733,7 @@ def test_team_files_of_a_pod_app_are_refused_beyond_the_secret_limit(client, db,
     body = {
         "name": "d", "appId": str(app.appId), "releaseTag": "v1.0", "teams": [_team("T", alice)],
         "files": {
-            "assignment": {"T": _file(b"x" * (900 * 1024))},
+            "assignment": {"T": _file(_zip(900 * 1024))},
             "readme": {"all": _file(b"y" * (200 * 1024), "README.md")},
         },
     }
@@ -742,7 +754,7 @@ def test_team_files_of_a_pod_app_reach_the_job(client, db, mock_user, pod_repo, 
     alice = _student(db, "alice")
     body = {
         "name": "d", "appId": str(app.appId), "releaseTag": "v1.0", "teams": [_team("T", alice)],
-        "files": {"assignment": {"T": _file(b"PK\x03\x04", "../../etc/a.zip")}},
+        "files": {"assignment": {"T": _file(_zip(64), "../../etc/a.zip")}},
     }
 
     response = client.post("/deployments/", json=body)

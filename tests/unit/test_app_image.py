@@ -90,10 +90,11 @@ def test_parse_oversized_payload_raises_413() -> None:
 @pytest.mark.unit
 def test_parse_mime_is_lowercased() -> None:
     """Großschreibung im Mime-Subtype wird normalisiert."""
-    encoded = base64.b64encode(b"jpegbytes").decode("ascii")
+    jpeg = bytes([0xFF, 0xD8, 0xFF, 0xE0]) + b"jpegbytes"
+    encoded = base64.b64encode(jpeg).decode("ascii")
     data_url = f"data:image/JPEG;base64,{encoded}"
     payload, mime = parse_image_data_url(data_url)
-    assert payload == b"jpegbytes"
+    assert payload == jpeg
     assert mime == "image/jpeg"
 
 

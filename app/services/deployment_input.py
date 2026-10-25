@@ -23,6 +23,7 @@ import json
 
 from fastapi import HTTPException, status
 
+from app.services.upload_validation import UploadRejected, inspect_upload
 from app.utils.filenames import safe_filename
 
 # Defense-in-depth limits for inline file uploads. The UX-side warning
@@ -191,13 +192,33 @@ def attach_files_to_user_input(
                     },
                 )
 
+            # What the bytes are, not what the name or the browser says: a ZIP is
+            # unpacked in somebody's pod, so it is checked completely (entries,
+            # real unpacked size, paths, links); programs and archive formats
+            # that cannot be inspected are refused unless the app lists them.
+            try:
+                inspected = inspect_upload(upload.name or "", decoded, allowed_exts)
+            except UploadRejected as rejected:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "reason": "file_content_rejected",
+                        "code": rejected.code,
+                        "message": rejected.message,
+                        "variable": var_name,
+                        "slot": slot_key,
+                        "filename": safe_filename(upload.name),
+                    },
+                )
+
             encoded_slots[slot_key] = {
                 # Stored as a plain file name: apps write it to disk and the
                 # download route puts it into a header (.github#7 R).
                 "name": safe_filename(upload.name),
                 "content_b64": content_b64,
                 "size": upload.size,
-                "content_type": upload.content_type or "application/octet-stream",
+                # Derived from the content; the client's claim is not stored.
+                "content_type": inspected.content_type,
             }
         # scope=team|user: HCL type is map(map(object({...}))) —
         # outer key is the team/user slot, inner key is the upload slot.
