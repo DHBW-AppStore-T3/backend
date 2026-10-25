@@ -367,8 +367,10 @@ class VmSpec(_Strict):
     cpu_cores: int = Field(default=4, ge=1, le=16, alias="cpuCores")
     memory_gib: int = Field(default=8, ge=2, le=32, alias="memoryGiB")
     disk_gib: int = Field(default=80, ge=40, le=200, alias="diskGiB")
-    # PVC name in the vm-images namespace used as clone source
+    # PVC name used as clone source; lives in imageNamespace
     image_ref: str = Field(alias="imageRef")
+    # Namespace that holds the golden-image PVC (defaults to vm-poc for PoC)
+    image_namespace: str = Field(default="vm-poc", alias="imageNamespace")
     storage_class: str = Field(default="cinder", alias="storageClass")
     vnc_access: bool = Field(default=True, alias="vncAccess")
 
