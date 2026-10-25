@@ -154,7 +154,16 @@ class FakeKube:
                     PodInfo(name=f"{name}-0", workload=workload, phase="Running" if ready else "Pending", ready=ready)
                 )
             elif kind == "VirtualMachine":
-                snap.vmis.append(VmiInfo(name, "Running" if ready else "Scheduling", ready))
+                labels = obj["metadata"].get("labels", {})
+                snap.vmis.append(
+                    VmiInfo(
+                        name,
+                        "Running" if ready else "Scheduling",
+                        ready,
+                        labels.get(TEAM_LABEL, ""),
+                        labels.get(USER_LABEL, ""),
+                    )
+                )
 
     def _purge(self, namespace: str) -> None:
         self._terminating.pop(namespace, None)

@@ -810,18 +810,23 @@ def _vm_workload_objects(
         },
     }
 
+    # The VM and its pod carry whose they are, so the live view can tell the rows apart.
+    vm_labels = {**labels, TEAM_LABEL: label_value(ref.team)}
+    if ref.user:
+        vm_labels[USER_LABEL] = label_value(ref.user.user_id)
+
     # VirtualMachine CR
     virtual_machine: dict[str, Any] = {
         "apiVersion": "kubevirt.io/v1",
         "kind": "VirtualMachine",
         "metadata": {
             **_meta(workload_name, dep, workload_name),
-            "labels": {**labels, TEAM_LABEL: label_value(ref.team)},
+            "labels": vm_labels,
         },
         "spec": {
             "runStrategy": "Always",
             "template": {
-                "metadata": {"labels": {**labels, "vm.kubevirt.io/name": workload_name, ROLE_LABEL: ROLE_VM}},
+                "metadata": {"labels": {**vm_labels, "vm.kubevirt.io/name": workload_name, ROLE_LABEL: ROLE_VM}},
                 "spec": {
                     "domain": {
                         "cpu": {"cores": vm.cpu_cores},
@@ -846,9 +851,6 @@ def _vm_workload_objects(
             },
         },
     }
-    if ref.user:
-        virtual_machine["metadata"]["labels"][USER_LABEL] = label_value(ref.user.user_id)
-
     # What the person signs in to the proxy with (HTTP basic auth, see docker/novnc-proxy).
     vnc_secret: dict[str, Any] = {
         "apiVersion": "v1",
