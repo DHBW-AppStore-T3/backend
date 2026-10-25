@@ -87,14 +87,6 @@ def parse_checked(raw: bytes) -> LoadedSpec:
                 "errors": exc.errors,
             },
         ) from exc
-    if spec.runtime != "kubernetes":
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={
-                "reason": "runtime_not_supported",
-                "message": f"runtime '{spec.runtime}' is not supported, use 'kubernetes'",
-            },
-        )
     digests = (
         tuple(sorted({c.image.split("@", 1)[1] for c in spec.workload.containers}))
         if spec.workload

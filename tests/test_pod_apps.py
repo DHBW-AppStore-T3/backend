@@ -191,7 +191,7 @@ def test_a_version_without_an_appstore_yaml_is_unusable(client, db, mock_user, f
         assert response.json()["detail"]["reason"] == "appstore_yaml_missing"
 
 
-def test_the_openstack_vm_runtime_is_refused(client, db, mock_user, pod_repo):
+def test_an_unknown_runtime_is_refused(client, db, mock_user, pod_repo):
     pod_repo({"apiVersion": "appstore/v2", "name": "windows", "runtime": "openstack-vm", "scope": "user"})
     app = _app(db, mock_user)
 
@@ -200,7 +200,7 @@ def test_the_openstack_vm_runtime_is_refused(client, db, mock_user, pod_repo):
         client.post(f"/apps/{app.appId}/versions/v1.0/submit", json={}),
     ):
         assert response.status_code == 422, response.text
-        assert response.json()["detail"]["reason"] == "runtime_not_supported"
+        assert response.json()["detail"]["reason"] == "invalid_app_spec"
 
 
 def test_approving_checks_the_spec_is_the_submitted_one(client, db, mock_user, admin_client, pod_repo):

@@ -364,7 +364,7 @@ class UserChoices(_Strict):
 class AppSpec(_Strict):
     api_version: Literal["appstore/v2"] = Field(alias="apiVersion")
     name: str
-    runtime: Literal["kubernetes", "openstack-vm"]
+    runtime: Literal["kubernetes"]
     scope: Literal["team", "user"] = "team"
     workload: Workload | None = None
     egress: Literal["none", "internet"] = "none"
@@ -377,10 +377,8 @@ class AppSpec(_Strict):
     def _check(self) -> AppSpec:
         if not _NAME_RE.match(self.name):
             raise ValueError(f"invalid app name {self.name!r} (lowercase letters, digits, '-')")
-        if self.runtime == "kubernetes" and self.workload is None:
+        if self.workload is None:
             raise ValueError("runtime 'kubernetes' requires 'workload'")
-        if self.runtime == "openstack-vm" and self.workload is not None:
-            raise ValueError("runtime 'openstack-vm' uses terraform/ + packer/, 'workload' is not allowed")
         names = [v.name for v in self.variables]
         if len(set(names)) != len(names):
             raise ValueError("variable names must be unique")
