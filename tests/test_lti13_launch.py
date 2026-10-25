@@ -363,3 +363,51 @@ def test_login_operations_have_their_own_ids():
     the generated frontend types."""
     ops = app.openapi()["paths"]["/lti13/login"]
     assert ops["get"]["operationId"] != ops["post"]["operationId"]
+
+
+def test_in_production_the_lti_cookies_carry_the_host_prefix(db):
+    """Cookie tossing: any host under the zone (or dhbw.site) can set a cookie for the parent
+    domain, so a planted ``lti13_binding`` would redeem the planter's code in the victim's
+    browser. Browsers accept ``__Host-`` cookies only from the host itself."""
+    client = TestClient(app, base_url="https://testserver")
+    with (
+        patch.object(settings, "APP_ENV", "production"),
+        patch.object(settings, "LTI13_PLATFORM_ISSUER", ISS),
+        patch.object(settings, "LTI13_CLIENT_ID", "client-123"),
+        patch.object(settings, "LTI13_SESSION_SECRET", "s" * 40),
+    ):
+        login = client.get("/lti13/login", params={"iss": ISS}, follow_redirects=False)
+        state_cookie = login.headers["set-cookie"]
+        assert state_cookie.startswith("__Host-lti13_state=")
+        assert "Secure" in state_cookie and "Path=/" in state_cookie and "Domain" not in state_cookie
+        state = login.cookies["__Host-lti13_state"]
+
+        with (
+            patch("app.routers.lti13.lti13_service.validate_id_token", return_value={}),
+            patch("app.routers.lti13.lti13_service.extract_user_info", return_value=_info()),
+        ):
+            launch = client.post("/lti13/launch", data={"id_token": "fake-token", "state": state})
+        assert launch.status_code == 200, launch.text
+        binding = next(c for c in launch.headers.get_list("set-cookie") if c.startswith("__Host-lti13_binding="))
+        assert "Secure" in binding and "Path=/" in binding and "Domain" not in binding
+        code = _fragment(launch)["code"]
+
+        # A browser that only got a planted, unprefixed binding cookie redeems nothing.
+        planted = TestClient(app, base_url="https://testserver")
+        planted.cookies.set("lti13_binding", launch.cookies["__Host-lti13_binding"])
+        assert planted.post("/lti13/session", json={"code": code}).status_code == 400
+
+    # (the attempt used the code up; a fresh launch for the real browser)
+    with (
+        patch.object(settings, "APP_ENV", "production"),
+        patch.object(settings, "LTI13_PLATFORM_ISSUER", ISS),
+        patch.object(settings, "LTI13_CLIENT_ID", "client-123"),
+        patch.object(settings, "LTI13_SESSION_SECRET", "s" * 40),
+    ):
+        state = client.get("/lti13/login", params={"iss": ISS}, follow_redirects=False).cookies["__Host-lti13_state"]
+        with (
+            patch("app.routers.lti13.lti13_service.validate_id_token", return_value={}),
+            patch("app.routers.lti13.lti13_service.extract_user_info", return_value=_info()),
+        ):
+            code = _fragment(client.post("/lti13/launch", data={"id_token": "fake-token", "state": state}))["code"]
+        assert client.post("/lti13/session", json={"code": code}).status_code == 200
