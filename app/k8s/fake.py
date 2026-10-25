@@ -75,11 +75,7 @@ class FakeKube:
     def namespaces(self, label_selector: str) -> list[str]:
         """Equality selectors only (``k=v[,k=v...]``), as the platform uses them."""
         wanted = [part.partition("=")[::2] for part in label_selector.split(",") if part]
-        return [
-            n
-            for n, labels in self.namespace_labels.items()
-            if all(labels.get(k) == v for k, v in wanted)
-        ]
+        return [n for n, labels in self.namespace_labels.items() if all(labels.get(k) == v for k, v in wanted)]
 
     def kinds(self, namespace: str | None = None) -> list[str]:
         return sorted(k for k, _n, ns, _v in self.objects if namespace is None or ns == namespace)
@@ -137,17 +133,13 @@ class FakeKube:
                     pod.waiting_reason, pod.restarts = self.fail_reason, 3
                 snap.pods.append(pod)
         if self.fail_reason == "quota":
-            snap.events.append(
-                EventInfo("StatefulSet/x", "FailedCreate", "exceeded quota: appstore-quota")
-            )
+            snap.events.append(EventInfo("StatefulSet/x", "FailedCreate", "exceeded quota: appstore-quota"))
         return snap
 
     def _purge(self, namespace: str) -> None:
         self._terminating.pop(namespace, None)
         self.namespace_labels.pop(namespace, None)
-        self.objects = {
-            k: v for k, v in self.objects.items() if k[2] != namespace and k[1] != namespace
-        }
+        self.objects = {k: v for k, v in self.objects.items() if k[2] != namespace and k[1] != namespace}
         self.replicas = {k: v for k, v in self.replicas.items() if k[0] != namespace}
 
     def workloads(self, namespace: str) -> set[str]:
