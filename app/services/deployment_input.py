@@ -20,12 +20,15 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import logging
 
 from fastapi import HTTPException, status
 
 from app.services import malware_scan
 from app.services.upload_validation import UploadRejected, inspect_upload
 from app.utils.filenames import safe_filename
+
+logger = logging.getLogger(__name__)
 
 # Defense-in-depth limits for inline file uploads. The UX-side warning
 # is mirrored on the wizard, but a hand-crafted POST could still try
@@ -39,6 +42,31 @@ from app.utils.filenames import safe_filename
 # blob of right-shape but wrong-size still fails fast.
 _MAX_FILE_BYTES_PER_FILE = 2 * 1024 * 1024
 _MAX_FILE_BYTES_PER_DEPLOYMENT = 10 * 1024 * 1024
+
+
+# ``reason`` values of the HTTPExceptions that :func:`attach_files_to_user_input` raises for a refused upload.
+_UPLOAD_REJECTION_REASONS = frozenset({
+    "file_var_collision", "file_var_empty", "file_extension_rejected", "file_b64_invalid",
+    "file_size_mismatch", "file_too_large", "deployment_files_too_large", "file_content_rejected",
+    "upload_scan_unavailable",
+})
+
+
+def log_rejected_upload(user_id, exc: HTTPException) -> None:
+    """One structured line per refused upload, so that attacks show up in the logs.
+
+    ``upload_rejected user=<id> reason=<reason> code=<code> variable=<name> slot=<slot>``: greppable, and a
+    count over it (Loki) is the metric. Only fixed codes and names the platform chose go in; the file name is
+    the client's and is left out, so nothing in it can forge a log line.
+    """
+    detail = exc.detail
+    if not isinstance(detail, dict) or detail.get("reason") not in _UPLOAD_REJECTION_REASONS:
+        return
+    fields = {k: detail.get(k) for k in ("reason", "code", "variable", "slot")}
+    logger.warning(
+        "upload_rejected user=%s %s", user_id,
+        " ".join(f"{k}={json.dumps(str(v))}" for k, v in fields.items() if v is not None),
+    )
 
 
 def attach_files_to_user_input(

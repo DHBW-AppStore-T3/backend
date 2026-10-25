@@ -395,3 +395,69 @@ def test_download_endpoint_member_403(
         # in the same session aren't affected.
         fastapi_app.dependency_overrides[get_current_user_keycloak] = lambda: mock_user
     assert resp.status_code == 403
+
+
+@pytest.mark.integration
+def test_rejected_upload_is_logged_as_a_security_event(
+    client, db, mock_user, patched_celery, caplog
+):
+    cred = _ensure_user_credentials(db, mock_user)
+    app = _ensure_app(db, mock_user)
+
+    evil = b"MZ" + b"\x00" * 200  # a Windows program
+    with caplog.at_level("WARNING", logger="app.services.deployment_input"):
+        response = client.post(
+            "/deployments/",
+            json={
+                "name": "rejected",
+                "appId": str(app.appId),
+                "releaseTag": "v1",
+                "credentialId": str(cred.credentialId),
+                "files": {"task_pdf": {"all": {
+                    "name": "evil\nupload_rejected user=forged.exe",
+                    "content_b64": _b64(evil),
+                    "size": len(evil),
+                }}},
+            },
+        )
+    assert response.status_code == 422
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("upload_rejected")]
+    assert len(lines) == 1
+    assert f"user={mock_user.userId}" in lines[0]
+    assert 'reason="file_content_rejected"' in lines[0]
+    assert 'variable="task_pdf"' in lines[0]
+    assert "forged" not in lines[0]
+
+
+@pytest.mark.integration
+def test_soft_delete_drops_the_uploaded_bytes_but_keeps_the_metadata(
+    client, db, mock_user, patched_celery
+):
+    from app.crud import deployments as crud_deployments
+
+    cred = _ensure_user_credentials(db, mock_user)
+    app = _ensure_app(db, mock_user)
+    pdf = b"%PDF-1.4\n" + b"PDF data" * 100
+    created = client.post(
+        "/deployments/",
+        json={
+            "name": "to-delete",
+            "appId": str(app.appId),
+            "releaseTag": "v1",
+            "credentialId": str(cred.credentialId),
+            "files": {"task_pdf": {"all": {
+                "name": "x.pdf", "content_b64": _b64(pdf), "size": len(pdf),
+            }}},
+        },
+    ).json()
+    dep_id = uuid.UUID(created["deploymentId"])
+    stored = db.query(Deployment).filter(Deployment.deploymentId == dep_id).one()
+    assert "content_b64" in stored.userInputVar
+
+    assert crud_deployments.soft_delete_deployment(db, dep_id) is True
+
+    db.expire_all()
+    row = db.query(Deployment).filter(Deployment.deploymentId == dep_id).one()
+    assert row.deleted_at is not None
+    assert "content_b64" not in row.userInputVar
+    assert json.loads(row.userInputVar)["terraform"]["task_pdf"]["all"]["name"] == "x.pdf"
