@@ -142,11 +142,6 @@ class Settings(BaseSettings):
     # resource endpoints return static dummy data. Only allowed in development.
     OPENSTACK_SIMULATE: bool = False
 
-    # Self-service-ui handoff (POST /handoff/mint). Own secret, independent
-    # of LTI13_SESSION_SECRET — a compromised LTI secret must not also open
-    # the self-service handoff path.
-    HANDOFF_SESSION_SECRET: str = "change-me-in-production"
-
     @property
     def is_development(self) -> bool:
         return self.APP_ENV == "development"

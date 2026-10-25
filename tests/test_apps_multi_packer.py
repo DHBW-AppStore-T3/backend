@@ -2,7 +2,7 @@
 shows up through the App-API.
 
 The discovery helper itself is covered isolated in
-``tests/test_packer_discovery.py``. The tests here pin the *integration*
+``tests/unit/test_packer_discovery.py``. The tests here pin the *integration*
 contract:
 
   * ``GET /apps/{id}/variables`` tags every Packer variable with the
@@ -49,7 +49,7 @@ from tests.conftest import create_app_in_db
 def _touch(path: str, content: str = "") -> None:
     """Create ``path`` and any missing parent directories. stdlib only so
     the helper stays runnable on any worker without a conftest fixture
-    chain — same shape as the helper in ``test_packer_discovery.py``."""
+    chain — same shape as the helper in ``tests/unit/test_packer_discovery.py``."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         f.write(content)
