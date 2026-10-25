@@ -114,6 +114,8 @@ class RenderSettings:
     scratch_size_limit: str = "1Gi"
     # The installation the namespaces belong to (ENVIRONMENT_LABEL); empty: none.
     environment: str = ""
+    # Image of the noVNC proxy of a kubevirt-vm workload (the chart pins it).
+    vnc_proxy_image: str = "ghcr.io/dhbw-appstore-t3/novnc-proxy:latest"
 
     @property
     def app_domain(self) -> str:
@@ -427,8 +429,10 @@ def _network_policies(spec: AppSpec, dep: DeploymentCtx, settings: RenderSetting
     return policies
 
 
-def _ingress(dep: DeploymentCtx, settings: RenderSettings, name: str, path: str) -> dict[str, Any]:
-    """Ingress of the Service ``name`` (port ``http``) at ``<name>-<deployment>.<app domain>``.
+def _ingress(
+    dep: DeploymentCtx, settings: RenderSettings, name: str, path: str, host: str | None = None
+) -> dict[str, Any]:
+    """Ingress of the Service ``name`` (port ``http``) at ``host``, default ``<name>-<deployment>.<app domain>``.
 
     Always a tls section: without one the ingress controller serves plain HTTP only.
     No secretName means the controller's default certificate (a cluster wildcard).
@@ -436,7 +440,7 @@ def _ingress(dep: DeploymentCtx, settings: RenderSettings, name: str, path: str)
     meta = _meta(name, dep, name)
     if settings.cluster_issuer:
         meta["annotations"] = {"cert-manager.io/cluster-issuer": settings.cluster_issuer}
-    host = f"{name}-{dep.short_id}.{settings.app_domain}"
+    host = host or f"{name}-{dep.short_id}.{settings.app_domain}"
     tls: dict[str, Any] = {"hosts": [host]}
     if settings.tls_secret:
         tls["secretName"] = settings.tls_secret
@@ -730,6 +734,11 @@ def _vm_network_policies(spec: AppSpec, dep: DeploymentCtx, settings: RenderSett
         _np_allow_ingress_controller(dep, settings, 8080, proxy),
         _np_allow_dns(dep),
         # The proxy talks to the API server (kubernetes.default: service port 443, node port 6443).
+        # The destination is any address on purpose: where the API server sits differs per
+        # cluster (service IP, node IPs, an external endpoint) and a NetworkPolicy cannot name
+        # the "kubernetes" service. What this opens is limited to the proxy pods (``proxy``
+        # selector, the app's code never runs there) and to ports 443/6443; the proxy has no
+        # other egress and its service account may only open VNC streams (vnc-proxy role).
         _netpol(
             dep,
             "allow-vnc-proxy-to-apiserver",
@@ -760,7 +769,15 @@ def _vm_workload_objects(
     vnc_password: str,
     settings: RenderSettings,
 ) -> list[dict[str, Any]]:
-    """All Kubernetes/KubeVirt objects for one kubevirt-vm workload slot."""
+    """All Kubernetes/KubeVirt objects for one kubevirt-vm workload slot.
+
+    Known limitation: all proxies of a namespace share the one ServiceAccount
+    ``vnc-proxy`` (its role may open the VNC stream of every VM of the namespace). With
+    ``scope: user`` that is many VMs per namespace, so a compromised proxy of one person
+    could reach the VNC stream of another person's VM in the same deployment (not of
+    another deployment). Binding one account per VM would need a ServiceAccount, Role
+    (resourceNames) and RoleBinding per VM and matching admission-policy rules.
+    """
     assert spec.vm is not None
     vm = spec.vm
     workload_name = ref.name
@@ -862,7 +879,7 @@ def _vm_workload_objects(
                     "containers": [
                         {
                             "name": "novnc",
-                            "image": "ghcr.io/dhbw-appstore-t3/novnc-proxy:latest",
+                            "image": settings.vnc_proxy_image,
                             "ports": [
                                 {
                                     "name": "http",
@@ -918,8 +935,11 @@ def _vm_workload_objects(
         },
     }
 
-    # Ingress for noVNC (browser access)
-    ingress = _ingress(dep, settings, novnc_name, "/")
+    # Ingress for noVNC (browser access). Its host is the workload's own,
+    # ``ref.host`` = <workload>-<deployment>.<app domain>, the one ``render_access``
+    # checks the access URL against (the app declares https://{workload}-{deployment}.{domain}).
+    # The Ingress and its Service keep the proxy's name; only the host drops the "-novnc".
+    ingress = _ingress(dep, settings, novnc_name, "/", host=ref.host(dep, settings))
 
     return [
         vnc_secret,

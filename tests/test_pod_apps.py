@@ -12,7 +12,15 @@ import pytest
 import yaml
 
 from app.k8s.fake import FakeKube
-from app.k8s.render import DeploymentCtx, Member, RenderSettings, Team, render, workload_refs
+from app.k8s.render import (
+    DeploymentCtx,
+    Member,
+    RenderSettings,
+    Team,
+    render,
+    render_vm,
+    workload_refs,
+)
 from app.k8s.spec import parse_spec
 from app.models import (
     App,
@@ -639,6 +647,81 @@ def test_restart_refuses_unknown_or_malformed_workloads(
         == code
     )
     sent.assert_not_called()
+
+
+@pytest.fixture
+def live_vm_deployment(client, db, mock_user, pod_repo, sent):
+    """A deployed kubevirt-vm app with one person (Anna) and its namespace in a FakeKube."""
+    pod_repo(KUBEVIRT_SPEC)
+    anna = _student(db, "anna")
+    app = _app(db, mock_user, is_private=True)
+    _submit_and_approve(client, db, app)
+    deployment_id = uuid.UUID(
+        _deploy(client, app, teams=[_team("Team-1", anna)]).json()["deploymentId"]
+    )
+    db.query(Task).update({"status": TaskStatus.SUCCESS})
+    db.commit()
+    sent.reset_mock()
+
+    kube = FakeKube(ready_after_polls=0)
+    spec = parse_spec(KUBEVIRT_SPEC)
+    teams = [Team("Team-1", (Member(str(anna.userId), "anna"),))]
+    passwords = {r.name: "x" for r in workload_refs(spec, teams)}
+    kube.namespace_labels["vm-poc"] = {}
+    for obj in render_vm(
+        spec, DeploymentCtx(id=str(deployment_id)), teams, RenderSettings(zone="z.example.org"), passwords
+    ):
+        kube.apply(obj)
+    k8s_status.set_kube_factory(lambda: kube)
+    yield deployment_id, kube, anna
+    k8s_status.set_kube_factory(None)
+
+
+def test_admins_operate_vm_deployments(db, live_vm_deployment, admin_client, sent):
+    deployment_id, _kube, _ = live_vm_deployment
+
+    response = admin_client.post(f"/deployments/{deployment_id}/pause")
+
+    assert response.status_code == 202, response.text
+    name, _kwargs = _job(sent)
+    assert name == "pods.pause_deployment"
+
+
+def test_the_owner_pauses_a_vm_deployment_without_a_credential(client, live_vm_deployment, sent):
+    deployment_id, _kube, _ = live_vm_deployment
+
+    assert client.post(f"/deployments/{deployment_id}/pause").status_code == 202
+    name, kwargs = _job(sent)
+    assert name == "pods.pause_deployment" and kwargs["openstack_envelope"] == {}
+
+
+def test_a_vm_is_restarted_by_name(client, live_vm_deployment, sent):
+    deployment_id, kube, _ = live_vm_deployment
+    (vm,) = [v.name for v in kube.snapshot(f"dep-{deployment_id.hex[:8]}").vmis]
+
+    response = client.post(f"/deployments/{deployment_id}/workloads/{vm}/restart")
+
+    assert response.status_code == 202, response.text
+    name, kwargs = _job(sent)
+    assert name == "pods.redeploy_resource" and kwargs["resource_address"] == vm
+
+
+def test_a_vm_cannot_be_reset(client, live_vm_deployment, sent):
+    deployment_id, kube, _ = live_vm_deployment
+    (vm,) = [v.name for v in kube.snapshot(f"dep-{deployment_id.hex[:8]}").vmis]
+
+    response = client.post(f"/deployments/{deployment_id}/workloads/{vm}/reset")
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["reason"] == "reset_not_supported"
+    sent.assert_not_called()
+
+
+def test_a_pod_workload_can_still_be_reset(client, live_pod_deployment, sent):
+    deployment_id, _kube, _ = live_pod_deployment
+    assert client.post(f"/deployments/{deployment_id}/workloads/team-1-ben/reset").status_code == 202
+
+
 
 
 def test_the_vm_resource_endpoints_are_gone(client, live_pod_deployment):

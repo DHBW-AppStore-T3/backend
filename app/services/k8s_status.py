@@ -175,7 +175,8 @@ def workload_views(deployment_id, namespace: str) -> list[dict[str, Any]] | None
                 "ready": ready,
                 "restarts": 0,
                 "phase": "Running" if ready else ("Starting" if vmi.phase == "Running" else vmi.phase),
-                "url": f"https://{vmi.name}-novnc-{dep.short_id}.{domain}" if domain else None,
+                # The proxy's ingress sits at the workload's host, as the pods' do (render_vm).
+                "url": f"https://{vmi.name}-{dep.short_id}.{domain}" if domain else None,
                 "lastEvent": None,
                 "setup": None,
             }

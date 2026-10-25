@@ -423,7 +423,7 @@ def test_the_live_view_shows_one_row_per_vm_with_the_link_to_its_proxy(monkeypat
     assert row["workload"].startswith("team-a")
     assert (row["phase"], row["ready"]) == ("Running", True)
     assert row["team"] == "team-a" and row["user_id"] == "uid-1"
-    assert row["url"] == f"https://{row['workload']}-novnc-{DEP.short_id}.apps.example.org"
+    assert row["url"] == f"https://{row['workload']}-{DEP.short_id}.apps.example.org"
 
 
 def test_a_booting_vm_is_not_ready_yet():
@@ -433,3 +433,63 @@ def test_a_booting_vm_is_not_ready_yet():
     finally:
         status.set_kube_factory(None)
     assert row["ready"] is False and row["phase"] != "Running"
+
+
+# ── the access link leads to the ingress that exists ───────────────────────────
+# appstore.yaml of the Windows-Matlab-App (v2.1.0), the access section verbatim.
+WINDOWS_MATLAB_SPEC = {
+    "apiVersion": "appstore/v2",
+    "name": "windows-matlab-app",
+    "runtime": "kubevirt-vm",
+    "scope": "user",
+    "vm": {
+        "cpuCores": 4,
+        "memoryGiB": 8,
+        "diskGiB": 90,
+        "imageRef": "windows11-matlab-golden",
+        "storageClass": "cinder",
+        "vncAccess": True,
+    },
+    "egress": "internet",
+    "access": [
+        {"type": "url", "template": "https://{workload}-{deployment}.{domain}"},
+        {"type": "password", "from": "generated-password", "username": "{user}"},
+    ],
+}
+
+
+@pytest.mark.parametrize("settings", [SETTINGS, RenderSettings(zone="z.example.org", app_domain_override="z.example.org")])
+def test_the_access_url_of_the_real_app_template_is_the_host_of_the_ingress(settings):
+    from app.k8s.render import render_access
+
+    spec = parse_spec(WINDOWS_MATLAB_SPEC)
+    teams = [Team("team-a", (Member(user_id="uid-1", name="alice"), Member(user_id="uid-2", name="bob")))]
+    passwords = {r.name: "pw" for r in workload_refs(spec, teams)}
+
+    objects = render_vm(spec, DEP, teams, settings, passwords)
+    entries = render_access(spec, DEP, teams, settings, passwords)
+
+    ingresses = {i["metadata"]["name"]: i for i in of_kind(objects, "Ingress")}
+    assert len(entries) == len(ingresses) == 2
+    for entry in entries:
+        ingress = ingresses[f"{entry.workload}-novnc"]
+        (rule,) = ingress["spec"]["rules"]
+        assert entry.url == f"https://{rule['host']}"
+        assert ingress["spec"]["tls"][0]["hosts"] == [rule["host"]]
+        # What the admission policy admits: <workload>-<deployment>.<app domain>
+        assert rule["host"] == f"{entry.workload}-{DEP.short_id}.{settings.app_domain}"
+        assert "novnc" not in rule["host"]
+        # ... and it still routes to the proxy's service
+        assert rule["http"]["paths"][0]["backend"]["service"]["name"] == f"{entry.workload}-novnc"
+
+
+def test_the_proxy_image_is_configurable_and_defaults_to_latest():
+    spec = parse_spec(VALID_VM_SPEC)
+    passwords = {r.name: "pw" for r in workload_refs(spec, TEAMS)}
+
+    default = render_vm(spec, DEP, TEAMS, SETTINGS, passwords)
+    pinned = render_vm(spec, DEP, TEAMS, RenderSettings(zone="z", vnc_proxy_image="ghcr.io/x/novnc@sha256:abc"), passwords)
+
+    image = lambda objs: of_kind(objs, "Deployment")[0]["spec"]["template"]["spec"]["containers"][0]["image"]  # noqa: E731
+    assert image(default) == "ghcr.io/dhbw-appstore-t3/novnc-proxy:latest"
+    assert image(pinned) == "ghcr.io/x/novnc@sha256:abc"

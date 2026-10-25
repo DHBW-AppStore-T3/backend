@@ -1042,6 +1042,7 @@ def _dispatch_workload_action(
 
     Operate right; only from ``success`` or ``redeploy_failed`` (lifecycle,
     under the deployment lock). 422 for a row of the removed VM path or a malformed name,
+    ``reset`` of a kubevirt-vm deployment is 422 ``reset_not_supported`` (restart works).
     404 ``workload_not_found`` when the cluster knows no such workload of
     this deployment (the worker checks again when the cluster cannot be
     asked here).
@@ -1054,6 +1055,16 @@ def _dispatch_workload_action(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"reason": "unsupported_runtime", "message": "Only pod deployments have workloads"},
+        )
+    if reset and deployment.runtime == RUNTIME_KUBEVIRT:
+        # Re-cloning the golden image needs to delete the disk claim and the worker
+        # has no such step for VMs (restart is the only action there).
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "reason": "reset_not_supported",
+                "message": "VM deployments can be restarted but not reset",
+            },
         )
     if not _WORKLOAD_RE.match(workload):
         raise HTTPException(

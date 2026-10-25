@@ -361,6 +361,21 @@ class TestCanOperateDeployment:
         dep = _deployment(uuid.uuid4())
         assert caps.can_operate_deployment(admin, dep, db_mock) is True
 
+    @pytest.mark.parametrize("runtime", ["kubernetes", "kubevirt-vm"])
+    def test_admin_operates_a_cluster_deployment_without_any_credential(self, admin, db_mock, runtime):
+        dep = SimpleNamespace(deploymentId=uuid.uuid4(), userId=uuid.uuid4(), runtime=runtime)
+        assert caps.can_operate_deployment(admin, dep, db_mock) is True
+
+    @pytest.mark.parametrize("runtime", ["kubernetes", "kubevirt-vm"])
+    def test_teacher_and_stranger_cannot_operate_a_cluster_deployment(self, teacher, student, db_mock, runtime):
+        dep = SimpleNamespace(deploymentId=uuid.uuid4(), userId=uuid.uuid4(), runtime=runtime)
+        assert caps.can_operate_deployment(teacher, dep, db_mock) is False
+        assert caps.can_operate_deployment(student, dep, db_mock) is False
+
+    def test_owner_operates_a_kubevirt_deployment(self, student, db_mock):
+        dep = SimpleNamespace(deploymentId=uuid.uuid4(), userId=student.userId, runtime="kubevirt-vm")
+        assert caps.can_operate_deployment(student, dep, db_mock) is True
+
     def test_unrelated_student_cannot_operate(self, student, db_mock):
         dep = _deployment(uuid.uuid4())
         assert caps.can_operate_deployment(student, dep, db_mock) is False
