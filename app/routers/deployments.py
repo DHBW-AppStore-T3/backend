@@ -25,8 +25,18 @@ from app.database import SessionLocal, get_db
 from app.k8s.render import Member, workload_refs
 from app.k8s.render import Team as RenderTeam
 from app.k8s.spec import MAX_FILE_VARIABLE_BYTES, parse_size_bytes
-from app.models import RUNTIME_K8S, TaskStatus, TaskType, User, UserRole
-from app.models import Task as TaskModel  # for ad-hoc state queries
+from app.models import (
+    CLUSTER_RUNTIMES,
+    RUNTIME_K8S,
+    RUNTIME_KUBEVIRT,
+    TaskStatus,
+    TaskType,
+    User,
+    UserRole,
+)
+from app.models import (
+    Task as TaskModel,
+)
 from app.schemas import (
     DeploymentCreate,
     DeploymentDetail,
@@ -48,8 +58,12 @@ from app.services import (
     task_finalizer,
     task_results,
 )
-from app.services import lifecycle as lifecycle_service
-from app.services import task_service as task_service_module
+from app.services import (
+    lifecycle as lifecycle_service,
+)
+from app.services import (
+    task_service as task_service_module,
+)
 from app.services.deployment_input import (
     attach_files_to_user_input,
     looks_like_file_var,
@@ -94,7 +108,7 @@ def list_deployments(
     app_id: UUID | None = None,
     status_filter: str | None = None,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user_keycloak)
+    current_user: User = Depends(get_current_user_keycloak),
 ):
     """List deployments visible to the caller.
 
@@ -140,9 +154,7 @@ def list_deployments(
     # bulk-fetched in two queries (latest + first task per deployment via
     # window functions) so the list endpoint stays at a constant query
     # count regardless of page size.
-    task_summary = crud_deployments.bulk_get_task_summary(
-        db, [d.deploymentId for d in deployments]
-    )
+    task_summary = crud_deployments.bulk_get_task_summary(db, [d.deploymentId for d in deployments])
 
     result = []
     for deployment in deployments:
@@ -163,18 +175,20 @@ def list_deployments(
         # download route is the only path that returns raw bytes.
         user_input_var_parsed = parse_and_strip_user_input(deployment.userInputVar)
 
-        result.append(DeploymentResponse(
-            deploymentId=deployment.deploymentId,
-            name=deployment.name,
-            appId=deployment.appId,
-            userId=deployment.userId,
-            releaseTag=deployment.releaseTag,
-            commit_sha=deployment.commit_sha,
-            runtime=deployment.runtime,
-            userInputVar=user_input_var_parsed,
-            status=status_value,
-            created_at=first_created_at,
-        ))
+        result.append(
+            DeploymentResponse(
+                deploymentId=deployment.deploymentId,
+                name=deployment.name,
+                appId=deployment.appId,
+                userId=deployment.userId,
+                releaseTag=deployment.releaseTag,
+                commit_sha=deployment.commit_sha,
+                runtime=deployment.runtime,
+                userInputVar=user_input_var_parsed,
+                status=status_value,
+                created_at=first_created_at,
+            )
+        )
 
     return result
 
@@ -187,7 +201,7 @@ def get_deployment(
     deployment_id: UUID,
     include_logs: bool = False,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user_keycloak)
+    current_user: User = Depends(get_current_user_keycloak),
 ):
     """
     Get deployment by ID with full details including:
@@ -199,10 +213,7 @@ def get_deployment(
     """
     deployment = crud_deployments.get_deployment_with_details(db, deployment_id)
     if not deployment:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Deployment not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deployment not found")
 
     # Member view or owner view (a course-teacher inspecting a student's
     # deployment); 403 otherwise. No blanket teacher access (.github#7 F).
@@ -240,7 +251,8 @@ def get_deployment(
     )
     if not is_owner_view:
         teams_data = [
-            t for t in teams_data
+            t
+            for t in teams_data
             if any(str(m["userId"]) == str(current_user.userId) for m in t["members"])
         ]
     teams = [
@@ -251,10 +263,10 @@ def get_deployment(
                 DeploymentTeamMember(
                     userId=member["userId"],
                     email=member["email"],
-                    username=member["username"]
+                    username=member["username"],
                 )
                 for member in team["members"]
-            ]
+            ],
         )
         for team in teams_data
     ]
@@ -291,13 +303,18 @@ def get_deployment(
     # data-URL string in place. Apps without an uploaded image are
     # unaffected (``getattr`` returns ``None`` and the helper no-ops).
     from app.routers.apps import _serialize_app  # local: avoid import cycle
+
     serialised_app = _serialize_app(deployment.app)
 
     # The UI renders buttons from these instead of guessing from the role.
     may_operate = can_operate_deployment(current_user, deployment, db)
-    permissions = DeploymentPermissions(owner_view=is_owner_view, operate=may_operate, member=is_member)
+    permissions = DeploymentPermissions(
+        owner_view=is_owner_view, operate=may_operate, member=is_member
+    )
     actions = (
-        sorted(a.value for a in lifecycle_service.allowed_actions(db, deployment)) if may_operate else []
+        sorted(a.value for a in lifecycle_service.allowed_actions(db, deployment))
+        if may_operate
+        else []
     )
 
     return DeploymentDetail(
@@ -334,7 +351,7 @@ def get_deployment(
 def create_deployment(
     deployment: DeploymentCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user_keycloak)
+    current_user: User = Depends(get_current_user_keycloak),
 ):
     """
     Create a new deployment
@@ -386,6 +403,7 @@ def create_deployment(
         load_version_spec,
         resolve_version_commit,
     )
+
     commit_sha = resolve_version_commit(target_app, deployment.releaseTag)
     if not target_app.is_private and not crud_approvals.has_approved_version(
         db, target_app.appId, deployment.releaseTag, commit_sha
@@ -395,12 +413,16 @@ def create_deployment(
             detail={"code": "version_not_approved", "version": deployment.releaseTag},
         )
 
-    # The app's appstore.yaml at the pinned commit (422 without a valid one);
-    # the review of a public app covers exactly this spec (.github#4).
+    # The app's appstore.yaml at the pinned commit (422 without a valid one):
+    # a pod app or a KubeVirt-VM app, both run in the cluster. The review of
+    # a public app covers exactly this spec (.github#4).
     loaded_spec = load_version_spec(target_app, deployment.releaseTag, commit_sha)
+    is_pods = loaded_spec.runtime == RUNTIME_K8S
     approval = crud_approvals.get_approval(db, target_app.appId, deployment.releaseTag)
     if not target_app.is_private and (
-        approval is None or approval.runtime != RUNTIME_K8S or approval.spec_sha256 != loaded_spec.sha256
+        approval is None
+        or approval.runtime not in (RUNTIME_K8S, RUNTIME_KUBEVIRT)
+        or approval.spec_sha256 != loaded_spec.sha256
     ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -423,7 +445,9 @@ def create_deployment(
     # available, the helper also enforces the app author's declared
     # ``fileExtensions`` filter on each upload name.
     deployment.userInputVar = attach_files_to_user_input(
-        deployment.userInputVar, deployment.files, variable_definitions or None,
+        deployment.userInputVar,
+        deployment.files,
+        variable_definitions or None,
     )
 
     # Enforce ``varScope = team|user`` contracts: each value must be a
@@ -437,8 +461,10 @@ def create_deployment(
             deployment.teams or [],
         )
 
-    _check_pod_files(loaded_spec, deployment.userInputVar)
-    # What the person chose for cpu/memory (only where the app allows it).
+    if is_pods:
+        _check_pod_files(loaded_spec, deployment.userInputVar)
+    # What the person chose for cpu/memory (vCPU/RAM of a VM) and the
+    # network (only where the app allows it), for pods and VMs alike.
     loaded_spec = app_spec.with_resource_overrides(loaded_spec, deployment.userInputVar.get("resources"))
     loaded_spec = app_spec.with_network_overrides(loaded_spec, deployment.userInputVar.get("network"))
     workloads = _check_pod_workloads(db, current_user, loaded_spec, deployment.teams or [])
@@ -448,16 +474,13 @@ def create_deployment(
         deployment,
         current_user.userId,
         commit_sha,
-        runtime=RUNTIME_K8S,
+        runtime=loaded_spec.runtime,
         k8s_workloads=workloads,
     )
 
     user_ids_in_deployment = set()
     if deployment.teams:
-        teams_data = [
-            {"name": team.name, "userIds": team.userIds}
-            for team in deployment.teams
-        ]
+        teams_data = [{"name": team.name, "userIds": team.userIds} for team in deployment.teams]
         crud_teams.create_teams_for_deployment(
             db=db,
             deployment_id=db_deployment.deploymentId,
@@ -475,9 +498,7 @@ def create_deployment(
 
     # Parse user input variables
     try:
-        user_vars = (
-            json.loads(db_deployment.userInputVar) if db_deployment.userInputVar else {}
-        )
+        user_vars = json.loads(db_deployment.userInputVar) if db_deployment.userInputVar else {}
     except Exception:
         user_vars = {}
 
@@ -507,7 +528,7 @@ def create_deployment(
         db,
         deployment_id=db_deployment.deploymentId,
         task_type=TaskType.DEPLOY,
-        celery_task_name=_task_name(TaskType.DEPLOY),
+        celery_task_name=_task_name(db_deployment.runtime, TaskType.DEPLOY),
         celery_kwargs=_job_kwargs(db_deployment, user_vars, teams_dict, **extra),
         dispatch_error_label="Could not dispatch deployment task — please retry",
         rollback_on_conflict=True,
@@ -599,11 +620,12 @@ def delete_deployment(
             ),
         )
 
-    # A pod deployment always goes through a destroy: even a cancelled one
-    # may have created its namespace before the cancel arrived, and hiding
-    # the row would leave the namespace running with nobody to see it. The
-    # listener soft-deletes the row when the destroy task succeeds.
-    if deployment.runtime == RUNTIME_K8S:
+    # A cluster deployment (pods, KubeVirt VM) always goes through a destroy:
+    # even a cancelled one may have created its namespace before the cancel
+    # arrived, and hiding the row would leave the namespace running with
+    # nobody to see it. The listener soft-deletes the row when the destroy
+    # task succeeds.
+    if deployment.runtime in CLUSTER_RUNTIMES:
         return _dispatch_destroy(db, deployment, current_user)
 
     # A row of the removed OpenStack VM path: nothing of it is managed
@@ -617,19 +639,24 @@ def delete_deployment(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-# The job each task type runs, on the ``pods`` queue (the pod deployer, no
-# OpenTofu, no root); see ``app.celery_app``.
+# The job each runtime and task type runs, on the ``pods`` queue (the pod
+# deployer, no OpenTofu, no root); see ``app.celery_app``.
 _TASK_NAMES = {
-    TaskType.DEPLOY: "pods.deploy_application",
-    TaskType.DESTROY: "pods.destroy_deployment",
-    TaskType.PAUSE: "pods.pause_deployment",
-    TaskType.RESUME: "pods.resume_deployment",
-    TaskType.REDEPLOY: "pods.redeploy_resource",
+    (RUNTIME_K8S, TaskType.DEPLOY): "pods.deploy_application",
+    (RUNTIME_K8S, TaskType.DESTROY): "pods.destroy_deployment",
+    (RUNTIME_K8S, TaskType.PAUSE): "pods.pause_deployment",
+    (RUNTIME_K8S, TaskType.RESUME): "pods.resume_deployment",
+    (RUNTIME_K8S, TaskType.REDEPLOY): "pods.redeploy_resource",
+    (RUNTIME_KUBEVIRT, TaskType.DEPLOY): "pods.deploy_vm_application",
+    (RUNTIME_KUBEVIRT, TaskType.DESTROY): "pods.destroy_deployment",
+    (RUNTIME_KUBEVIRT, TaskType.PAUSE): "pods.pause_deployment",
+    (RUNTIME_KUBEVIRT, TaskType.RESUME): "pods.resume_deployment",
+    (RUNTIME_KUBEVIRT, TaskType.REDEPLOY): "pods.redeploy_resource",
 }
 
 
-def _task_name(task_type: TaskType) -> str:
-    return _TASK_NAMES[task_type]
+def _task_name(runtime: str, task_type: TaskType) -> str:
+    return _TASK_NAMES[(runtime, task_type)]
 
 
 def _render_teams(db: Session, teams) -> list[RenderTeam]:
@@ -664,13 +691,20 @@ def _check_pod_workloads(db: Session, owner: User, loaded_spec, teams) -> int:
     if not refs:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"reason": "no_workloads", "message": "Add teams (and members, for per-person apps)"},
+            detail={
+                "reason": "no_workloads",
+                "message": "Add teams (and members, for per-person apps)",
+            },
         )
     limit = settings.K8S_MAX_WORKLOADS_PER_DEPLOYMENT
     if len(refs) > limit:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"reason": "too_many_workloads", "workloads": len(refs), "limit": limit},
+            detail={
+                "reason": "too_many_workloads",
+                "workloads": len(refs),
+                "limit": limit,
+            },
         )
     budget = settings.K8S_MAX_WORKLOADS_PER_OWNER
     if budget:
@@ -678,7 +712,12 @@ def _check_pod_workloads(db: Session, owner: User, loaded_spec, teams) -> int:
         if used + len(refs) > budget:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail={"reason": "workload_budget_exceeded", "in_use": used, "requested": len(refs), "budget": budget},
+                detail={
+                    "reason": "workload_budget_exceeded",
+                    "in_use": used,
+                    "requested": len(refs),
+                    "budget": budget,
+                },
             )
     return len(refs)
 
@@ -697,7 +736,9 @@ def _check_pod_files(loaded_spec, user_input: dict | None) -> None:
     for variable in loaded_spec.spec.variables:
         if variable.type != "file":
             continue
-        limit = parse_size_bytes(variable.max_size) if variable.max_size else MAX_FILE_VARIABLE_BYTES
+        limit = (
+            parse_size_bytes(variable.max_size) if variable.max_size else MAX_FILE_VARIABLE_BYTES
+        )
         largest = 0
         for slot_key, entry in (terraform_block.get(variable.name) or {}).items():
             if isinstance(entry, dict) and isinstance(entry.get("uploaded"), dict):
@@ -719,7 +760,10 @@ def _check_pod_files(loaded_spec, user_input: dict | None) -> None:
     if total > MAX_FILE_VARIABLE_BYTES:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail={"reason": "deployment_files_too_large", "limit_bytes": MAX_FILE_VARIABLE_BYTES},
+            detail={
+                "reason": "deployment_files_too_large",
+                "limit_bytes": MAX_FILE_VARIABLE_BYTES,
+            },
         )
 
 
@@ -734,7 +778,10 @@ def _validate_teams(db: Session, teams) -> None:
     if any(not name for name in names) or len(set(names)) != len(names):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"reason": "invalid_teams", "message": "Team names must be unique and not empty"},
+            detail={
+                "reason": "invalid_teams",
+                "message": "Team names must be unique and not empty",
+            },
         )
     seen: set[str] = set()
     for team in teams:
@@ -751,7 +798,10 @@ def _validate_teams(db: Session, teams) -> None:
             if str(user_id) in seen:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={"reason": "member_in_several_teams", "user_id": str(user_id)},
+                    detail={
+                        "reason": "member_in_several_teams",
+                        "user_id": str(user_id),
+                    },
                 )
             seen.add(str(user_id))
 
@@ -902,9 +952,7 @@ def _dispatch_lifecycle_task(
             user_vars = {
                 **user_vars,
                 "terraform": {
-                    k: v
-                    for k, v in terraform_block.items()
-                    if not looks_like_file_var(v)
+                    k: v for k, v in terraform_block.items() if not looks_like_file_var(v)
                 },
             }
 
@@ -923,7 +971,7 @@ def _dispatch_lifecycle_task(
         db,
         deployment_id=deployment.deploymentId,
         task_type=task_type,
-        celery_task_name=_task_name(task_type),
+        celery_task_name=_task_name(deployment.runtime, task_type),
         celery_kwargs=_job_kwargs(deployment, user_vars, teams_dict, **(extra_kwargs or {})),
         dispatch_error_label=f"Could not dispatch {task_type.value} task — please retry",
         rollback_on_conflict=False,
@@ -962,7 +1010,7 @@ def list_deployment_resources(
         )
     ensure_view_deployment_owner(current_user, deployment, db)
 
-    if deployment.runtime != RUNTIME_K8S:
+    if deployment.runtime not in CLUSTER_RUNTIMES:
         # A row of the removed OpenStack VM path: there is nothing to show.
         return DeploymentResourceListResponse(runtime=deployment.runtime, workloads=[], live=False)
 
@@ -979,7 +1027,9 @@ def list_deployment_resources(
 _WORKLOAD_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 
-def _dispatch_workload_action(db: Session, deployment_id: UUID, workload: str, current_user: User, *, reset: bool):
+def _dispatch_workload_action(
+    db: Session, deployment_id: UUID, workload: str, current_user: User, *, reset: bool
+):
     """Restart or reset one workload of a pod deployment (202 ``redeploying``).
 
     Operate right; only from ``success`` or ``redeploy_failed`` (lifecycle,
@@ -992,7 +1042,7 @@ def _dispatch_workload_action(db: Session, deployment_id: UUID, workload: str, c
     if not deployment:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deployment not found")
     ensure_operate_deployment(current_user, deployment, db)
-    if deployment.runtime != RUNTIME_K8S:
+    if deployment.runtime not in CLUSTER_RUNTIMES:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"reason": "unsupported_runtime", "message": "Only pod deployments have workloads"},
@@ -1003,7 +1053,9 @@ def _dispatch_workload_action(db: Session, deployment_id: UUID, workload: str, c
             detail={"reason": "invalid_workload"},
         )
     crud_locks.acquire_deployment_xact_lock(db, deployment_id)
-    lifecycle_service.ensure_action_allowed(db, deployment, lifecycle_service.DeploymentAction.REDEPLOY)
+    lifecycle_service.ensure_action_allowed(
+        db, deployment, lifecycle_service.DeploymentAction.REDEPLOY
+    )
     known = k8s_status.workload_views(deployment_id, deployment.k8s_namespace or "")
     if known is not None and workload not in {r["workload"] for r in known}:
         raise HTTPException(
@@ -1020,7 +1072,10 @@ def _dispatch_workload_action(db: Session, deployment_id: UUID, workload: str, c
     )
 
 
-@router.post("/{deployment_id}/workloads/{workload}/restart", status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/{deployment_id}/workloads/{workload}/restart",
+    status_code=status.HTTP_202_ACCEPTED,
+)
 def restart_workload(
     deployment_id: UUID,
     workload: str,
@@ -1084,12 +1139,17 @@ def cancel_deployment(
     # across the status check AND the task insert.
     crud_locks.acquire_deployment_xact_lock(db, deployment_id)
     lifecycle_service.ensure_action_allowed(
-        db, deployment, lifecycle_service.DeploymentAction.CANCEL,
+        db,
+        deployment,
+        lifecycle_service.DeploymentAction.CANCEL,
     )
 
     blocking_task_id = None
     in_flight = crud_deployments.get_latest_task(db, deployment_id)
-    if in_flight is not None and in_flight.status in (TaskStatus.PENDING, TaskStatus.RUNNING):
+    if in_flight is not None and in_flight.status in (
+        TaskStatus.PENDING,
+        TaskStatus.RUNNING,
+    ):
         in_flight.status = TaskStatus.CANCELLED
         in_flight.cancel_requested_at = datetime.now(UTC)
         in_flight.finished_at = utcnow()
@@ -1112,10 +1172,13 @@ def cancel_deployment(
             ),
         )
         # Delivered with the commit inside the dispatch below.
-        db.execute(text("SELECT pg_notify(:channel, :task_id)"), {
-            "channel": NOTIFY_TASK_CANCEL,
-            "task_id": str(in_flight.taskId),
-        })
+        db.execute(
+            text("SELECT pg_notify(:channel, :task_id)"),
+            {
+                "channel": NOTIFY_TASK_CANCEL,
+                "task_id": str(in_flight.taskId),
+            },
+        )
         db.flush()
 
     return _dispatch_lifecycle_task(
@@ -1158,7 +1221,9 @@ def pause_deployment(
     # ``prepare_task_in_tx`` flush.
     crud_locks.acquire_deployment_xact_lock(db, deployment_id)
     lifecycle_service.ensure_action_allowed(
-        db, deployment, lifecycle_service.DeploymentAction.PAUSE,
+        db,
+        deployment,
+        lifecycle_service.DeploymentAction.PAUSE,
     )
 
     return _dispatch_lifecycle_task(
@@ -1202,7 +1267,9 @@ def resume_deployment(
     # requests on this deployment.
     crud_locks.acquire_deployment_xact_lock(db, deployment_id)
     lifecycle_service.ensure_action_allowed(
-        db, deployment, lifecycle_service.DeploymentAction.RESUME,
+        db,
+        deployment,
+        lifecycle_service.DeploymentAction.RESUME,
     )
 
     return _dispatch_lifecycle_task(
@@ -1450,7 +1517,11 @@ async def stream_deployment_events(
                         yield _sse_frame(_event_name_for(terminal[0]), terminal[1])
                     return
                 if not rows:
-                    poll = _SSE_POLL_SECONDS if task_events.hub.listening else _SSE_FALLBACK_POLL_SECONDS
+                    poll = (
+                        _SSE_POLL_SECONDS
+                        if task_events.hub.listening
+                        else _SSE_FALLBACK_POLL_SECONDS
+                    )
                     timeout = min(poll, max(keepalive_at - loop.time(), 0.0))
                     with contextlib.suppress(TimeoutError):
                         await asyncio.wait_for(wake.wait(), timeout=timeout)

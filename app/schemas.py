@@ -135,11 +135,26 @@ class AppResponse(AppBase):
     is_private: bool
     # An admin deactivated the app; only an admin can make it public again.
     hidden_by_admin: bool = False
+    # Highlighted by an admin in the catalog.
+    recommended: bool = False
+    # The version tag teachers deploy, set by an admin; None until one is set.
+    # ``GET /apps/{id}`` reports it only while that version can still be
+    # deployed (its tag exists and points to the approved commit).
+    deploy_version: str | None = None
     # Data-URL or null. Populated from ``app.image`` + ``app.image_mime``
     # by ``serialize_app_image``; the raw bytes never leave the backend.
     image: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class AppRecommendedUpdate(BaseModel):
+    recommended: bool
+
+
+class AppDeployVersionUpdate(BaseModel):
+    # ``null`` clears the setting.
+    version_tag: str | None = Field(min_length=1)
 
 
 class AppWithUser(AppResponse):

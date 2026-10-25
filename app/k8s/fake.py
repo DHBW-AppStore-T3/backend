@@ -11,12 +11,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.k8s.kube import EventInfo, PodInfo, Snapshot, StatefulSetInfo
-from app.k8s.render import DEPLOYMENT_LABEL, TEAM_LABEL, USER_LABEL, WORKLOAD_LABEL
+from app.k8s.kube import DeploymentInfo, EventInfo, PodInfo, Snapshot, StatefulSetInfo, VmiInfo
+from app.k8s.render import DEPLOYMENT_LABEL, TEAM_LABEL, USER_LABEL, VM_NAMESPACE_LABEL, WORKLOAD_LABEL
 
 
 class FakeKube:
-    def __init__(self, *, fail_reason: str | None = None, ready_after_polls: int = 1, delete_polls: int = 1):
+    def __init__(
+        self,
+        *,
+        fail_reason: str | None = None,
+        ready_after_polls: int = 1,
+        delete_polls: int = 1,
+    ):
         self.objects: dict[tuple[str, str, str | None, str], dict[str, Any]] = {}
         self.replicas: dict[tuple[str, str], int] = {}
         self.deleted_pods: list[str] = []
@@ -44,6 +50,9 @@ class FakeKube:
             key = (ns, meta["name"])
             self.replicas[key] = obj["spec"]["replicas"]
             self._generation.setdefault(key, 0)
+
+    def delete_object(self, api_version: str, kind: str, namespace: str, name: str) -> None:
+        self.objects.pop((kind, name, namespace, api_version), None)
 
     def delete_namespace(self, name: str) -> None:
         if name in self.namespace_labels:
@@ -78,7 +87,11 @@ class FakeKube:
         if namespace in self._terminating:
             if self._terminating[namespace] > 0:
                 self._terminating[namespace] -= 1
-                return Snapshot(exists=True, terminating=True, labels=dict(self.namespace_labels[namespace]))
+                return Snapshot(
+                    exists=True,
+                    terminating=True,
+                    labels=dict(self.namespace_labels[namespace]),
+                )
             self._purge(namespace)
         if namespace not in self.namespace_labels:
             return Snapshot(exists=False)
@@ -99,7 +112,11 @@ class FakeKube:
             labels = self.objects[("StatefulSet", name, ns, "apps/v1")]["metadata"]["labels"]
             snap.statefulsets.append(
                 StatefulSetInfo(
-                    name, replicas, 1 if ready else 0, labels.get(TEAM_LABEL, ""), labels.get(USER_LABEL, "")
+                    name,
+                    replicas,
+                    1 if ready else 0,
+                    labels.get(TEAM_LABEL, ""),
+                    labels.get(USER_LABEL, ""),
                 )
             )
             if up:
@@ -111,13 +128,42 @@ class FakeKube:
                 )
                 pod.uid = f"{name}-uid-{self._generation[(ns, name)]}"
                 if self.fail_reason == "Unschedulable":
-                    pod.unschedulable, pod.message = True, "0/1 nodes are available: Insufficient memory."
+                    pod.unschedulable, pod.message = (
+                        True,
+                        "0/1 nodes are available: Insufficient memory.",
+                    )
                 elif self.fail_reason:
                     pod.waiting_reason, pod.restarts = self.fail_reason, 3
                 snap.pods.append(pod)
+        if snap.labels.get(VM_NAMESPACE_LABEL) == "true":
+            self._vm_snapshot(snap, namespace, polls)
         if self.fail_reason == "quota":
             snap.events.append(EventInfo("StatefulSet/x", "FailedCreate", "exceeded quota: appstore-quota"))
         return snap
+
+    def _vm_snapshot(self, snap: Snapshot, namespace: str, polls: int) -> None:
+        """noVNC proxies (Deployments) and VMs of a kubevirt-vm namespace, ready after ``ready_after_polls`` polls."""
+        ready = polls > self.ready_after_polls and not self.fail_reason
+        for (kind, name, ns, _v), obj in sorted(self.objects.items(), key=lambda i: i[0][:3]):
+            if ns != namespace:
+                continue
+            if kind == "Deployment":
+                snap.deployments.append(DeploymentInfo(name, 1, 1 if ready else 0))
+                workload = obj["metadata"]["labels"].get(WORKLOAD_LABEL, name)
+                snap.pods.append(
+                    PodInfo(name=f"{name}-0", workload=workload, phase="Running" if ready else "Pending", ready=ready)
+                )
+            elif kind == "VirtualMachine":
+                labels = obj["metadata"].get("labels", {})
+                snap.vmis.append(
+                    VmiInfo(
+                        name,
+                        "Running" if ready else "Scheduling",
+                        ready,
+                        labels.get(TEAM_LABEL, ""),
+                        labels.get(USER_LABEL, ""),
+                    )
+                )
 
     def _purge(self, namespace: str) -> None:
         self._terminating.pop(namespace, None)

@@ -19,10 +19,10 @@ APP = Path(__file__).resolve().parents[2] / "app"
 SHARED = {
     "git_urls.py": "c9b06a9fd9fc28b226e365eb4f90aa002a0205c11d2ba2abcda99b2e95258583",
     "k8s/__init__.py": "500314b04df7e61475d0e29efb5c22a3b7bd2d4b6df7f0ebf3ab55f150d53274",
-    "k8s/fake.py": "723c36ec725922ff45937c9b9df61019730ef8b7123c39dd69413f753bd647d5",
-    "k8s/kube.py": "c9aafff959cb13b8deb49b4c546a48421ecaca5a41f29d301a229c6cb66229e3",
-    "k8s/render.py": "8ad3ad83fc281470297809cdd749386566d343aea8e5192c663cc600e2188822",
-    "k8s/spec.py": "3c876e6c971b6641a7a691e51dc08d8bfdbd45c6d359dcbdf68ed846c9ad17af",
+    "k8s/fake.py": "7d4068cd2a97b14e19180090aa5ffe40b243012f0a8f3e46a7105d556e6cdd77",
+    "k8s/kube.py": "1544b0f3a8dd10b8fed7cb1c41e653322592d499f36ed9f74f13a62be6396610",
+    "k8s/render.py": "eedfef1776e7368d165781946596c18aec8972ca0fa50b7b2c6c0d14042746fe",
+    "k8s/spec.py": "eb87c7343dcb1aeecd6830bd590b0d1841b5b5cc0f73deeb138451f07549eddb",
     "pgq.py": "57f323480984fbad424662810cfec1ebc39256fa2ec7b77680863b1f416b62e4",
     "task_contract.py": "4c77d4e3d5e986ab61bf3eb497a34f34c27c97881522660d2871b1faf58a7ad1",
 }

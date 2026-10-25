@@ -1,11 +1,14 @@
 from unittest.mock import patch
 
+import pytest
 from fastapi.security import HTTPAuthorizationCredentials
 
 from app.config import settings
 from app.models import User, UserRole
 from app.services import lti13_service
 from app.utils.keycloak_auth import get_current_user_keycloak, sync_user_from_keycloak
+
+pytestmark = pytest.mark.integration
 
 
 def _credentials(token: str) -> HTTPAuthorizationCredentials:
@@ -27,7 +30,7 @@ def test_get_current_user_accepts_lti_session_token(db):
 
     with patch.object(settings, "LTI13_SESSION_SECRET", "test-secret"):
         token = lti13_service.issue_session_token(str(user.userId), "test-secret")
-        result = get_current_user_keycloak(credentials=_credentials(token), db=db)
+        result = get_current_user_keycloak(credentials=_credentials(token), x_dev_user=None, db=db)
 
     assert result.email == "lti-user@example.com"
 
@@ -45,7 +48,7 @@ def test_get_current_user_falls_through_to_keycloak_on_invalid_lti_token(db):
             },
         ),
     ):
-        result = get_current_user_keycloak(credentials=_credentials("not-a-valid-lti-token"), db=db)
+        result = get_current_user_keycloak(credentials=_credentials("not-a-valid-lti-token"), x_dev_user=None, db=db)
 
     assert result.email == "kc-user@example.com"
 

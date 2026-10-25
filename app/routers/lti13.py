@@ -37,8 +37,23 @@ router = APIRouter(prefix="/lti13", tags=["LTI 1.3"])
 # launch are two requests that can reach different API processes
 # (``uvicorn --workers``) or replicas.
 NONCE_TTL = 300  # 5 minutes
-# The cookie that binds a launch's one-time code to this browser (review S19).
+# The cookies of an LTI login: the state of the OIDC initiation, and the
+# binding of a launch's one-time code to this browser (review S19).
+STATE_COOKIE = "lti13_state"
 BINDING_COOKIE = "lti13_binding"
+
+
+def cookie_name(name: str) -> str:
+    """``name`` with the ``__Host-`` prefix, except over plain HTTP (development).
+
+    Every host under the zone, and under ``dhbw.site`` (which no browser treats
+    as a public suffix), is one site, and any of them, e.g. a page a student app
+    serves, may set a cookie for the parent domain. A planted binding cookie
+    would sign the visitor in with the planter's code (login CSRF). Browsers
+    accept a ``__Host-`` cookie only from this very host, with ``Secure`` and
+    ``Path=/`` and without ``Domain``, so it cannot be planted from elsewhere.
+    """
+    return name if settings.is_development else f"__Host-{name}"
 
 
 def _store_nonce(db: Session, state: str, nonce: str) -> None:
@@ -136,9 +151,10 @@ def _login(params, db: Session) -> RedirectResponse:
     # mismatch", not just in production. APP_ENV=development is the one
     # carve-out, for plain-HTTP localhost development.
     redirect.set_cookie(
-        key="lti13_state",
+        key=cookie_name(STATE_COOKIE),
         value=state,
         max_age=NONCE_TTL,
+        path="/",
         httponly=True,
         samesite="none",
         secure=not settings.is_development,
@@ -161,7 +177,7 @@ async def lti13_launch(request: Request, db: Session = Depends(get_db)) -> HTMLR
         raise HTTPException(status_code=400, detail="Missing id_token")
 
     # Verify state matches the cookie we set in step 1
-    cookie_state = request.cookies.get("lti13_state", "")
+    cookie_state = request.cookies.get(cookie_name(STATE_COOKIE), "")
     if not cookie_state or cookie_state != state:
         raise HTTPException(status_code=400, detail="State mismatch — possible CSRF")
 
@@ -207,26 +223,27 @@ async def lti13_launch(request: Request, db: Session = Depends(get_db)) -> HTMLR
     fragment = urllib.parse.urlencode({"lti": "1", "code": code})
     target = f"{settings.APP_BASE_URL}#{fragment}"
 
-    # Use a JS redirect so the browser also clears the state cookie (a Set-Cookie
-    # on a 302 to a cross-origin URL is unreliable in practice).
+    # A page that redirects with JavaScript, so the Set-Cookie headers below
+    # (a 302 to another origin handles them unreliably in practice) take effect.
     response = HTMLResponse(
         content=f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <script>
-  document.cookie = "lti13_state=; Max-Age=0; path=/";
   window.location.href = "{target}";
 </script>
 </head><body>Weiterleitung zum App-Store…</body></html>
 """
     )
-    # No Path: the browser takes this response's directory (``/api/lti13``
-    # behind the gateway), where /session is. Lax: the redemption is a
-    # same-origin request.
+    # The state is used up (HttpOnly: the page's JavaScript could not clear it).
+    response.delete_cookie(
+        cookie_name(STATE_COOKIE), path="/", secure=not settings.is_development, httponly=True, samesite="none"
+    )
+    # Path=/ as __Host- requires. Lax: the redemption is a same-origin request.
     response.set_cookie(
-        key=BINDING_COOKIE,
+        key=cookie_name(BINDING_COOKIE),
         value=binding,
         max_age=lti13_service.LTI_CODE_TTL,
-        path=None,
+        path="/",
         httponly=True,
         samesite="lax",
         secure=not settings.is_development,
@@ -345,7 +362,7 @@ def lti13_session(body: LtiSessionRequest, request: Request, db: Session = Depen
     400 ``lti_code_invalid`` for an unknown, used, expired or foreign code;
     the code is gone after the first attempt either way.
     """
-    user_id = lti13_service.redeem_login_code(db, body.code, request.cookies.get(BINDING_COOKIE, ""))
+    user_id = lti13_service.redeem_login_code(db, body.code, request.cookies.get(cookie_name(BINDING_COOKIE), ""))
     user = db.get(User, user_id) if user_id is not None else None
     if user is None:
         raise HTTPException(
@@ -360,7 +377,9 @@ def lti13_session(body: LtiSessionRequest, request: Request, db: Session = Depen
             "role": user.role.value,
         }
     )
-    response.delete_cookie(BINDING_COOKIE, path=None, secure=not settings.is_development, httponly=True, samesite="lax")
+    response.delete_cookie(
+        cookie_name(BINDING_COOKIE), path="/", secure=not settings.is_development, httponly=True, samesite="lax"
+    )
     return response
 
 

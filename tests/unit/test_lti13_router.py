@@ -215,9 +215,12 @@ async def test_lti13_launch_hands_out_only_a_code_and_a_binding_cookie():
     assert f"{url.scheme}://{url.netloc}" == "https://app.example.com"
     assert url.query == ""
     assert urllib.parse.parse_qs(url.fragment) == {"lti": ["1"], "code": ["the-code"]}
-    cookie = response.headers["set-cookie"]
-    assert cookie.startswith("lti13_binding=the-binding;")
-    assert "HttpOnly" in cookie and "SameSite=lax" in cookie and "Path=" not in cookie
+    cookies = response.headers.getlist("set-cookie")
+    binding = next(c for c in cookies if c.startswith("lti13_binding="))
+    assert binding.startswith("lti13_binding=the-binding;")
+    assert "HttpOnly" in binding and "SameSite=lax" in binding and "Path=/" in binding and "Domain" not in binding
+    # the used state cookie is cleared
+    assert any(c.startswith("lti13_state=") and "Max-Age=0" in c for c in cookies)
 
 
 async def test_lti13_launch_checks_the_configured_deployment_id():

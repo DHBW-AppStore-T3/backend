@@ -6,13 +6,15 @@ from sqlalchemy.orm import Session
 from app.crud import app_version_approvals as crud_approvals
 from app.crud import apps as crud_apps
 from app.database import get_db
-from app.models import User
+from app.models import AppVersionApprovalStatus, User
 from app.routers.apps import (
     _serialize_app,
     load_version_spec,
     resolve_version_commit,
 )
 from app.schemas import (
+    AppDeployVersionUpdate,
+    AppRecommendedUpdate,
     AppResponse,
     AppVersionApprovalDecision,
     AppVersionApprovalResponse,
@@ -161,6 +163,87 @@ def deactivate_app(
     """
     _require_app(db, app_id)
     updated = crud_apps.set_hidden_by_admin(db, app_id, True)
+    return _serialize_app(updated)
+
+
+# ----------------------------------------------------------------
+# RECOMMENDATION
+# ----------------------------------------------------------------
+@router.put(
+    "/apps/{app_id}/recommended",
+    response_model=AppResponse,
+    tags=["Admin"],
+)
+def set_app_recommended(
+    app_id: UUID,
+    body: AppRecommendedUpdate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Mark an app as recommended or not. Admin only.
+
+    The flag only highlights the app in the catalog; it does not change who
+    may see or deploy it.
+    """
+    _require_app(db, app_id)
+    updated = crud_apps.set_recommended(db, app_id, body.recommended)
+    return _serialize_app(updated)
+
+
+# ----------------------------------------------------------------
+# DEPLOY VERSION
+# ----------------------------------------------------------------
+@router.put(
+    "/apps/{app_id}/deploy-version",
+    response_model=AppResponse,
+    tags=["Admin"],
+)
+def set_deploy_version(
+    app_id: UUID,
+    body: AppDeployVersionUpdate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Set the version teachers deploy, or clear it with ``version_tag: null``.
+
+    Only a version that is approved for the commit its tag points to now
+    can be set:
+
+    - 404: the app does not exist, or the version has no approval entry.
+    - 409 ``version_not_approved``: the entry exists but is pending,
+      rejected or from before versions were pinned to commits.
+    - 409 ``version_moved``: the tag points to another commit than the
+      approved one; it has to be submitted and reviewed again.
+    - 502: the repository cannot be read.
+
+    The setting is cleared again when the version's approval ends (revoked,
+    or replaced by a new submission). ``POST /deployments/`` is not bound to
+    it and still checks the approval of the version it is given.
+    """
+    app = _require_app(db, app_id)
+    if body.version_tag is not None:
+        # Locked until the commit below: a revocation waits and then clears
+        # the setting, so it cannot be set to a version revoked meanwhile.
+        approval = crud_approvals.get_approval(db, app_id, body.version_tag, lock=True)
+        if approval is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Version approval entry not found")
+        if approval.status != AppVersionApprovalStatus.APPROVED or approval.commit_sha is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "version_not_approved",
+                    "message": "Only an approved version can be set as the deploy version",
+                },
+            )
+        if resolve_version_commit(app, body.version_tag) != approval.commit_sha:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "version_moved",
+                    "message": "The tag now points to a different commit than the approved one; submit it again",
+                },
+            )
+    updated = crud_apps.set_deploy_version(db, app_id, body.version_tag)
     return _serialize_app(updated)
 
 

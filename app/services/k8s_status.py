@@ -163,4 +163,21 @@ def workload_views(deployment_id, namespace: str) -> list[dict[str, Any]] | None
                 "setup": setup if setup is not None and setup["percent"] < 100 else None,
             }
         )
+    # kubevirt-vm: one row per VM; it is ready once the VM runs and its proxy (the link) answers.
+    proxies_ready = {d.name for d in snap.deployments if d.ready_replicas >= 1}
+    for vmi in snap.vmis:
+        ready = vmi.ready and f"{vmi.name}-novnc" in proxies_ready
+        rows.append(
+            {
+                "workload": vmi.name,
+                "team": vmi.team or None,
+                "user_id": vmi.user or None,
+                "ready": ready,
+                "restarts": 0,
+                "phase": "Running" if ready else ("Starting" if vmi.phase == "Running" else vmi.phase),
+                "url": f"https://{vmi.name}-novnc-{dep.short_id}.{domain}" if domain else None,
+                "lastEvent": None,
+                "setup": None,
+            }
+        )
     return rows

@@ -13,6 +13,8 @@ from app.models import App, Deployment, Task, TaskStatus, TaskType, User
 from app.services import lifecycle as lifecycle_service
 from app.services.lifecycle import DeploymentAction
 
+pytestmark = pytest.mark.integration
+
 
 def _seed_deployment_with_latest_task(
     db, user: User, *, task_type: TaskType, task_status: TaskStatus

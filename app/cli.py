@@ -19,7 +19,9 @@ undone):
   - the apps of the config file are registered (public, owned by the first
     admin); a version without any review entry is submitted and approved.
     A version an admin rejected or revoked stays so, and a submission of
-    somebody else waits for its review
+    somebody else waits for its review. An app is the demo app only with
+    the configured name and repository, and one somebody deleted is not
+    registered again
 """
 
 import argparse
@@ -136,10 +138,26 @@ def seed_apps(db: Session, owner: User, apps: list[dict]) -> None:
     from app.routers.apps import _submit_at, ensure_allowed_git_link, resolve_version_commit
 
     for a in apps:
-        row = db.query(App).filter(App.name == a["name"], App.deleted_at.is_(None)).first()
+        try:
+            link = ensure_allowed_git_link(a["gitLink"]) if a.get("gitLink") else None
+        except HTTPException as exc:
+            log.warning("app %s not created: %s", a["name"], _detail(exc))
+            continue
+        # The demo app is the app with this name AND this repository: names are
+        # not unique, and the versions of somebody's app of the same name from
+        # another repository must not be approved here.
+        rows = (
+            db.query(App)
+            .filter(App.name == a["name"], (App.git_link == link) if link else App.git_link.is_(None))
+            .order_by(App.created_at)
+            .all()
+        )
+        row = next((r for r in rows if r.deleted_at is None), None)
+        if row is None and rows:
+            log.info("app %s was deleted, not registered again", a["name"])
+            continue
         if row is None:
             try:
-                link = ensure_allowed_git_link(a["gitLink"]) if a.get("gitLink") else None
                 if link:
                     access = git_service.verify_repository_access(link)
                     if not access["success"]:

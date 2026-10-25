@@ -30,7 +30,7 @@ from app.k8s.spec import (
     limits_from,
     parse_spec,
 )
-from app.models import RUNTIME_K8S
+from app.models import RUNTIME_K8S, RUNTIME_KUBEVIRT
 from app.utils import safe_yaml
 
 SPEC_FILE = "appstore.yaml"
@@ -44,7 +44,7 @@ class LoadedSpec:
 
     @property
     def runtime(self) -> str:
-        return RUNTIME_K8S
+        return RUNTIME_KUBEVIRT if self.spec.runtime == "kubevirt-vm" else RUNTIME_K8S
 
     def payload(self) -> dict[str, Any]:
         """The spec as the pod worker gets it in the job (it validates it again)."""
@@ -57,12 +57,13 @@ class LoadedSpec:
 
 
 def platform_limits() -> PlatformLimits:
-    """Limits from the settings (``APP_IMAGE_REGISTRY_ALLOWLIST``, ``APP_MAX_*``)."""
+    """Limits from the settings (``APP_IMAGE_REGISTRY_ALLOWLIST``, ``APP_MAX_*``, ``APP_VM_IMAGE_NAMESPACES``)."""
     return limits_from(
         settings.APP_IMAGE_REGISTRY_ALLOWLIST,
         settings.APP_MAX_CPU,
         settings.APP_MAX_MEMORY,
         settings.APP_MAX_STORAGE,
+        settings.APP_VM_IMAGE_NAMESPACES,
     )
 
 
