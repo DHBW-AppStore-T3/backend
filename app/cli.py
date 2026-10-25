@@ -19,7 +19,8 @@ undone):
   - the apps of the config file are registered (public, owned by the first
     admin); a version without any review entry is submitted and approved.
     A version an admin rejected or revoked stays so, and a submission of
-    somebody else waits for its review
+    somebody else waits for its review. An app somebody deleted is not
+    registered again
 """
 
 import argparse
@@ -136,7 +137,11 @@ def seed_apps(db: Session, owner: User, apps: list[dict]) -> None:
     from app.routers.apps import _submit_at, ensure_allowed_git_link, resolve_version_commit
 
     for a in apps:
-        row = db.query(App).filter(App.name == a["name"], App.deleted_at.is_(None)).first()
+        rows = db.query(App).filter(App.name == a["name"]).all()
+        row = next((r for r in rows if r.deleted_at is None), None)
+        if row is None and rows:
+            log.info("app %s was deleted, not registered again", a["name"])
+            continue
         if row is None:
             try:
                 link = ensure_allowed_git_link(a["gitLink"]) if a.get("gitLink") else None

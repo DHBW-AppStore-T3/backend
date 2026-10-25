@@ -139,6 +139,33 @@ def test_seed_enrolls_only_the_users_it_created(db, pod_repo):
     assert db.query(User).filter_by(username="student2").one().courseId == course.courseId
 
 
+def test_seed_does_not_register_again_an_app_somebody_deleted(db, pod_repo):
+    from datetime import UTC, datetime
+
+    cli.seed(db, CFG, _realm())
+    db.query(App).one().deleted_at = datetime.now(UTC)
+    db.commit()
+
+    cli.seed(db, CFG, _realm())
+
+    assert db.query(App).count() == 1
+    assert db.query(App).filter(App.deleted_at.is_(None)).count() == 0
+
+
+def test_seed_keeps_using_a_live_app_of_the_same_name(db, pod_repo):
+    from datetime import UTC, datetime
+
+    cli.seed(db, CFG, _realm())
+    first = db.query(App).one()
+    first.deleted_at = datetime.now(UTC)
+    db.add(App(name=first.name, userId=first.userId, git_link=first.git_link, is_private=False))
+    db.commit()
+
+    cli.seed(db, CFG, _realm())
+
+    assert db.query(App).filter(App.deleted_at.is_(None)).count() == 1
+
+
 def test_seed_skips_apps_whose_repository_is_not_allowed(db, pod_repo):
     cfg = {"apps": [{"name": "evil", "gitLink": "https://evil.example.org/x/y", "versions": ["v1"]}]}
 
