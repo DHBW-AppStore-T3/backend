@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.k8s.render import DeploymentCtx
 from app.models import (
-    RUNTIME_K8S,
+    CLUSTER_RUNTIMES,
     RUNTIME_VM,
     Deployment,
     Task,
@@ -494,7 +494,7 @@ def count_live_workloads(db: Session, user_id: UUID) -> int:
     total = (
         db.query(func.coalesce(func.sum(Deployment.k8s_workloads), 0))
         .filter(Deployment.userId == user_id)
-        .filter(Deployment.runtime == RUNTIME_K8S)
+        .filter(Deployment.runtime.in_(CLUSTER_RUNTIMES))
         .filter(Deployment.deleted_at.is_(None))
         .filter(~_is_destroyed_subq())
         .scalar()
@@ -526,7 +526,7 @@ def create_deployment(
     if deployment.userInputVar is not None:
         user_input_var_json = json.dumps(deployment.userInputVar)
 
-    deployment_id, namespace = _free_pod_identity(db) if runtime == RUNTIME_K8S else (uuid.uuid4(), None)
+    deployment_id, namespace = _free_pod_identity(db) if runtime in CLUSTER_RUNTIMES else (uuid.uuid4(), None)
     db_deployment = Deployment(
         deploymentId=deployment_id,
         name=deployment.name,

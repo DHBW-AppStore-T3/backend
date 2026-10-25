@@ -28,6 +28,7 @@ from app.k8s.render import Member, workload_refs
 from app.k8s.render import Team as RenderTeam
 from app.k8s.spec import MAX_FILE_VARIABLE_BYTES, parse_size_bytes
 from app.models import (
+    CLUSTER_RUNTIMES,
     RUNTIME_K8S,
     RUNTIME_KUBEVIRT,
     RUNTIME_VM,
@@ -691,7 +692,7 @@ def delete_deployment(
     # A pod deployment always goes through a destroy: even a cancelled one
     # may have created its namespace before the cancel arrived, and hiding
     # the row would leave the namespace running with nobody to see it.
-    if deployment.runtime == RUNTIME_K8S:
+    if deployment.runtime in CLUSTER_RUNTIMES:
         return _dispatch_destroy(db, deployment, current_user)
 
     # No resources to clean up (cancelled, or anything else terminal):
@@ -1261,12 +1262,12 @@ def list_deployment_resources(
     # operate rights; this endpoint is read-only.
     ensure_view_deployment_owner(current_user, deployment, db)
 
-    if deployment.runtime == RUNTIME_K8S:
+    if deployment.runtime in CLUSTER_RUNTIMES:
         # The namespace is the state; nothing of it is cached here.
         rows = k8s_status.workload_views(deployment_id, deployment.k8s_namespace or "")
         return DeploymentResourceListResponse(
             resources=[],
-            runtime=RUNTIME_K8S,
+            runtime=deployment.runtime,
             workloads=[PodWorkloadSchema.model_validate(r) for r in rows or []],
             live=rows is not None,
         )
@@ -1427,7 +1428,7 @@ def redeploy_deployment_resource(
 
 def _refuse_pods(deployment) -> None:
     """422 for the OpenStack resource endpoints on a pod deployment (they have workloads)."""
-    if deployment.runtime == RUNTIME_K8S:
+    if deployment.runtime in CLUSTER_RUNTIMES:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={
@@ -1456,7 +1457,7 @@ def _dispatch_workload_action(
     if not deployment:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deployment not found")
     ensure_operate_deployment(current_user, deployment, db)
-    if deployment.runtime != RUNTIME_K8S:
+    if deployment.runtime not in CLUSTER_RUNTIMES:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={
@@ -1632,7 +1633,7 @@ def cancel_deployment(
         # VM: reap the Packer build the cancel interrupted. Pods: the destroy
         # removes the namespace with everything the deploy created.
         extra_kwargs=(
-            {"sweep_build_artifacts": True} if deployment.runtime != RUNTIME_K8S else None
+            {"sweep_build_artifacts": True} if deployment.runtime not in CLUSTER_RUNTIMES else None
         ),
         after_task_id=blocking_task_id,
     )

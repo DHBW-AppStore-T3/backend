@@ -250,6 +250,44 @@ def test_a_pod_app_deploys_without_an_openstack_credential(client, db, mock_user
     assert response.json()["runtime"] == "kubernetes"
 
 
+KUBEVIRT_SPEC = {
+    "apiVersion": "appstore/v2",
+    "name": "windows-matlab-app",
+    "runtime": "kubevirt-vm",
+    "scope": "user",
+    "vm": {"cpuCores": 4, "memoryGiB": 8, "diskGiB": 90, "imageRef": "windows11-matlab-golden"},
+    "egress": "internet",
+    "access": [
+        {"type": "url", "template": "https://{workload}-{deployment}.apps.{zone}"},
+        {"type": "password", "from": "generated-password", "username": "{user}"},
+    ],
+}
+
+
+def test_a_kubevirt_app_is_submitted_deployed_and_kept_as_a_cluster_app(client, db, mock_user, pod_repo, sent):
+    pod_repo(KUBEVIRT_SPEC)
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+
+    runtime = client.get(f"/apps/{app.appId}/runtime", params={"version": "v1.0"}).json()
+    submitted = _submit_and_approve(client, db, app)
+    response = _deploy(client, app, teams=[_team("Team-1", alice)])
+
+    assert (runtime["runtime"], runtime["scope"]) == ("kubevirt-vm", "user")
+    assert submitted["runtime"] == "kubevirt-vm" and submitted["spec_sha256"]
+    assert response.status_code == 201, response.text
+    name, kwargs = _job(sent)
+    assert name == "pods.deploy_vm_application"
+    assert kwargs["openstack_envelope"] == {}
+    assert kwargs["spec"]["vm"]["imageRef"] == "windows11-matlab-golden"
+    deployment_id = uuid.UUID(response.json()["deploymentId"])
+    row = db.get(Deployment, deployment_id)
+    assert (row.runtime, row.os_project_id, row.k8s_workloads) == ("kubevirt-vm", None, 1)
+    # Without its namespace the orphan sweep would delete the running VM.
+    assert row.k8s_namespace == f"dep-{deployment_id.hex[:8]}"
+    assert response.json()["runtime"] == "kubevirt-vm"
+
+
 def test_a_supplied_credential_is_ignored_for_pods(client, db, mock_user, pod_repo, sent):
     app = _app(db, mock_user, is_private=True)
     response = _deploy(client, app, teams=[_team("T", _student(db, "c"))], credential=add_credential(db, mock_user))
