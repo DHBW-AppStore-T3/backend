@@ -17,6 +17,8 @@ from app.services.packer_discovery import (
     discover_packer_templates,
 )
 
+pytestmark = pytest.mark.unit
+
 
 def _touch(path: str, content: str = "") -> None:
     """Create file + parent dirs. Stdlib-only so the helper stays

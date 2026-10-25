@@ -2,11 +2,14 @@ import re
 import urllib.parse
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.main import app
 from app.models import Course, User, UserRole
+
+pytestmark = pytest.mark.integration
 
 
 def test_lti13_routes_registered():

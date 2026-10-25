@@ -4,6 +4,8 @@ from pydantic import ValidationError
 
 from app.config import Settings
 
+pytestmark = pytest.mark.unit
+
 GOOD_KEY = "kZ1V3mEJqvGQ7yVxN7kT9mH4cP0sR2aB6dF8gJ1lK3o="  # random, unpublished
 CI_KEY = "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U="
 

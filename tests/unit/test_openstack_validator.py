@@ -133,7 +133,6 @@ def test_openstack_simulate_refused_in_production(monkeypatch):
             DATABASE_URL="postgresql://u:p@db/x",
             CREDENTIAL_ENCRYPTION_KEY=key,
             LTI13_SESSION_SECRET="a" * 32,
-            HANDOFF_SESSION_SECRET="b" * 32,
         )
 
 

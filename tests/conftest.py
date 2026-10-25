@@ -116,6 +116,30 @@ TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engin
 
 
 # ----------------------------------------------------------------
+# Marker-Pflicht
+# ----------------------------------------------------------------
+def pytest_collection_modifyitems(config, items):
+    """Refuse tests that CI would never run.
+
+    CI runs ``pytest -m unit`` and ``pytest -m integration`` and nothing
+    else, so a test with neither marker passes or fails unseen. Mark a whole
+    file with ``pytestmark = pytest.mark.unit`` (no database: put it in
+    ``tests/unit/``) or ``pytest.mark.integration``.
+    """
+    unmarked = sorted(
+        {
+            item.nodeid.split("::")[0]
+            for item in items
+            if item.get_closest_marker("unit") is None and item.get_closest_marker("integration") is None
+        }
+    )
+    if unmarked:
+        raise pytest.UsageError(
+            "tests without a 'unit' or 'integration' marker are never run by CI: " + ", ".join(unmarked)
+        )
+
+
+# ----------------------------------------------------------------
 # Schema-Lifecycle — einmal pro pytest-Session.
 # ----------------------------------------------------------------
 @pytest.fixture(scope="session", autouse=True)
