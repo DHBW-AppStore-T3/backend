@@ -254,8 +254,6 @@ class DeploymentResponse(DeploymentBase):
     releaseTag: str | None = None
     # The commit every job of the deployment runs.
     commit_sha: str | None = None
-    # ``kubernetes`` (pods, .github#4); a row of the removed VM path says
-    # ``openstack-vm``.
     runtime: str = "kubernetes"
     userInputVar: dict[str, Any] | None = None
     status: str | None = None  # From latest task
