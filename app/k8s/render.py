@@ -237,16 +237,27 @@ def _storage_mib(spec: AppSpec) -> int:
     return parse_storage_mib(spec.workload.storage.size)
 
 
-def _namespace(dep: DeploymentCtx, settings: RenderSettings) -> dict[str, Any]:
+def _namespace_object(
+    dep: DeploymentCtx,
+    settings: RenderSettings,
+    pod_security: str,
+    extra_labels: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """The deployment's Namespace; ``pod_security`` is the Pod Security level it enforces."""
     meta = _meta(dep.namespace, dep, namespaced=False)
     meta["labels"] = {
         **meta["labels"],
-        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce": pod_security,
         "pod-security.kubernetes.io/enforce-version": "latest",
+        **(extra_labels or {}),
     }
     if settings.environment:
         meta["labels"][ENVIRONMENT_LABEL] = label_value(settings.environment)
     return {"apiVersion": "v1", "kind": "Namespace", "metadata": meta}
+
+
+def _namespace(dep: DeploymentCtx, settings: RenderSettings) -> dict[str, Any]:
+    return _namespace_object(dep, settings, "restricted")
 
 
 def _quota_and_limits(spec: AppSpec, dep: DeploymentCtx, n: int) -> list[dict[str, Any]]:
@@ -291,91 +302,169 @@ def _quota_and_limits(spec: AppSpec, dep: DeploymentCtx, n: int) -> list[dict[st
     return [quota, limit_range]
 
 
+def _netpol(dep: DeploymentCtx, name: str, body: dict[str, Any], pod_selector: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": _meta(name, dep),
+        "spec": {"podSelector": pod_selector, **body},
+    }
+
+
+def _np_default_deny(dep: DeploymentCtx) -> dict[str, Any]:
+    return _netpol(dep, "default-deny", {"policyTypes": ["Ingress", "Egress"]}, {})
+
+
+def _np_allow_ingress_controller(
+    dep: DeploymentCtx, settings: RenderSettings, port: int, pod_selector: dict[str, Any]
+) -> dict[str, Any]:
+    """The ingress controller's namespace may reach ``port`` of the selected pods."""
+    return _netpol(
+        dep,
+        "allow-ingress-controller",
+        {
+            "policyTypes": ["Ingress"],
+            "ingress": [
+                {
+                    "from": [
+                        {
+                            "namespaceSelector": {
+                                "matchLabels": {"kubernetes.io/metadata.name": settings.ingress_namespace}
+                            }
+                        }
+                    ],
+                    "ports": [{"protocol": "TCP", "port": port}],
+                }
+            ],
+        },
+        pod_selector,
+    )
+
+
+def _np_allow_dns(dep: DeploymentCtx) -> dict[str, Any]:
+    return _netpol(
+        dep,
+        "allow-dns",
+        {
+            "policyTypes": ["Egress"],
+            "egress": [
+                {
+                    "to": [
+                        {
+                            "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
+                            "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
+                        }
+                    ],
+                    "ports": [
+                        {"protocol": "UDP", "port": 53},
+                        {"protocol": "TCP", "port": 53},
+                    ],
+                }
+            ],
+        },
+        {},
+    )
+
+
+def _np_allow_egress_internet(
+    dep: DeploymentCtx, settings: RenderSettings, pod_selector: dict[str, Any]
+) -> dict[str, Any]:
+    """Internet for the selected pods, without pod/service/node networks, private and link-local ranges."""
+    extra = list(settings.extra_egress_except)
+    v4 = _EGRESS_EXCEPT_V4 + [c for c in extra if ":" not in c]
+    v6 = _EGRESS_EXCEPT_V6 + [c for c in extra if ":" in c]
+    return _netpol(
+        dep,
+        "allow-egress-internet",
+        {
+            "policyTypes": ["Egress"],
+            "egress": [
+                {"to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": v4}}]},
+                {"to": [{"ipBlock": {"cidr": "::/0", "except": v6}}]},
+            ],
+        },
+        pod_selector,
+    )
+
+
+def _np_allow_intra_namespace(
+    dep: DeploymentCtx,
+    peer: list[dict[str, Any]],
+    pod_selector: dict[str, Any],
+    ports: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Both directions between the selected pods and ``peer`` (default-deny blocks both).
+
+    Without ``ports`` every port is open.
+    """
+    port_part = {"ports": ports} if ports else {}
+    return _netpol(
+        dep,
+        "allow-intra-namespace",
+        {
+            "policyTypes": ["Ingress", "Egress"],
+            "ingress": [{"from": peer, **port_part}],
+            "egress": [{"to": peer, **port_part}],
+        },
+        pod_selector,
+    )
+
+
 def _network_policies(spec: AppSpec, dep: DeploymentCtx, settings: RenderSettings) -> list[dict[str, Any]]:
     assert spec.workload is not None
     port = next(c.expose.port for c in spec.workload.containers if c.expose)
-
-    def policy(name: str, body: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "apiVersion": "networking.k8s.io/v1",
-            "kind": "NetworkPolicy",
-            "metadata": _meta(name, dep),
-            "spec": {"podSelector": {}, **body},
-        }
-
     policies = [
-        policy("default-deny", {"policyTypes": ["Ingress", "Egress"]}),
-        policy(
-            "allow-ingress-controller",
-            {
-                "policyTypes": ["Ingress"],
-                "ingress": [
-                    {
-                        "from": [
-                            {
-                                "namespaceSelector": {
-                                    "matchLabels": {"kubernetes.io/metadata.name": settings.ingress_namespace}
-                                }
-                            }
-                        ],
-                        "ports": [{"protocol": "TCP", "port": port}],
-                    }
-                ],
-            },
-        ),
-        policy(
-            "allow-dns",
-            {
-                "policyTypes": ["Egress"],
-                "egress": [
-                    {
-                        "to": [
-                            {
-                                "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
-                                "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
-                            }
-                        ],
-                        "ports": [
-                            {"protocol": "UDP", "port": 53},
-                            {"protocol": "TCP", "port": 53},
-                        ],
-                    }
-                ],
-            },
-        ),
+        _np_default_deny(dep),
+        _np_allow_ingress_controller(dep, settings, port, {}),
+        _np_allow_dns(dep),
     ]
     if spec.egress == "internet":
-        extra = list(settings.extra_egress_except)
-        v4 = _EGRESS_EXCEPT_V4 + [c for c in extra if ":" not in c]
-        v6 = _EGRESS_EXCEPT_V6 + [c for c in extra if ":" in c]
-        policies.append(
-            policy(
-                "allow-egress-internet",
-                {
-                    "policyTypes": ["Egress"],
-                    "egress": [
-                        {"to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": v4}}]},
-                        {"to": [{"ipBlock": {"cidr": "::/0", "except": v6}}]},
-                    ],
-                },
-            )
-        )
+        policies.append(_np_allow_egress_internet(dep, settings, {}))
     if spec.pod_network == "namespace":
-        # Both directions: default-deny blocks both. No namespaceSelector or
-        # ipBlock, so it reaches only pods of this deployment's namespace.
-        peer = [{"podSelector": {}}]
-        ports = [{"protocol": "TCP", "port": port}]
-        policies.append(
-            policy(
-                "allow-intra-namespace",
-                {
-                    "policyTypes": ["Ingress", "Egress"],
-                    "ingress": [{"from": peer, "ports": ports}],
-                    "egress": [{"to": peer, "ports": ports}],
-                },
-            )
-        )
+        # No namespaceSelector or ipBlock, so it reaches only pods of this
+        # deployment's namespace; the admission policy demands TCP ports here.
+        policies.append(_np_allow_intra_namespace(dep, [{"podSelector": {}}], {}, [{"protocol": "TCP", "port": port}]))
     return policies
+
+
+def _ingress(dep: DeploymentCtx, settings: RenderSettings, name: str, path: str) -> dict[str, Any]:
+    """Ingress of the Service ``name`` (port ``http``) at ``<name>-<deployment>.<app domain>``.
+
+    Always a tls section: without one the ingress controller serves plain HTTP only.
+    No secretName means the controller's default certificate (a cluster wildcard).
+    """
+    meta = _meta(name, dep, name)
+    if settings.cluster_issuer:
+        meta["annotations"] = {"cert-manager.io/cluster-issuer": settings.cluster_issuer}
+    host = f"{name}-{dep.short_id}.{settings.app_domain}"
+    tls: dict[str, Any] = {"hosts": [host]}
+    if settings.tls_secret:
+        tls["secretName"] = settings.tls_secret
+    elif settings.cluster_issuer:
+        tls["secretName"] = f"{name}-tls"
+    return {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "Ingress",
+        "metadata": meta,
+        "spec": {
+            "ingressClassName": settings.ingress_class,
+            "rules": [
+                {
+                    "host": host,
+                    "http": {
+                        "paths": [
+                            {
+                                "path": path,
+                                "pathType": "Prefix",
+                                "backend": {"service": {"name": name, "port": {"name": "http"}}},
+                            }
+                        ]
+                    },
+                }
+            ],
+            "tls": [tls],
+        },
+    }
 
 
 def _env_entries(c: Container, ref: WorkloadRef) -> list[dict[str, Any]]:
@@ -582,41 +671,7 @@ def _workload_objects(
             "ports": [{"name": "http", "port": exposed.expose.port, "targetPort": "http"}],
         },
     }
-    ingress_meta = _meta(ref.name, dep, ref.name)
-    if settings.cluster_issuer:
-        ingress_meta["annotations"] = {"cert-manager.io/cluster-issuer": settings.cluster_issuer}
-    host = ref.host(dep, settings)
-    ingress_spec: dict[str, Any] = {
-        "ingressClassName": settings.ingress_class,
-        "rules": [
-            {
-                "host": host,
-                "http": {
-                    "paths": [
-                        {
-                            "path": exposed.expose.path,
-                            "pathType": "Prefix",
-                            "backend": {"service": {"name": ref.name, "port": {"name": "http"}}},
-                        }
-                    ]
-                },
-            }
-        ],
-    }
-    # Always a tls section: without one the ingress controller serves plain HTTP only.
-    # No secretName means the controller's default certificate (a cluster wildcard).
-    tls: dict[str, Any] = {"hosts": [host]}
-    if settings.tls_secret:
-        tls["secretName"] = settings.tls_secret
-    elif settings.cluster_issuer:
-        tls["secretName"] = f"{ref.name}-tls"
-    ingress_spec["tls"] = [tls]
-    ingress = {
-        "apiVersion": "networking.k8s.io/v1",
-        "kind": "Ingress",
-        "metadata": ingress_meta,
-        "spec": ingress_spec,
-    }
+    ingress = _ingress(dep, settings, ref.name, exposed.expose.path)
     objects = [secret]
     if file_items:
         objects.append(
@@ -633,17 +688,7 @@ def _workload_objects(
 
 def _vm_namespace(dep: DeploymentCtx, settings: RenderSettings) -> dict[str, Any]:
     """Namespace for a kubevirt-vm deployment; PSS privileged (virt-launcher needs it)."""
-    meta = _meta(dep.namespace, dep, namespaced=False)
-    meta["labels"] = {
-        **meta["labels"],
-        # privileged PSS so virt-launcher can run
-        "pod-security.kubernetes.io/enforce": "privileged",
-        "pod-security.kubernetes.io/enforce-version": "latest",
-        VM_NAMESPACE_LABEL: "true",
-    }
-    if settings.environment:
-        meta["labels"][ENVIRONMENT_LABEL] = label_value(settings.environment)
-    return {"apiVersion": "v1", "kind": "Namespace", "metadata": meta}
+    return _namespace_object(dep, settings, "privileged", {VM_NAMESPACE_LABEL: "true"})
 
 
 def vm_clone_grant_name(dep: DeploymentCtx) -> str:
@@ -678,59 +723,15 @@ def _vm_network_policies(spec: AppSpec, dep: DeploymentCtx, settings: RenderSett
     through a pod port. The VM itself gets DNS, and internet / the other VMs of
     the namespace when the app (or the person, see ``userChoices``) allows it.
     """
-
-    def policy(name: str, body: dict[str, Any], role: str | None = None) -> dict[str, Any]:
-        selector = {"matchLabels": {ROLE_LABEL: role}} if role else {}
-        return {
-            "apiVersion": "networking.k8s.io/v1",
-            "kind": "NetworkPolicy",
-            "metadata": _meta(name, dep),
-            "spec": {"podSelector": selector, **body},
-        }
-
+    proxy = {"matchLabels": {ROLE_LABEL: ROLE_VNC_PROXY}}
+    vm = {"matchLabels": {ROLE_LABEL: ROLE_VM}}
     policies = [
-        policy("default-deny", {"policyTypes": ["Ingress", "Egress"]}),
-        policy(
-            "allow-ingress-controller",
-            {
-                "policyTypes": ["Ingress"],
-                "ingress": [
-                    {
-                        "from": [
-                            {
-                                "namespaceSelector": {
-                                    "matchLabels": {"kubernetes.io/metadata.name": settings.ingress_namespace}
-                                }
-                            }
-                        ],
-                        "ports": [{"protocol": "TCP", "port": 8080}],
-                    }
-                ],
-            },
-            ROLE_VNC_PROXY,
-        ),
-        policy(
-            "allow-dns",
-            {
-                "policyTypes": ["Egress"],
-                "egress": [
-                    {
-                        "to": [
-                            {
-                                "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
-                                "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
-                            }
-                        ],
-                        "ports": [
-                            {"protocol": "UDP", "port": 53},
-                            {"protocol": "TCP", "port": 53},
-                        ],
-                    }
-                ],
-            },
-        ),
+        _np_default_deny(dep),
+        _np_allow_ingress_controller(dep, settings, 8080, proxy),
+        _np_allow_dns(dep),
         # The proxy talks to the API server (kubernetes.default: service port 443, node port 6443).
-        policy(
+        _netpol(
+            dep,
             "allow-vnc-proxy-to-apiserver",
             {
                 "policyTypes": ["Egress"],
@@ -741,36 +742,14 @@ def _vm_network_policies(spec: AppSpec, dep: DeploymentCtx, settings: RenderSett
                     }
                 ],
             },
-            ROLE_VNC_PROXY,
+            proxy,
         ),
     ]
     if spec.egress == "internet":
-        extra = list(settings.extra_egress_except)
-        v4 = _EGRESS_EXCEPT_V4 + [c for c in extra if ":" not in c]
-        v6 = _EGRESS_EXCEPT_V6 + [c for c in extra if ":" in c]
-        policies.append(
-            policy(
-                "allow-egress-internet",
-                {
-                    "policyTypes": ["Egress"],
-                    "egress": [
-                        {"to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": v4}}]},
-                        {"to": [{"ipBlock": {"cidr": "::/0", "except": v6}}]},
-                    ],
-                },
-                ROLE_VM,
-            )
-        )
+        policies.append(_np_allow_egress_internet(dep, settings, vm))
     if spec.pod_network == "namespace":
         # The VMs of this namespace see each other (any port); the proxies are not part of it.
-        peer = [{"podSelector": {"matchLabels": {ROLE_LABEL: ROLE_VM}}}]
-        policies.append(
-            policy(
-                "allow-intra-namespace",
-                {"policyTypes": ["Ingress", "Egress"], "ingress": [{"from": peer}], "egress": [{"to": peer}]},
-                ROLE_VM,
-            )
-        )
+        policies.append(_np_allow_intra_namespace(dep, [{"podSelector": vm}], vm))
     return policies
 
 
@@ -940,43 +919,7 @@ def _vm_workload_objects(
     }
 
     # Ingress for noVNC (browser access)
-    host = f"{novnc_name}-{dep.short_id}.{settings.app_domain}"
-    ingress_meta = _meta(novnc_name, dep, novnc_name)
-    if settings.cluster_issuer:
-        ingress_meta["annotations"] = {"cert-manager.io/cluster-issuer": settings.cluster_issuer}
-    tls_block: dict[str, Any] = {"hosts": [host]}
-    if settings.tls_secret:
-        tls_block["secretName"] = settings.tls_secret
-    elif settings.cluster_issuer:
-        tls_block["secretName"] = f"{novnc_name}-tls"
-    ingress: dict[str, Any] = {
-        "apiVersion": "networking.k8s.io/v1",
-        "kind": "Ingress",
-        "metadata": ingress_meta,
-        "spec": {
-            "ingressClassName": settings.ingress_class,
-            "rules": [
-                {
-                    "host": host,
-                    "http": {
-                        "paths": [
-                            {
-                                "path": "/",
-                                "pathType": "Prefix",
-                                "backend": {
-                                    "service": {
-                                        "name": novnc_name,
-                                        "port": {"name": "http"},
-                                    }
-                                },
-                            }
-                        ]
-                    },
-                }
-            ],
-            "tls": [tls_block],
-        },
-    }
+    ingress = _ingress(dep, settings, novnc_name, "/")
 
     return [
         vnc_secret,
@@ -1008,6 +951,10 @@ def render_vm(
     if missing:
         raise ValueError(f"missing passwords for workloads: {', '.join(missing)}")
 
+    # No ResourceQuota/LimitRange here, on purpose: the admission policy demands
+    # limits.cpu/limits.memory in every quota, and a quota with them rejects each
+    # pod without limits (KubeVirt's virt-launcher, CDI clone pods). Capping the
+    # VM namespaces needs limits on those pods first.
     objects: list[dict[str, Any]] = [
         _vm_namespace(dep, settings),
         *_vm_network_policies(spec, dep, settings),

@@ -507,7 +507,7 @@ def create_deployment(
         loaded_spec = app_spec.with_network_overrides(
             loaded_spec, deployment.userInputVar.get("network")
         )
-        workloads = _check_pod_workloads(db, current_user, loaded_spec, deployment.teams or [])
+        workloads = _check_cluster_workloads(db, current_user, loaded_spec, deployment.teams or [])
 
     db_deployment = crud_deployments.create_deployment(
         db,
@@ -738,7 +738,10 @@ def _fetch_dispatch_envelope(db: Session, user: User, deployment) -> dict:
 
 # The job each (runtime, task type) runs. VM jobs go to the ``vm`` queue
 # (OpenTofu/Packer executor, no cluster rights), pod jobs to ``pods`` (the pod
-# deployer, no OpenTofu, no root); see ``app.celery_app``.
+# deployer, no OpenTofu, no root); see ``app.celery_app``. Historic naming: the
+# ``pods.*`` tasks and queue came first and now also serve kubevirt-vm
+# deployments (``pods.deploy_vm_application``). Deployed workers and queued
+# tasks use these names, so they are not renamed.
 _TASK_NAMES = {
     (RUNTIME_VM, TaskType.DEPLOY): "tasks.deploy_application",
     (RUNTIME_VM, TaskType.DESTROY): "tasks.destroy_deployment",
@@ -775,8 +778,8 @@ def _render_teams(db: Session, teams) -> list[RenderTeam]:
     return out
 
 
-def _check_pod_workloads(db: Session, owner: User, loaded_spec, teams) -> int:
-    """The number of workloads a pod deployment will run; refuses what the platform does not allow.
+def _check_cluster_workloads(db: Session, owner: User, loaded_spec, teams) -> int:
+    """The number of workloads a pod or VM deployment will run; refuses what the platform does not allow.
 
     422 ``team_names_collide`` when two team names normalise to the same
     workload name, 422 ``no_workloads`` without members to run anything for,
