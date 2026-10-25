@@ -12,6 +12,7 @@ from fastapi import HTTPException, status
 
 from app.models import OpenStackAuthType
 from app.schemas import OpenStackCredentialUpsert
+from app.utils import safe_yaml
 
 _SUPPORTED_AUTH_TYPES = {
     "v3applicationcredential": OpenStackAuthType.APPLICATION_CREDENTIAL,
@@ -28,7 +29,9 @@ def _bad(msg: str) -> HTTPException:
 
 def parse(clouds_yaml: str, cloud_name: str | None = None) -> OpenStackCredentialUpsert:
     try:
-        doc = yaml.safe_load(clouds_yaml)
+        doc = safe_yaml.load(clouds_yaml)
+    except safe_yaml.UnsafeYaml as e:
+        raise _bad(str(e))
     except yaml.YAMLError as e:
         raise _bad(f"Invalid YAML: {e}")
 

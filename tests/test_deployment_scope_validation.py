@@ -87,7 +87,7 @@ def test_file_extension_filter_skipped_without_definitions():
     usable from older code paths that don't yet load definitions."""
     out = attach_files_to_user_input(
         user_input_var={"terraform": {}, "packer": {}},
-        files={"some_var": {"all": _payload("anything.tar", b"...")}},
+        files={"some_var": {"all": _payload("anything.dat", b"...")}},
         variable_definitions=None,
     )
     assert "some_var" in out["terraform"]

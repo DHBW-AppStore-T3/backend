@@ -44,6 +44,13 @@ class Settings(BaseSettings):
     # deployment step that runs that command needs it.
     WORKER_DB_PASSWORD: str = ""
 
+    # Virus scan of uploaded files (ClamAV daemon, ``app/services/malware_scan.py``). Empty
+    # ``CLAMD_HOST``: no scan. Once a host is set, scanning is mandatory: an upload is refused
+    # (503) while the daemon cannot be reached.
+    CLAMD_HOST: str = ""
+    CLAMD_PORT: int = 3310
+    CLAMD_TIMEOUT: float = 20.0
+
     # Git: app repositories are public and read anonymously (.github#7 B).
     # Apps may only be registered from these hosts (comma-separated, exact
     # names); the worker checks the same list before it clones.

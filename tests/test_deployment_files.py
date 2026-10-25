@@ -189,7 +189,7 @@ def test_detail_endpoint_strips_file_bytes(
     cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
-    pdf = b"PDF data" * 100
+    pdf = b"%PDF-1.4\n" + b"PDF data" * 100
     create = client.post(
         "/deployments/",
         json={
@@ -259,7 +259,7 @@ def test_download_endpoint_returns_owner_bytes(
 def test_upload_names_are_stored_without_paths_or_header_breakers(client, db, mock_user, patched_celery):
     cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
-    payload_bytes = b"x"
+    payload_bytes = b"%PDF-1.4 x"
     create = client.post(
         "/deployments/",
         json={
@@ -272,7 +272,7 @@ def test_upload_names_are_stored_without_paths_or_header_breakers(client, db, mo
                     "all": {
                         "name": '../../etc/cron.d/a"\r\nSet-Cookie: x=1.pdf',
                         "content_b64": _b64(payload_bytes),
-                        "size": 1,
+                        "size": len(payload_bytes),
                         "content_type": "text/html",
                     }
                 }
