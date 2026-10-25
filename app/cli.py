@@ -19,9 +19,9 @@ undone):
   - the apps of the config file are registered (public, owned by the first
     admin); a version without any review entry is submitted and approved.
     A version an admin rejected or revoked stays so, and a submission of
-    somebody else waits for its review. An app somebody deleted is not
-    registered again, and an app of the same name that a teacher owns is
-    left alone
+    somebody else waits for its review. An app is the demo app only with
+    the configured name and repository, and one somebody deleted is not
+    registered again
 """
 
 import argparse
@@ -138,12 +138,17 @@ def seed_apps(db: Session, owner: User, apps: list[dict]) -> None:
     from app.routers.apps import _submit_at, ensure_allowed_git_link, resolve_version_commit
 
     for a in apps:
-        # Only an admin's app is the demo app: names are not unique, and the
-        # versions of a teacher's app of the same name must not be approved here.
+        try:
+            link = ensure_allowed_git_link(a["gitLink"]) if a.get("gitLink") else None
+        except HTTPException as exc:
+            log.warning("app %s not created: %s", a["name"], _detail(exc))
+            continue
+        # The demo app is the app with this name AND this repository: names are
+        # not unique, and the versions of somebody's app of the same name from
+        # another repository must not be approved here.
         rows = (
             db.query(App)
-            .join(User, App.userId == User.userId)
-            .filter(App.name == a["name"], User.role == UserRole.ADMIN)
+            .filter(App.name == a["name"], (App.git_link == link) if link else App.git_link.is_(None))
             .order_by(App.created_at)
             .all()
         )
@@ -153,7 +158,6 @@ def seed_apps(db: Session, owner: User, apps: list[dict]) -> None:
             continue
         if row is None:
             try:
-                link = ensure_allowed_git_link(a["gitLink"]) if a.get("gitLink") else None
                 if link:
                     access = git_service.verify_repository_access(link)
                     if not access["success"]:

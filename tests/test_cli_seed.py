@@ -166,19 +166,33 @@ def test_seed_keeps_using_a_live_app_of_the_same_name(db, pod_repo):
     assert db.query(App).filter(App.deleted_at.is_(None)).count() == 1
 
 
-def test_seed_never_approves_a_teachers_app_of_the_same_name(db, pod_repo):
+def _teachers_app(db, git_link):
     cli.seed(db, {"apps": []}, _realm())
     teacher = db.query(User).filter_by(username="dozent").one()
-    theirs = App(name="ide", userId=teacher.userId, git_link="https://github.com/someone/ide", is_private=True)
-    db.add(theirs)
+    app = App(name="ide", userId=teacher.userId, git_link=git_link, is_private=True)
+    db.add(app)
     db.commit()
+    return app
+
+
+def test_seed_never_approves_an_app_of_the_same_name_from_another_repository(db, pod_repo):
+    theirs = _teachers_app(db, "https://github.com/someone/ide")
 
     cli.seed(db, CFG, _realm())
 
     assert db.query(AppVersionApproval).filter_by(appId=theirs.appId).count() == 0
     ours = db.query(App).filter(App.appId != theirs.appId).one()
-    assert db.get(User, ours.userId).role == UserRole.ADMIN
+    assert ours.git_link == "https://github.com/example/ide"
     assert db.query(AppVersionApproval).filter_by(appId=ours.appId).one().status == AppVersionApprovalStatus.APPROVED
+
+
+def test_seed_uses_an_app_somebody_registered_from_the_configured_repository(db, pod_repo):
+    theirs = _teachers_app(db, "https://github.com/example/ide")
+
+    cli.seed(db, CFG, _realm())
+
+    assert db.query(App).count() == 1
+    assert db.query(AppVersionApproval).filter_by(appId=theirs.appId).one().status == AppVersionApprovalStatus.APPROVED
 
 
 def test_seed_skips_apps_whose_repository_is_not_allowed(db, pod_repo):
