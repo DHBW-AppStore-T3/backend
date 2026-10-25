@@ -410,6 +410,8 @@ class VmSpec(_Strict):
     # Namespace that holds the golden-image PVC (defaults to vm-poc for PoC)
     image_namespace: str = Field(default="vm-poc", alias="imageNamespace")
     storage_class: str = Field(default="cinder", alias="storageClass")
+    # Reserved: accepted (app specs set it and the model forbids unknown keys) but
+    # not read by the renderer; every VM gets the noVNC proxy regardless.
     vnc_access: bool = Field(default=True, alias="vncAccess")
 
     @model_validator(mode="after")
