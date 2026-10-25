@@ -24,7 +24,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from app.k8s.spec import AppSpec, Container, parse_cpu_millicores, parse_memory_mib, parse_storage_mib
+from app.k8s.spec import AppSpec, Container, VmSpec, parse_cpu_millicores, parse_memory_mib, parse_storage_mib
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -588,6 +588,308 @@ def _workload_objects(
             }
         )
     return [*objects, statefulset, service, ingress]
+
+
+def _vm_namespace(dep: DeploymentCtx, settings: RenderSettings) -> dict[str, Any]:
+    """Namespace for a kubevirt-vm deployment; PSS privileged (virt-launcher needs it)."""
+    meta = _meta(dep.namespace, dep, namespaced=False)
+    meta["labels"] = {
+        **meta["labels"],
+        # privileged PSS so virt-launcher can run
+        "pod-security.kubernetes.io/enforce": "privileged",
+        "pod-security.kubernetes.io/enforce-version": "latest",
+        f"{LABEL_PREFIX}/vm-namespace": "true",
+    }
+    if settings.environment:
+        meta["labels"][ENVIRONMENT_LABEL] = label_value(settings.environment)
+    return {"apiVersion": "v1", "kind": "Namespace", "metadata": meta}
+
+
+def _vm_network_policies(dep: DeploymentCtx, settings: RenderSettings) -> list[dict[str, Any]]:
+    """Default-deny + ingress-controller + DNS for VM namespaces (no pod port known upfront)."""
+
+    def policy(name: str, body: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": _meta(name, dep),
+            "spec": {"podSelector": {}, **body},
+        }
+
+    return [
+        policy("default-deny", {"policyTypes": ["Ingress", "Egress"]}),
+        policy(
+            "allow-ingress-controller",
+            {
+                "policyTypes": ["Ingress"],
+                "ingress": [
+                    {
+                        "from": [
+                            {
+                                "namespaceSelector": {
+                                    "matchLabels": {"kubernetes.io/metadata.name": settings.ingress_namespace}
+                                }
+                            }
+                        ],
+                        "ports": [{"protocol": "TCP", "port": 8080}],
+                    }
+                ],
+            },
+        ),
+        policy(
+            "allow-dns",
+            {
+                "policyTypes": ["Egress"],
+                "egress": [
+                    {
+                        "to": [
+                            {
+                                "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
+                                "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
+                            }
+                        ],
+                        "ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}],
+                    }
+                ],
+            },
+        ),
+        # The noVNC proxy pod needs to reach the VM's VNC port inside the namespace
+        policy(
+            "allow-novnc-to-vm-vnc",
+            {
+                "policyTypes": ["Egress"],
+                "egress": [
+                    {
+                        "to": [{"podSelector": {"matchLabels": {"vm.kubevirt.io/name": "desktop"}}}],
+                        "ports": [{"protocol": "TCP", "port": 5900}],
+                    }
+                ],
+            },
+        ),
+    ]
+
+
+def _vm_workload_objects(
+    spec: AppSpec,
+    dep: DeploymentCtx,
+    ref: WorkloadRef,
+    vnc_password: str,
+    settings: RenderSettings,
+) -> list[dict[str, Any]]:
+    """All Kubernetes/KubeVirt objects for one kubevirt-vm workload slot."""
+    assert spec.vm is not None
+    vm = spec.vm
+    workload_name = ref.name
+    disk_name = f"{workload_name}-disk"
+    novnc_name = f"{workload_name}-novnc"
+    namespace = dep.namespace
+
+    labels = _labels(dep, workload_name)
+    novnc_labels = {**labels, WORKLOAD_LABEL: novnc_name}
+
+    # PVC — clone from the golden image in namespace vm-images
+    pvc: dict[str, Any] = {
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": _meta(disk_name, dep, workload_name),
+        "spec": {
+            "storageClassName": vm.storage_class,
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": f"{vm.disk_gib}Gi"}},
+            "dataSourceRef": {
+                "apiGroup": "",
+                "kind": "PersistentVolumeClaim",
+                "name": vm.image_ref,
+                "namespace": "vm-images",
+            },
+        },
+    }
+
+    # VirtualMachine CR
+    virtual_machine: dict[str, Any] = {
+        "apiVersion": "kubevirt.io/v1",
+        "kind": "VirtualMachine",
+        "metadata": {**_meta(workload_name, dep, workload_name), "labels": {**labels, TEAM_LABEL: label_value(ref.team)}},
+        "spec": {
+            "runStrategy": "Always",
+            "template": {
+                "metadata": {"labels": {**labels, "vm.kubevirt.io/name": workload_name}},
+                "spec": {
+                    "domain": {
+                        "cpu": {"cores": vm.cpu_cores},
+                        "memory": {"guest": f"{vm.memory_gib}Gi"},
+                        "devices": {
+                            "disks": [{"name": "root", "disk": {"bus": "sata"}}],
+                            "interfaces": [{"name": "default", "masquerade": {}, "model": "e1000e"}],
+                            "inputs": [{"name": "tablet", "type": "tablet", "bus": "usb"}],
+                            "tpm": {},
+                        },
+                        "features": {"hyperv": {}, "acpi": {}},
+                        "firmware": {"bootloader": {"efi": {"secureBoot": False}}},
+                    },
+                    "networks": [{"name": "default", "pod": {}}],
+                    "volumes": [{"name": "root", "persistentVolumeClaim": {"claimName": disk_name}}],
+                },
+            },
+        },
+    }
+    if ref.user:
+        virtual_machine["metadata"]["labels"][USER_LABEL] = label_value(ref.user.user_id)
+
+    # Service: internal VNC + RDP targeting the virt-launcher pod
+    vm_service: dict[str, Any] = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": _meta(f"{workload_name}-vm", dep, workload_name),
+        "spec": {
+            "type": "ClusterIP",
+            "selector": {"vm.kubevirt.io/name": workload_name},
+            "ports": [
+                {"name": "vnc", "port": 5900, "targetPort": 5900},
+                {"name": "rdp", "port": 3389, "targetPort": 3389},
+            ],
+        },
+    }
+
+    # VNC password secret
+    vnc_secret: dict[str, Any] = {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": _meta(workload_name, dep, workload_name),
+        "type": "Opaque",
+        "stringData": {PASSWORD_KEY: vnc_password},
+    }
+
+    # noVNC proxy deployment — browser-accessible VNC over WebSocket
+    vnc_host = f"{workload_name}-vm.{namespace}.svc.cluster.local"
+    novnc_deploy: dict[str, Any] = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {**_meta(novnc_name, dep, novnc_name), "labels": novnc_labels},
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": {WORKLOAD_LABEL: novnc_name, DEPLOYMENT_LABEL: dep.id}},
+            "template": {
+                "metadata": {"labels": novnc_labels},
+                "spec": {
+                    "automountServiceAccountToken": False,
+                    "enableServiceLinks": False,
+                    "securityContext": {
+                        "runAsNonRoot": True,
+                        "runAsUser": 1000,
+                        "runAsGroup": 1000,
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                    "containers": [
+                        {
+                            "name": "novnc",
+                            "image": "ghcr.io/dhbw-appstore-t3/novnc-proxy:latest",
+                            "ports": [{"name": "http", "containerPort": 8080, "protocol": "TCP"}],
+                            "env": [
+                                {"name": "VNC_HOST", "value": vnc_host},
+                                {"name": "VNC_PORT", "value": "5900"},
+                                {"name": "VNC_PASSWORD", "valueFrom": {"secretKeyRef": {"name": workload_name, "key": PASSWORD_KEY}}},
+                            ],
+                            "securityContext": {
+                                "allowPrivilegeEscalation": False,
+                                "readOnlyRootFilesystem": True,
+                                "runAsNonRoot": True,
+                                "capabilities": {"drop": ["ALL"]},
+                                "seccompProfile": {"type": "RuntimeDefault"},
+                            },
+                            "resources": {
+                                "requests": {"cpu": "50m", "memory": "64Mi"},
+                                "limits": {"cpu": "200m", "memory": "128Mi"},
+                            },
+                            "readinessProbe": {
+                                "tcpSocket": {"port": "http"},
+                                "periodSeconds": 5,
+                                "timeoutSeconds": 2,
+                                "failureThreshold": 3,
+                            },
+                        }
+                    ],
+                },
+            },
+        },
+    }
+
+    # Service for noVNC proxy
+    novnc_service: dict[str, Any] = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": _meta(novnc_name, dep, novnc_name),
+        "spec": {
+            "type": "ClusterIP",
+            "selector": {WORKLOAD_LABEL: novnc_name, DEPLOYMENT_LABEL: dep.id},
+            "ports": [{"name": "http", "port": 8080, "targetPort": "http"}],
+        },
+    }
+
+    # Ingress for noVNC (browser access)
+    host = f"{novnc_name}-{dep.short_id}.{settings.app_domain}"
+    ingress_meta = _meta(novnc_name, dep, novnc_name)
+    if settings.cluster_issuer:
+        ingress_meta["annotations"] = {"cert-manager.io/cluster-issuer": settings.cluster_issuer}
+    tls_block: dict[str, Any] = {"hosts": [host]}
+    if settings.tls_secret:
+        tls_block["secretName"] = settings.tls_secret
+    elif settings.cluster_issuer:
+        tls_block["secretName"] = f"{novnc_name}-tls"
+    ingress: dict[str, Any] = {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "Ingress",
+        "metadata": ingress_meta,
+        "spec": {
+            "ingressClassName": settings.ingress_class,
+            "rules": [
+                {
+                    "host": host,
+                    "http": {
+                        "paths": [
+                            {
+                                "path": "/",
+                                "pathType": "Prefix",
+                                "backend": {"service": {"name": novnc_name, "port": {"name": "http"}}},
+                            }
+                        ]
+                    },
+                }
+            ],
+            "tls": [tls_block],
+        },
+    }
+
+    return [vnc_secret, pvc, virtual_machine, vm_service, novnc_deploy, novnc_service, ingress]
+
+
+def render_vm(
+    spec: AppSpec,
+    dep: DeploymentCtx,
+    teams: list[Team],
+    settings: RenderSettings,
+    passwords: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    """Return all objects of a kubevirt-vm deployment in apply order.
+
+    ``passwords`` maps workload name (see :func:`workload_refs`) to its generated VNC password.
+    """
+    if spec.runtime != "kubevirt-vm" or spec.vm is None:
+        raise ValueError("render_vm() only supports runtime 'kubevirt-vm'")
+    refs = workload_refs(spec, teams)
+    if not refs:
+        raise ValueError("no workloads: teams are empty")
+    missing = [r.name for r in refs if r.name not in passwords]
+    if missing:
+        raise ValueError(f"missing passwords for workloads: {', '.join(missing)}")
+
+    objects: list[dict[str, Any]] = [
+        _vm_namespace(dep, settings),
+        *_vm_network_policies(dep, settings),
+    ]
+    for ref in refs:
+        objects.extend(_vm_workload_objects(spec, dep, ref, passwords[ref.name], settings))
+    return objects
 
 
 def render(
