@@ -20,12 +20,16 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import logging
 
 from fastapi import HTTPException, status
 
 from app.services import malware_scan
 from app.services.upload_validation import UploadRejected, inspect_upload
+from app.utils import upload_mac
 from app.utils.filenames import safe_filename
+
+logger = logging.getLogger(__name__)
 
 # Defense-in-depth limits for inline file uploads. The UX-side warning
 # is mirrored on the wizard, but a hand-crafted POST could still try
@@ -39,6 +43,31 @@ from app.utils.filenames import safe_filename
 # blob of right-shape but wrong-size still fails fast.
 _MAX_FILE_BYTES_PER_FILE = 2 * 1024 * 1024
 _MAX_FILE_BYTES_PER_DEPLOYMENT = 10 * 1024 * 1024
+
+
+# ``reason`` values of the HTTPExceptions that :func:`attach_files_to_user_input` raises for a refused upload.
+_UPLOAD_REJECTION_REASONS = frozenset({
+    "file_var_collision", "file_var_empty", "file_extension_rejected", "file_b64_invalid",
+    "file_size_mismatch", "file_too_large", "deployment_files_too_large", "file_content_rejected",
+    "upload_scan_unavailable",
+})
+
+
+def log_rejected_upload(user_id, exc: HTTPException) -> None:
+    """One structured line per refused upload, so that attacks show up in the logs.
+
+    ``upload_rejected user=<id> reason=<reason> code=<code> variable=<name> slot=<slot>``: greppable, and a
+    count over it (Loki) is the metric. Only fixed codes and names the platform chose go in; the file name is
+    the client's and is left out, so nothing in it can forge a log line.
+    """
+    detail = exc.detail
+    if not isinstance(detail, dict) or detail.get("reason") not in _UPLOAD_REJECTION_REASONS:
+        return
+    fields = {k: detail.get(k) for k in ("reason", "code", "variable", "slot")}
+    logger.warning(
+        "upload_rejected user=%s %s", user_id,
+        " ".join(f"{k}={json.dumps(str(v))}" for k, v in fields.items() if v is not None),
+    )
 
 
 def attach_files_to_user_input(
@@ -233,14 +262,17 @@ def attach_files_to_user_input(
                     detail={"reason": "upload_scan_unavailable", "message": str(failed)},
                 )
 
+            stored_name = safe_filename(upload.name)
             encoded_slots[slot_key] = {
                 # Stored as a plain file name: apps write it to disk and the
                 # download route puts it into a header (.github#7 R).
-                "name": safe_filename(upload.name),
+                "name": stored_name,
                 "content_b64": content_b64,
                 "size": upload.size,
                 # Derived from the content; the client's claim is not stored.
                 "content_type": inspected.content_type,
+                # Proof for the worker that these bytes passed the checks above.
+                "mac": upload_mac.sign(var_name, slot_key, stored_name, decoded),
             }
         # scope=team|user: HCL type is map(map(object({...}))) —
         # outer key is the team/user slot, inner key is the upload slot.
@@ -478,6 +510,11 @@ def strip_file_vars_from_user_input(user_input_var: dict | None) -> dict | None:
     for var_name, value in tf_block.items():
         if looks_like_file_var(value):
             stripped_tf[var_name] = _file_var_metadata_only(value)
+        elif _looks_like_scoped_file_var(value):
+            # scope=team|user: {slot: {"uploaded": {name, content_b64, ...}}}
+            stripped_tf[var_name] = {
+                slot: _file_var_metadata_only(inner) for slot, inner in value.items()
+            }
         else:
             stripped_tf[var_name] = value
     out["terraform"] = stripped_tf
@@ -534,6 +571,15 @@ def looks_like_file_var(value) -> bool:
     return True
 
 
+def _looks_like_scoped_file_var(value) -> bool:
+    """``scope=team|user`` shape: every slot wraps a file-shape map (``{"uploaded": {...}}``)."""
+    return (
+        isinstance(value, dict)
+        and bool(value)
+        and all(looks_like_file_var(inner) for inner in value.values())
+    )
+
+
 def _file_var_metadata_only(value: dict) -> dict:
     """Return a copy of a file-shape variable with the ``content_b64``
     payload stripped. Metadata fields (name, size, content_type)
@@ -542,5 +588,5 @@ def _file_var_metadata_only(value: dict) -> dict:
     """
     out: dict = {}
     for slot_key, slot in value.items():
-        out[slot_key] = {k: v for k, v in slot.items() if k != "content_b64"}
+        out[slot_key] = {k: v for k, v in slot.items() if k not in ("content_b64", "mac")}
     return out
