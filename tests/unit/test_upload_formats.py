@@ -18,7 +18,6 @@ from app.config import settings
 from app.schemas import DeploymentFileUpload
 from app.services import malware_scan
 from app.services.app_spec import parse_checked
-from app.services.clouds_yaml_parser import parse as parse_clouds
 from app.services.deployment_input import attach_files_to_user_input
 from app.services.upload_validation import UploadRejected, inspect_upload
 from app.utils import safe_yaml
@@ -292,10 +291,7 @@ def test_safe_yaml_refuses_alias_bombs_big_and_deeply_nested_documents():
 
 
 @pytest.mark.unit
-def test_clouds_yaml_and_appstore_yaml_use_the_safe_loader():
-    with pytest.raises(HTTPException) as exc:
-        parse_clouds("clouds:\n  a: &x {auth: {}}\n  b: *x\n")
-    assert exc.value.status_code == 422 and "alias" in exc.value.detail
+def test_appstore_yaml_uses_the_safe_loader():
     with pytest.raises(HTTPException) as exc:
         parse_checked(b"a: &x [1]\nb: *x\n")
     assert exc.value.status_code == 422

@@ -80,23 +80,14 @@ class Settings(BaseSettings):
     # from any other origin is refused (app/utils/cross_site.py, review S3).
     CSRF_TRUSTED_ORIGINS: str = ""
 
-    # Symmetric Fernet key shared with the worker. Used to encrypt OpenStack
-    # credentials at rest and to seal the envelope shipped through Celery.
+    # Symmetric Fernet key shared with the worker. Seals task results unless
+    # RESULTS_ENCRYPTION_KEY is set, and opens results sealed with it earlier.
     # Generate: python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
     CREDENTIAL_ENCRYPTION_KEY: str
     # Fernet key of task results (``tasks.outputs_enc``), shared with the
-    # worker. A key of its own, so the pod deployer, which seals results but
-    # has nothing to do with OpenStack, never holds the credential key (it
-    # can read the job queue, where the VM jobs' credential envelopes
-    # travel). Empty: the credential key, as before. Results sealed with
-    # the credential key open either way.
+    # worker. Empty: the credential key, as before. Results sealed with the
+    # credential key open either way.
     RESULTS_ENCRYPTION_KEY: str = ""
-
-    # Keystone URLs OpenStack credentials may point to, comma-separated
-    # (e.g. ``https://keystone.example.org:5000/v3``; a trailing ``/v3`` is
-    # ignored). API and worker send no login anywhere else (.github#7 C).
-    # Empty: in development any https URL, in production none.
-    OPENSTACK_ALLOWED_AUTH_URLS: str = ""
 
     # Pod apps (.github#4) -------------------------------------------------
     # Images in an appstore.yaml must come from these registries (prefixes,
@@ -137,10 +128,6 @@ class Settings(BaseSettings):
     LTI13_PLATFORM_JWKS_URL: str = "http://localhost:8081/mod/lti/certs.php"
     LTI13_REDIRECT_URI: str = "http://localhost:8000/lti13/launch"
     LTI13_SESSION_SECRET: str = "change-me-in-production"
-
-    # Skip real OpenStack calls: credential validation is a no-op and the
-    # resource endpoints return static dummy data. Only allowed in development.
-    OPENSTACK_SIMULATE: bool = False
 
     # Self-service-ui handoff (POST /handoff/mint). Own secret, independent
     # of LTI13_SESSION_SECRET — a compromised LTI secret must not also open
@@ -183,8 +170,6 @@ class Settings(BaseSettings):
             self.LTI13_SESSION_SECRET in _PLACEHOLDER_SECRETS or len(self.LTI13_SESSION_SECRET) < 32
         ):
             problems.append("LTI13_SESSION_SECRET must be a random secret of at least 32 characters")
-        if self.OPENSTACK_SIMULATE:
-            problems.append("OPENSTACK_SIMULATE must not be set in production")
         if problems:
             raise ValueError("unsafe production configuration: " + "; ".join(problems))
         return self

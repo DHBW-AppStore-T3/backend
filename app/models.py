@@ -23,10 +23,9 @@ from sqlalchemy.orm import relationship
 from app.database import Base
 from app.utils.time import utcnow
 
-# How a deployment runs: OpenTofu/Packer on OpenStack VMs (Windows apps), or
-# pods in the cluster rendered from the app's appstore.yaml (.github#4). The
-# values are the ``runtime`` names of the appstore.yaml contract.
-RUNTIME_VM = "openstack-vm"
+# How a deployment runs: pods in the cluster rendered from the app's
+# appstore.yaml (.github#4). The value is the ``runtime`` name of the
+# appstore.yaml contract; the column stays for further runtimes (KubeVirt).
 RUNTIME_K8S = "kubernetes"
 
 
@@ -51,9 +50,8 @@ class TaskType(str, enum.Enum):
     DESTROY = "destroy"
     PAUSE = "pause"
     RESUME = "resume"
-    # Single-resource redeploy of ONE Compute-Instance via
-    # ``terraform apply -replace=<addr> -target=<addr>``, without
-    # touching the other team VMs of the same deployment.
+    # Restart (or reset) of ONE workload, without touching the others of
+    # the same deployment.
     REDEPLOY = "redeploy"
 
 
@@ -63,11 +61,6 @@ class TaskStatus(str, enum.Enum):
     SUCCESS = "success"
     FAILED = "failed"
     CANCELLED = "cancelled"
-
-
-class OpenStackAuthType(str, enum.Enum):
-    APPLICATION_CREDENTIAL = "v3applicationcredential"
-    PASSWORD = "password"
 
 
 # ----------------------------------------------------------------
@@ -140,13 +133,6 @@ class User(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
-    # One credential per OpenStack project (dhbw-appstore's model).
-    openstack_credentials = relationship(
-        "UserOpenStackCredential",
-        back_populates="user",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
 
 
 # ----------------------------------------------------------------
@@ -201,14 +187,7 @@ class Deployment(Base):
     # The commit ``releaseTag`` pointed to when the deployment was created.
     # Every job of the deployment runs exactly this commit (.github#7 G).
     commit_sha = Column(String(40), nullable=True)
-    # VM deployments: the OpenStack project of the credential they were
-    # created with (as Keystone scoped it). Everyone holding an own verified
-    # credential for this project is a peer: owner view and operate, each
-    # with their own credential. None for pod deployments, and for VM
-    # deployments made before projects were verified until their owner's
-    # old credential is re-checked (``crud.openstack_credentials``).
-    os_project_id = Column(String, nullable=True, index=True)
-    runtime = Column(String(16), nullable=False, default=RUNTIME_VM, server_default=RUNTIME_VM)
+    runtime = Column(String(16), nullable=False, default=RUNTIME_K8S, server_default=RUNTIME_K8S)
     # Pod deployments: their namespace (``dep-<first 8 hex of the id>``),
     # unique across all deployments, deleted ones included, so a destroy can
     # never reach another deployment's namespace; and how many workloads
@@ -302,10 +281,6 @@ class Task(Base):
     # worker reported them (``app.services.task_results``). Replaces the
     # plaintext ``outputs``/``tf_state`` for tasks run since .github#5.
     outputs_enc = Column(LargeBinary, nullable=True)
-    # SHA-256 of the random token that lets this task's OpenTofu reach the
-    # state of its deployment through ``/internal/tfstate`` while the task
-    # is RUNNING. The token itself travels sealed in the job message only.
-    state_token_hash = Column(String(64), nullable=True)
 
     __table_args__ = (
         # At most one PENDING/RUNNING task per deployment: the database
@@ -367,33 +342,6 @@ class TaskEvent(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 
     __table_args__ = (Index("ix_task_events_task", "task_id", "id"),)
-
-
-# ----------------------------------------------------------------
-# TERRAFORM STATE MODEL
-# ----------------------------------------------------------------
-# The OpenTofu state of one VM deployment, written and read by OpenTofu
-# through the API's HTTP state backend (``routers/internal_tfstate``), never
-# by the worker directly; the job holds no database credentials. It lists
-# every resource with its attributes, generated passwords included, so it is
-# stored Fernet-encrypted. Deleted once a destroy has succeeded.
-class TerraformState(Base):
-    __tablename__ = "terraform_states"
-
-    deploymentId = Column(
-        UUID(as_uuid=True),
-        ForeignKey("deployments.deploymentId", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    state = Column(LargeBinary, nullable=True)  # Fernet, JSON inside
-    # OpenTofu's lock: its id, the lock info it sent (returned to a
-    # competing client) and the task that took it. A lock whose task no
-    # longer runs is stale and may be taken over, so a worker that died
-    # mid-apply cannot block the deployment for good.
-    lock_id = Column(String, nullable=True)
-    lock_info = Column(Text, nullable=True)
-    lock_task_id = Column(UUID(as_uuid=True), nullable=True)
-    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 # ----------------------------------------------------------------
@@ -472,71 +420,6 @@ class UserToTeam(Base):
 
 
 # ----------------------------------------------------------------
-# USER OPENSTACK CREDENTIAL MODEL
-# ----------------------------------------------------------------
-class UserOpenStackCredential(Base):
-    __tablename__ = "user_openstack_credentials"
-
-    credentialId = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    userId = Column(
-        UUID(as_uuid=True),
-        ForeignKey("users.userId", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    auth_type = Column(
-        Enum(
-            OpenStackAuthType,
-            name="openstackauthtype",
-            values_callable=lambda x: [e.value for e in x],
-        ),
-        nullable=False,
-    )
-
-    # Non-secret display fields (plaintext)
-    auth_url = Column(String, nullable=False)
-    region_name = Column(String, nullable=True)
-    interface = Column(String, nullable=True, default="public")
-    identity_api_version = Column(String, nullable=True, default="3")
-    # The project Keystone scoped the token to, once ``project_verified``:
-    # it decides who is a project peer, so a typed value must never count.
-    # For password auth it is also the scope requested at login.
-    project_id = Column(String, nullable=True, index=True)
-    project_name = Column(String, nullable=True)
-    user_domain_name = Column(String, nullable=True)
-    project_domain_name = Column(String, nullable=True)
-    # True once ``project_id`` came from a Keystone token. Credentials saved
-    # before projects were taken from Keystone carry whatever the user typed
-    # (an application credential ignores it entirely), so they are False
-    # until re-checked and count for nobody's project.
-    project_verified = Column(Boolean, nullable=False, default=False, server_default=text("false"))
-
-    # Encrypted (Fernet ciphertext) — never logged, never returned via API
-    encrypted_identifier = Column(LargeBinary, nullable=False)
-    encrypted_secret = Column(LargeBinary, nullable=False)
-
-    last_validated_at = Column(DateTime, nullable=True)
-    last_validation_error = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=utcnow)
-    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
-
-    __table_args__ = (
-        # One verified credential per user and project; saving another one
-        # for the same project replaces it (that is how a secret is rotated).
-        # Unverified old rows stay out of it until re-checked.
-        Index(
-            "uq_user_openstack_credentials_project",
-            "userId",
-            "project_id",
-            unique=True,
-            postgresql_where=text("project_verified"),
-        ),
-    )
-
-    user = relationship("User", back_populates="openstack_credentials")
-
-
-# ----------------------------------------------------------------
 # APP VERSION APPROVAL MODEL
 # ----------------------------------------------------------------
 class AppVersionApproval(Base):
@@ -572,9 +455,9 @@ class AppVersionApproval(Base):
     reviewed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=utcnow, nullable=False)
     # What the review covered besides the commit (.github#4): how the version
-    # runs and, for pods, the SHA-256 of its appstore.yaml and the image
+    # runs and the SHA-256 of its appstore.yaml and the image
     # digests it names (JSON list). A deploy refuses a spec that differs.
-    runtime = Column(String(16), nullable=False, default=RUNTIME_VM, server_default=RUNTIME_VM)
+    runtime = Column(String(16), nullable=False, default=RUNTIME_K8S, server_default=RUNTIME_K8S)
     spec_sha256 = Column(String(64), nullable=True)
     image_digests = Column(Text, nullable=True)
 

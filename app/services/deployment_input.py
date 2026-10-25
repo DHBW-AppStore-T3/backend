@@ -76,7 +76,6 @@ def attach_files_to_user_input(
     """
     base = dict(user_input_var or {})
     base.setdefault("terraform", {})
-    base.setdefault("packer", {})
 
     if not files:
         return base
@@ -125,7 +124,7 @@ def attach_files_to_user_input(
             content_b64 = upload.content_b64
 
             # Extension-filter check — only when the app author declared
-            # an ``@openstack:file:<scope>:<exts>`` filter. We compare
+            # a ``fileExtensions`` filter. We compare
             # the filename suffix (after the last dot, lowercased) to
             # the allowed list. Missing dot or unknown suffix → 422.
             allowed_exts = allowed_exts_by_var.get(var_name)
@@ -338,7 +337,7 @@ def validate_scoped_user_input(
             return True
         return isinstance(val, (list, dict)) and len(val) == 0
 
-    for source_key in ("terraform", "packer"):
+    for source_key in ("terraform",):
         block = user_input_var.get(source_key)
         if not isinstance(block, dict):
             continue

@@ -8,7 +8,6 @@ Prod als `backend-prod` hinter nginx unter `/api/`.
 - **`routers/`** — ein Router pro Ressource: `apps.py` (App-Katalog,
   größte Datei im Projekt), `deployments.py` (Deploy-Lebenszyklus,
   ebenfalls sehr groß), `courses.py`, `teams.py`, `users.py`,
-  `openstack_credentials.py`, `openstack_resources.py`, `quotas.py`,
   `admin_apps.py`, `dashboard.py`, `tasks.py`, `auth_keycloak.py`.
 - **`services/`** — Geschäftslogik getrennt von den Routern:
   `git_service.py` (klont App-Repos), `task_service.py` (Task-Zeile
@@ -18,14 +17,13 @@ Prod als `backend-prod` hinter nginx unter `/api/`.
   Destroy, Zugangs-Mails), `reconciler.py` (tote Worker → `worker_lost`,
   verlorene Dispatches, geparkte Nachrichten), `task_results.py`
   (Fernet-versiegelte Outputs/State lesen), `deployment_notifier.py`,
-  `deployment_status.py`, `tf_state_parser.py`,
-  `openstack_client.py`/`openstack_validator.py`,
-  `clouds_yaml_parser.py`, `email_service.py`, `lifecycle.py`.
+  `k8s_status.py` (Live-Status der Pod-Workloads), `app_spec.py`
+  (`appstore.yaml` lesen und prüfen), `lifecycle.py`.
 - **`pgq.py` / `task_contract.py`** — Kombu-Transport auf Postgres und
   der Event-/Ergebnis-Vertrag mit dem Worker; identisch im Worker-Repo
   (.github#5).
 - **`models.py`** — SQLAlchemy-Modelle: `User`, `Course`, `App`,
-  `Deployment`, `Task`, `Team`, `UserOpenStackCredential`,
+  `Deployment`, `Task`, `Team`,
   `AppVersionApproval`, plus Join-Tabellen (`UserToDeployment`,
   `UserToTeam`, `CourseTeacher`).
 - **`schemas.py`** — Pydantic-Schemas, getrennt von den ORM-Modellen.
@@ -35,8 +33,8 @@ Prod als `backend-prod` hinter nginx unter `/api/`.
 1. Frontend → `POST /deployments` (Router `deployments.py`)
 2. Backend legt `Deployment`+`Task`-Zeilen an und sendet die Celery-Task
    nach dem Commit in die Tabelle `celery_queue` (Task-ID = `taskId`)
-3. Worker (separates Repo) holt sie per `SKIP LOCKED`, führt Terraform/Packer
-   aus und schreibt Fortschritt/Logs in `task_events`, am Ende Status,
+3. Worker (separates Repo) holt sie per `SKIP LOCKED`, rendert die Kubernetes-Objekte der App
+   (Pod-Deployer) und schreibt Fortschritt/Logs in `task_events`, am Ende Status,
    Transkript und versiegelte Ergebnisse in die Task-Zeile
 4. `NOTIFY task_events` weckt die SSE-Streams jedes API-Prozesses; der
    Finalizer erledigt die Folgearbeit genau einmal

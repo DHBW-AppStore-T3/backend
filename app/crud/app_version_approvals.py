@@ -11,7 +11,7 @@ from uuid import UUID
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.models import RUNTIME_VM, App, AppVersionApproval, AppVersionApprovalStatus
+from app.models import RUNTIME_K8S, App, AppVersionApproval, AppVersionApprovalStatus
 from app.utils.time import utcnow
 
 
@@ -22,7 +22,7 @@ def submit_version(
     commit_sha: str,
     diff_url: str | None = None,
     notes: str | None = None,
-    runtime: str = RUNTIME_VM,
+    runtime: str = RUNTIME_K8S,
     spec_sha256: str | None = None,
     image_digests: str | None = None,
 ) -> AppVersionApproval:

@@ -14,8 +14,8 @@ Datei existiert.
 
 ## `CREDENTIAL_ENCRYPTION_KEY` fehlt
 
-Backend und Worker teilen sich diesen Fernet-Key zum Ver-/Entschlüsseln
-von OpenStack-Credentials. Fehlt er, bricht der Container-Start mit
+Backend und Worker teilen sich diesen Fernet-Key (er versiegelt die
+Task-Ergebnisse, solange kein `RESULTS_ENCRYPTION_KEY` gesetzt ist). Fehlt er, bricht der Container-Start mit
 einer expliziten `:? is required`-Fehlermeldung ab (siehe
 `docker-compose.prod.yml`) — kein stiller Fallback. Wenn Backend und
 Worker unterschiedliche Werte haben, startet zwar beides, aber jede

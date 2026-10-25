@@ -27,7 +27,6 @@ from app.models import (
     TaskEvent,
     TaskStatus,
     TaskType,
-    UserOpenStackCredential,
 )
 from app.pgq import libpq_url
 from app.services import reconciler, task_finalizer, task_service
@@ -43,7 +42,7 @@ from app.task_contract import (
     terminal_payload,
 )
 from app.utils import crypto
-from tests.conftest import _TEST_DB_URL, TEST_PROJECT, TestingSessionLocal, add_credential
+from tests.conftest import _TEST_DB_URL, TestingSessionLocal
 
 pytestmark = pytest.mark.integration
 
@@ -56,14 +55,14 @@ def _sessions_on_test_db(monkeypatch):
 
 
 def _seed(db, user, *, task_type=TaskType.DEPLOY, task_status=TaskStatus.SUCCESS, **task_fields) -> tuple:
-    """App + deployment + one task + the user's OpenStack credential."""
+    """App + deployment + one task."""
     app = App(appId=uuid.uuid4(), name=f"app-{uuid.uuid4().hex[:6]}", userId=user.userId,
               git_link="https://example.com/acme/repo.git")
     db.add(app)
     db.flush()
     deployment = Deployment(deploymentId=uuid.uuid4(), name=f"d-{uuid.uuid4().hex[:6]}", appId=app.appId,
-                            userId=user.userId, releaseTag="v1.0.0", os_project_id=TEST_PROJECT,
-                            userInputVar=json.dumps({"terraform": {}, "packer": {}}))
+                            userId=user.userId, releaseTag="v1.0.0", runtime="kubernetes",
+                            userInputVar=json.dumps({"terraform": {}}))
     db.add(deployment)
     db.flush()
     task_id = uuid.uuid4()
@@ -72,8 +71,6 @@ def _seed(db, user, *, task_type=TaskType.DEPLOY, task_status=TaskStatus.SUCCESS
                 status=task_status, **task_fields)
     db.add(task)
     db.commit()
-    if db.query(UserOpenStackCredential).filter_by(userId=user.userId).first() is None:
-        add_credential(db, user)
     return deployment, task
 
 
@@ -103,7 +100,7 @@ def test_dispatch_puts_one_message_keyed_by_the_task_id(client, db, mock_user):
 
     (row,) = _queue_rows(db)
     assert row["task_id"] == task_id and row["visible"] and row["after_task"] is None
-    assert row["payload"]["headers"]["task"] == "tasks.pause_deployment"
+    assert row["payload"]["headers"]["task"] == "pods.pause_deployment"
     task = db.get(Task, task_id)
     assert task.status == TaskStatus.PENDING and task.celeryTaskId == str(task_id)
 
@@ -121,7 +118,7 @@ def test_second_active_task_is_refused_by_the_database(db, mock_user):
 # ----------------------------------------------------------------
 def test_cancel_before_a_worker_claimed_the_job(client, db, mock_user):
     deployment, task = _seed(db, mock_user, task_status=TaskStatus.PENDING)
-    task_service.dispatch_to_celery(db, task, "tasks.deploy_application", {"deployment_id": str(deployment.deploymentId)})
+    task_service.dispatch_to_celery(db, task, "pods.deploy_application", {"deployment_id": str(deployment.deploymentId)})
 
     response = client.post(f"/deployments/{deployment.deploymentId}/cancel")
     assert response.status_code == 202
@@ -134,7 +131,7 @@ def test_cancel_before_a_worker_claimed_the_job(client, db, mock_user):
     # The deploy never reaches a worker; the destroy runs right away.
     (row,) = _queue_rows(db)
     assert row["task_id"] == destroy_id and row["visible"] and row["after_task"] is None
-    assert row["payload"]["headers"]["task"] == "tasks.destroy_deployment"
+    assert row["payload"]["headers"]["task"] == "pods.destroy_deployment"
 
 
 def test_cancel_while_a_worker_runs_the_job_parks_the_destroy(client, db, mock_user):
@@ -142,7 +139,7 @@ def test_cancel_while_a_worker_runs_the_job_parks_the_destroy(client, db, mock_u
         db, mock_user, task_status=TaskStatus.RUNNING,
         claimed_by="worker-1:42", lease_until=datetime.now(UTC) + timedelta(minutes=2),
     )
-    task_service.dispatch_to_celery(db, task, "tasks.deploy_application", {"deployment_id": str(deployment.deploymentId)})
+    task_service.dispatch_to_celery(db, task, "pods.deploy_application", {"deployment_id": str(deployment.deploymentId)})
     db.execute(text("UPDATE celery_queue SET claimed_by = 'worker-1', visible_after = now() + interval '5 min'"))
     db.commit()
 
@@ -353,7 +350,7 @@ def test_reconciler_fails_lost_dispatches_but_not_queued_or_fresh_ones(db, mock_
     old = datetime.utcnow() - timedelta(minutes=5)
     _, lost = _seed(db, mock_user, task_status=TaskStatus.PENDING, created_at=old)
     queued_dep, queued = _seed(db, mock_user, task_status=TaskStatus.PENDING, created_at=old)
-    task_service.dispatch_to_celery(db, queued, "tasks.deploy_application", {"deployment_id": str(queued_dep.deploymentId)})
+    task_service.dispatch_to_celery(db, queued, "pods.deploy_application", {"deployment_id": str(queued_dep.deploymentId)})
     _, fresh = _seed(db, mock_user, task_status=TaskStatus.PENDING)
 
     reconciler.reconcile_once()
@@ -371,7 +368,7 @@ def test_reconciler_releases_a_destroy_parked_behind_a_dead_worker(db, mock_user
                    status=TaskStatus.PENDING)
     db.add(destroy)
     db.commit()
-    task_service.dispatch_to_celery(db, destroy, "tasks.destroy_deployment", {}, after_task_id=cancelled.taskId)
+    task_service.dispatch_to_celery(db, destroy, "pods.destroy_deployment", {}, after_task_id=cancelled.taskId)
     assert not _queue_rows(db)[0]["visible"]
 
     reconciler.reconcile_once()

@@ -5,8 +5,7 @@ uvicorn process: four soft-deletes and four access mails per deploy. Here it
 is claimed through ``tasks.finalized_at``; whichever API process sets it
 does the work, every other process skips the task:
 
-- **destroy succeeded** → forget the deployment's OpenTofu state and
-  soft-delete the deployment, in the same transaction as the claim (a
+- **destroy succeeded** → soft-delete the deployment, in the same transaction as the claim (a
   crash repeats it, which is harmless).
 
 There are no access mails any more (.github#7 I): members fetch their own
@@ -30,7 +29,6 @@ from sqlalchemy.orm import Session
 
 from app.crud import deployments as crud_deployments
 from app.models import Task, TaskStatus, TaskType
-from app.services import tf_state_store
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +42,8 @@ def _follow_up(db: Session, task: Task) -> None:
     """Mark ``task`` finalized and run its follow-up; commits."""
     task.finalized_at = text("now()")
     if task.status == TaskStatus.SUCCESS and task.type == TaskType.DESTROY:
-        # The OpenStack resources are gone: drop the (now empty) state, hide
-        # the deployment, keep the row and its tasks for the record.
-        # Commits together with the mark.
-        tf_state_store.drop(db, task.deploymentId)
+        # The namespace is gone: hide the deployment, keep the row and its
+        # tasks for the record. Commits together with the mark.
         crud_deployments.soft_delete_deployment(db, task.deploymentId)
         db.commit()
         logger.info("Soft-deleted deployment %s after its destroy", task.deploymentId)

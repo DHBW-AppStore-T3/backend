@@ -72,3 +72,5 @@ graphify-out/.graphify_root
 # Generated API schemas and local locks
 openapi.json
 uv.lock
+# Generated code graph (graphify), not tracked
+graphify-out/

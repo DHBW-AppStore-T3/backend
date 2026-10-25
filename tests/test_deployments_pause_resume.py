@@ -19,23 +19,16 @@ from app.models import (
     TaskStatus,
     TaskType,
 )
-from tests.conftest import TEST_PROJECT, add_credential
 
 
-def _make_deployment_with_creds(
+def _make_deployment(
     db,
     user,
     *,
     latest_task_type: TaskType,
     latest_task_status: TaskStatus,
 ):
-    """Seed a deployment + app + credentials + one task on the user.
-
-    The credential row needs valid ciphertext so
-    ``crud_openstack_credentials.get_dispatch_envelope`` doesn't 412
-    before the dispatch path even runs. The cleartext doesn't matter
-    for these tests — Celery is patched out.
-    """
+    """Seed a pod deployment + app + one task on the user. Celery is patched out."""
 
     app = App(
         appId=uuid.uuid4(),
@@ -52,8 +45,8 @@ def _make_deployment_with_creds(
         appId=app.appId,
         userId=user.userId,
         releaseTag="v1.0.0",
-        os_project_id=TEST_PROJECT,
-        userInputVar=json.dumps({"terraform": {}, "packer": {}}),
+        runtime="kubernetes",
+        userInputVar=json.dumps({"terraform": {}}),
     )
     db.add(deployment)
     db.flush()
@@ -69,7 +62,6 @@ def _make_deployment_with_creds(
     )
 
     db.commit()
-    add_credential(db, user)
     db.refresh(deployment)
     return deployment
 
@@ -94,7 +86,7 @@ def patched_celery():
 def test_pause_dispatches_when_status_is_success(
     client, db, mock_user, patched_celery,
 ):
-    deployment = _make_deployment_with_creds(
+    deployment = _make_deployment(
         db, mock_user,
         latest_task_type=TaskType.DEPLOY,
         latest_task_status=TaskStatus.SUCCESS,
@@ -117,7 +109,7 @@ def test_pause_dispatches_when_status_is_success(
     assert task.status == TaskStatus.PENDING
     assert task.celeryTaskId == "fake-celery-task-id"
     patched_celery.assert_called_once()
-    assert patched_celery.call_args.args[0] == "tasks.pause_deployment"
+    assert patched_celery.call_args.args[0] == "pods.pause_deployment"
 
 
 @pytest.mark.integration
@@ -140,7 +132,7 @@ def test_pause_dispatches_when_status_is_success(
 def test_pause_rejected_when_not_success(
     client, db, mock_user, patched_celery, task_type, task_status,
 ):
-    deployment = _make_deployment_with_creds(
+    deployment = _make_deployment(
         db, mock_user,
         latest_task_type=task_type,
         latest_task_status=task_status,
@@ -157,7 +149,7 @@ def test_pause_rejected_when_not_success(
 def test_resume_dispatches_when_status_is_paused(
     client, db, mock_user, patched_celery,
 ):
-    deployment = _make_deployment_with_creds(
+    deployment = _make_deployment(
         db, mock_user,
         latest_task_type=TaskType.PAUSE,
         latest_task_status=TaskStatus.SUCCESS,
@@ -176,7 +168,7 @@ def test_resume_dispatches_when_status_is_paused(
         .one()
     )
     assert task.status == TaskStatus.PENDING
-    assert patched_celery.call_args.args[0] == "tasks.resume_deployment"
+    assert patched_celery.call_args.args[0] == "pods.resume_deployment"
 
 
 @pytest.mark.integration
@@ -184,7 +176,7 @@ def test_resume_rejected_when_not_paused(
     client, db, mock_user, patched_celery,
 ):
     """A successful deploy is not a valid resume target — only paused is."""
-    deployment = _make_deployment_with_creds(
+    deployment = _make_deployment(
         db, mock_user,
         latest_task_type=TaskType.DEPLOY,
         latest_task_status=TaskStatus.SUCCESS,
@@ -199,7 +191,7 @@ def test_destroy_allowed_from_paused(
     client, db, mock_user, patched_celery,
 ):
     """Paused deployments still hold OpenStack resources — Destroy works."""
-    deployment = _make_deployment_with_creds(
+    deployment = _make_deployment(
         db, mock_user,
         latest_task_type=TaskType.PAUSE,
         latest_task_status=TaskStatus.SUCCESS,
@@ -251,7 +243,7 @@ def test_delete_rejected_while_action_in_flight(
     regardless of which kind. The current_status string in the
     detail message helps the frontend tell the user *why* they
     have to wait."""
-    deployment = _make_deployment_with_creds(
+    deployment = _make_deployment(
         db, mock_user,
         latest_task_type=task_type,
         latest_task_status=task_status,
@@ -274,7 +266,7 @@ def test_resume_rejected_while_action_in_flight(
     client, db, mock_user, patched_celery, task_type, task_status, expected_status_text,
 ):
     """RESUME mirrors PAUSE — refused during any in-flight task."""
-    deployment = _make_deployment_with_creds(
+    deployment = _make_deployment(
         db, mock_user,
         latest_task_type=task_type,
         latest_task_status=task_status,
@@ -290,7 +282,7 @@ def test_pause_failed_status_allows_retry(client, db, mock_user, patched_celery)
     attempt — the deployment itself is unaffected. Mirrors the
     lifecycle matrix entry for ``pause_failed``.
     """
-    deployment = _make_deployment_with_creds(
+    deployment = _make_deployment(
         db, mock_user,
         latest_task_type=TaskType.PAUSE,
         latest_task_status=TaskStatus.FAILED,
@@ -303,7 +295,7 @@ def test_pause_failed_status_allows_retry(client, db, mock_user, patched_celery)
 @pytest.mark.integration
 def test_destroy_allowed_from_pause_failed(client, db, mock_user, patched_celery):
     """User can give up on a stuck pause and tear it down."""
-    deployment = _make_deployment_with_creds(
+    deployment = _make_deployment(
         db, mock_user,
         latest_task_type=TaskType.PAUSE,
         latest_task_status=TaskStatus.FAILED,

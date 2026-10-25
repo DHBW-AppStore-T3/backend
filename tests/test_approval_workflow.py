@@ -90,20 +90,12 @@ def test_resubmit_after_rejection_succeeds(client, mock_admin, mock_user, db):
 # ================================================================
 
 @pytest.mark.integration
-def test_submit_blocked_when_marker_errors(client, mock_user, db):
+def test_submit_blocked_without_a_valid_appstore_yaml(client, mock_user, db, fake_git):
     app_obj = create_app_in_db(db, mock_user)
-    broken_vars = [{"name": "flavor", "markerError": {
-        "variable": "flavor",
-        "message": "Unknown OS type: 'flaavoor'. Did you mean 'flavor'?",
-        "location": "terraform/variables.tf:5",
-        "code": "MARKER_UNKNOWN_OS_TYPE",
-    }}]
-    with patch("app.routers.apps.load_variable_definitions", return_value=broken_vars):
-        resp = client.post(f"/apps/{app_obj.appId}/versions/v1.0/submit", json={})
+    del fake_git.files["appstore.yaml"]
+    resp = client.post(f"/apps/{app_obj.appId}/versions/v1.0/submit", json={})
     assert resp.status_code == 422
-    detail = resp.json()["detail"]
-    assert "marker_errors" in detail
-    assert detail["marker_errors"][0]["code"] == "MARKER_UNKNOWN_OS_TYPE"
+    assert resp.json()["detail"]["reason"] == "appstore_yaml_missing"
 
 
 @pytest.mark.integration

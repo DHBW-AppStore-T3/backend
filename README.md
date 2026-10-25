@@ -88,12 +88,9 @@ app/
 | `deployments` | `/deployments` | Deployments anlegen/steuern (Kern-Ressource) |
 | `tasks` | `/tasks` | Celery-Task-Status |
 | `teams` | `/teams` | Teams innerhalb eines Kurses |
-| `quotas` | `/quotas` | OpenStack-Quota-Abfrage |
 | `dashboard` | `/dashboard` | Aggregierte Übersichten fürs Frontend |
-| `openstack_credentials` | `/me/openstack-credentials` | OpenStack-Zugangsdaten pro User |
-| `openstack_resources` | `/me/openstack/resources` | Read-API für Networks/Flavors/Images (Wizard-Dropdowns) |
 
-**crud/** — je ein File pro Ressource (`users`, `apps`, `courses`, `teams`, `tasks`, `app_version_approvals`, `openstack_credentials`), das reine DB-Operationen für das gleichnamige Modell kapselt — keine HTTP- oder Business-Logik. Zwei fallen aus dem Muster:
+**crud/** — je ein File pro Ressource (`users`, `apps`, `courses`, `teams`, `tasks`, `app_version_approvals`), das reine DB-Operationen für das gleichnamige Modell kapselt — keine HTTP- oder Business-Logik. Zwei fallen aus dem Muster:
 
 - `deployments` — mit Abstand am umfangreichsten, da Deployments die Kern-Ressource sind (Status-Übergänge, Task-Verknüpfung, Redeploy)
 - `locks` — keine Ressource, sondern Per-User-Serialisierung über Postgres Advisory Locks (verhindert parallele Deployments desselben Users)
@@ -105,16 +102,12 @@ app/
 | `celery_event_listener` | Daemon-Thread: konsumiert Celery-Events aus RabbitMQ, schreibt Task-Status in die DB |
 | `reconciler` | Fängt hängende Tasks ab, deren Events verloren gingen (Fallback zum Listener) |
 | `deployment_pubsub` | In-Process-Bridge Listener → SSE-Endpoint (Live-Status) |
-| `deployment_status` | Verheiratet gecachten Terraform-State mit Live-OpenStack-Daten (Infrastructure-Tab) |
+| `k8s_status` | Liest den Live-Status der Workloads eines Pod-Deployments aus dem Cluster |
 | `deployment_notifier` | Baut & versendet Post-Deploy-Mails (User- und Owner-Variante) |
 | `email_service` | SMTP-Versand + Jinja2-Templating für die Mails |
 | `task_service` | Zwei-Phasen-Dispatch: PENDING-Row in Tx anlegen, dann Celery-Enqueue |
 | `lifecycle` | Single Source of Truth, welche Aktion in welchem Deployment-Status erlaubt ist |
-| `git_service` | Git-Clone/Release-Infos, Sparse-Checkout für den Variablen-Scan |
-| `openstack_client` | Gemeinsamer OpenStack-Client-Layer (per-User-`Connection`) |
-| `openstack_validator` | Prüft Credentials gegen das Ziel-Keystone (Upsert + `/test`) |
-| `clouds_yaml_parser` | Parst rohes `clouds.yaml` in ein Credential-Schema |
-| `tf_state_parser` | Liest den in `Task.tf_state` persistierten Terraform-State |
+| `git_service` | Git-Clone/Release-Infos, Sparse-Checkout der `appstore.yaml` |
 
 **utils/** — `keycloak_auth` (Token-Validierung), `permissions` + `capabilities` (rollenbasierte `can_*`/`ensure_*`-Checks), `crypto` (Fernet-Verschlüsselung at-rest, Key geteilt mit dem Worker), `app_image` (Data-URL ↔ Bytes), `time`.
 

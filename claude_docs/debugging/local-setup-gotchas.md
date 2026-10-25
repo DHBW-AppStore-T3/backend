@@ -8,11 +8,10 @@
 
 ## Drei getrennte Postgres-Instanzen in Prod/Staging
 
-Anwendungs-DB, Terraform-State-DB und Keycloak-DB sind bewusst
-getrennte Container (`postgres`, `postgres-tfstate`,
-`keycloak-postgres`) — beim lokalen Debuggen eines DB-Problems zuerst
-prüfen, gegen welche der drei man überhaupt verbunden ist.
-`DATABASE_URL` zeigt nur auf die Anwendungs-DB.
+Anwendungs-DB und Keycloak-DB sind bewusst getrennte Container
+(`postgres`, `keycloak-postgres`) — beim lokalen Debuggen eines
+DB-Problems zuerst prüfen, gegen welche der beiden man überhaupt
+verbunden ist. `DATABASE_URL` zeigt nur auf die Anwendungs-DB.
 
 ## Security-Check läuft erst seit kurzem tatsächlich
 
