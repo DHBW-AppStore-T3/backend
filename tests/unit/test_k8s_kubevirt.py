@@ -402,6 +402,7 @@ def _live_vm(ready_after_polls=0):
     from app.services import k8s_status
 
     kube = FakeKube(ready_after_polls=ready_after_polls)
+    kube.namespace_labels["vm-poc"] = {}  # the image namespace exists before any deployment
     for obj in _vm_objects():
         kube.apply(obj)
     k8s_status.set_kube_factory(lambda: kube)
