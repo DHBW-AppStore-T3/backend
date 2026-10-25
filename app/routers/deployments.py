@@ -54,14 +54,14 @@ from app.services import (
     access,
     app_spec,
     k8s_status,
+    lifecycle as lifecycle_service,
     openstack_client,
     task_events,
     task_finalizer,
     task_results,
+    task_service as task_service_module,
     tf_state_store,
 )
-from app.services import lifecycle as lifecycle_service
-from app.services import task_service as task_service_module
 from app.services.deployment_input import (
     attach_files_to_user_input,
     looks_like_file_var,
