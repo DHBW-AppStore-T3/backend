@@ -392,3 +392,43 @@ def test_a_vm_follows_the_network_choices_the_author_released():
     assert {"allow-egress-internet", "allow-intra-namespace"} <= names
     with pytest.raises(SpecValidationError):
         apply_network_overrides(parse_spec(VALID_VM_SPEC), {"internet": True})
+
+
+# ── the live view of a VM deployment ───────────────────────────────────────────
+
+
+def _live_vm(ready_after_polls=0):
+    from app.k8s.fake import FakeKube
+    from app.services import k8s_status
+
+    kube = FakeKube(ready_after_polls=ready_after_polls)
+    for obj in _vm_objects():
+        kube.apply(obj)
+    k8s_status.set_kube_factory(lambda: kube)
+    return k8s_status
+
+
+def test_the_live_view_shows_one_row_per_vm_with_the_link_to_its_proxy(monkeypatch):
+    from app.services import k8s_status
+
+    monkeypatch.setattr(k8s_status, "app_domain", lambda: "apps.example.org")
+    status = _live_vm()
+    try:
+        status.workload_views(DEP.id, DEP.namespace)  # first poll
+        (row,) = status.workload_views(DEP.id, DEP.namespace)
+    finally:
+        status.set_kube_factory(None)
+
+    assert row["workload"].startswith("team-a")
+    assert (row["phase"], row["ready"]) == ("Running", True)
+    assert row["team"] == "team-a" and row["user_id"] == "uid-1"
+    assert row["url"] == f"https://{row['workload']}-novnc-{DEP.short_id}.apps.example.org"
+
+
+def test_a_booting_vm_is_not_ready_yet():
+    status = _live_vm(ready_after_polls=10**6)
+    try:
+        (row,) = status.workload_views(DEP.id, DEP.namespace)
+    finally:
+        status.set_kube_factory(None)
+    assert row["ready"] is False and row["phase"] != "Running"

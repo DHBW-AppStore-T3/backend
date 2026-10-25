@@ -67,6 +67,8 @@ class VmiInfo:
     name: str
     phase: str = "Pending"
     ready: bool = False
+    team: str = ""
+    user: str = ""  # the member's user id (``scope: user``)
 
 
 @dataclass
@@ -212,7 +214,16 @@ class KubeApi:
             status = item.get("status") or {}
             conditions = status.get("conditions") or []
             ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions)
-            out.append(VmiInfo(item["metadata"]["name"], status.get("phase") or "Pending", ready))
+            labels = item["metadata"].get("labels") or {}
+            out.append(
+                VmiInfo(
+                    item["metadata"]["name"],
+                    status.get("phase") or "Pending",
+                    ready,
+                    labels.get(TEAM_LABEL, ""),
+                    labels.get(USER_LABEL, ""),
+                )
+            )
         return out
 
     def scale(self, namespace: str, statefulset: str, replicas: int) -> None:
