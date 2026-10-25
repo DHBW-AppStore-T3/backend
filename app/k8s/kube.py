@@ -108,9 +108,7 @@ class KubeApi:
         self._apps: Any = client.AppsV1Api(api)
 
     def apply(self, obj: dict[str, Any]) -> None:
-        resource = self._dyn.resources.get(
-            api_version=obj["apiVersion"], kind=obj["kind"]
-        )
+        resource = self._dyn.resources.get(api_version=obj["apiVersion"], kind=obj["kind"])
         meta = obj["metadata"]
         self._dyn.server_side_apply(
             resource,
@@ -132,8 +130,7 @@ class KubeApi:
 
     def namespaces(self, label_selector: str) -> list[str]:
         return [
-            n.metadata.name
-            for n in self._core.list_namespace(label_selector=label_selector).items
+            n.metadata.name for n in self._core.list_namespace(label_selector=label_selector).items
         ]
 
     def snapshot(self, namespace: str) -> Snapshot:
@@ -164,9 +161,7 @@ class KubeApi:
                 )
             )
         for c in self._core.list_namespaced_persistent_volume_claim(namespace).items:
-            snap.pvcs.append(
-                (c.metadata.name, (c.metadata.labels or {}).get(WORKLOAD_LABEL, ""))
-            )
+            snap.pvcs.append((c.metadata.name, (c.metadata.labels or {}).get(WORKLOAD_LABEL, "")))
         for p in self._core.list_namespaced_pod(namespace).items:
             snap.pods.append(_pod_info(p))
         for ev in self._core.list_namespaced_event(namespace).items:
@@ -215,8 +210,7 @@ def _pod_info(p: Any) -> PodInfo:
         if c.state and c.state.terminated and c.state.terminated.reason != "Completed":
             info.waiting_reason = c.state.terminated.reason
     info.ready = any(
-        cond.type == "Ready" and cond.status == "True"
-        for cond in p.status.conditions or []
+        cond.type == "Ready" and cond.status == "True" for cond in p.status.conditions or []
     )
     for cond in p.status.conditions or []:
         if (

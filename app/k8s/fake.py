@@ -41,11 +41,7 @@ class FakeKube:
     def apply(self, obj: dict[str, Any]) -> None:
         meta = obj["metadata"]
         ns = meta.get("namespace")
-        if (
-            obj["kind"] != "Namespace"
-            and ns is not None
-            and ns not in self.namespace_labels
-        ):
+        if obj["kind"] != "Namespace" and ns is not None and ns not in self.namespace_labels:
             raise RuntimeError(f"namespace {ns} not found")
         self.objects[(obj["kind"], meta["name"], ns, obj["apiVersion"])] = obj
         if obj["kind"] == "Namespace":
@@ -78,9 +74,7 @@ class FakeKube:
     # --- reads ---------------------------------------------------------
     def namespaces(self, label_selector: str) -> list[str]:
         """Equality selectors only (``k=v[,k=v...]``), as the platform uses them."""
-        wanted = [
-            part.partition("=")[::2] for part in label_selector.split(",") if part
-        ]
+        wanted = [part.partition("=")[::2] for part in label_selector.split(",") if part]
         return [
             n
             for n, labels in self.namespace_labels.items()
@@ -88,9 +82,7 @@ class FakeKube:
         ]
 
     def kinds(self, namespace: str | None = None) -> list[str]:
-        return sorted(
-            k for k, _n, ns, _v in self.objects if namespace is None or ns == namespace
-        )
+        return sorted(k for k, _n, ns, _v in self.objects if namespace is None or ns == namespace)
 
     def snapshot(self, namespace: str) -> Snapshot:
         if namespace in self._terminating:
@@ -118,9 +110,7 @@ class FakeKube:
                 continue
             up = replicas >= 1
             ready = up and polls > self.ready_after_polls and not self.fail_reason
-            labels = self.objects[("StatefulSet", name, ns, "apps/v1")]["metadata"][
-                "labels"
-            ]
+            labels = self.objects[("StatefulSet", name, ns, "apps/v1")]["metadata"]["labels"]
             snap.statefulsets.append(
                 StatefulSetInfo(
                     name,
@@ -148,9 +138,7 @@ class FakeKube:
                 snap.pods.append(pod)
         if self.fail_reason == "quota":
             snap.events.append(
-                EventInfo(
-                    "StatefulSet/x", "FailedCreate", "exceeded quota: appstore-quota"
-                )
+                EventInfo("StatefulSet/x", "FailedCreate", "exceeded quota: appstore-quota")
             )
         return snap
 
@@ -158,9 +146,7 @@ class FakeKube:
         self._terminating.pop(namespace, None)
         self.namespace_labels.pop(namespace, None)
         self.objects = {
-            k: v
-            for k, v in self.objects.items()
-            if k[2] != namespace and k[1] != namespace
+            k: v for k, v in self.objects.items() if k[2] != namespace and k[1] != namespace
         }
         self.replicas = {k: v for k, v in self.replicas.items() if k[0] != namespace}
 

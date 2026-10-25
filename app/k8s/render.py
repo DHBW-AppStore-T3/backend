@@ -96,9 +96,7 @@ class RenderSettings:
     zone: str
     ingress_class: str = "traefik"
     ingress_namespace: str = "kube-system"
-    tls_secret: str = (
-        ""  # wildcard cert Secret; empty => no ``tls`` block (cert-manager annotation instead)
-    )
+    tls_secret: str = ""  # wildcard cert Secret; empty => no ``tls`` block (cert-manager annotation instead)
     cluster_issuer: str = ""
     storage_class: str = ""
     node_selector: Mapping[str, str] = field(default_factory=dict)
@@ -188,9 +186,7 @@ def workload_refs(spec: AppSpec, teams: list[Team]) -> list[WorkloadRef]:
         ]
     names = [r.name for r in refs]
     if len(set(names)) != len(names):
-        raise ValueError(
-            "workload names collide; team names must be distinct after normalisation"
-        )
+        raise ValueError("workload names collide; team names must be distinct after normalisation")
     return refs
 
 
@@ -251,9 +247,7 @@ def _namespace(dep: DeploymentCtx, settings: RenderSettings) -> dict[str, Any]:
     return {"apiVersion": "v1", "kind": "Namespace", "metadata": meta}
 
 
-def _quota_and_limits(
-    spec: AppSpec, dep: DeploymentCtx, n: int
-) -> list[dict[str, Any]]:
+def _quota_and_limits(spec: AppSpec, dep: DeploymentCtx, n: int) -> list[dict[str, Any]]:
     assert spec.workload is not None
     total = _quantities(spec, n)
     hard: dict[str, str] = {
@@ -271,9 +265,7 @@ def _quota_and_limits(
         "metadata": _meta("appstore-quota", dep),
         "spec": {"hard": hard},
     }
-    biggest = max(
-        spec.workload.containers, key=lambda c: parse_memory_mib(c.resources.memory)
-    )
+    biggest = max(spec.workload.containers, key=lambda c: parse_memory_mib(c.resources.memory))
     limit_range = {
         "apiVersion": "v1",
         "kind": "LimitRange",
@@ -297,9 +289,7 @@ def _quota_and_limits(
     return [quota, limit_range]
 
 
-def _network_policies(
-    spec: AppSpec, dep: DeploymentCtx, settings: RenderSettings
-) -> list[dict[str, Any]]:
+def _network_policies(spec: AppSpec, dep: DeploymentCtx, settings: RenderSettings) -> list[dict[str, Any]]:
     assert spec.workload is not None
     port = next(c.expose.port for c in spec.workload.containers if c.expose)
 
@@ -322,9 +312,7 @@ def _network_policies(
                         "from": [
                             {
                                 "namespaceSelector": {
-                                    "matchLabels": {
-                                        "kubernetes.io/metadata.name": settings.ingress_namespace
-                                    }
+                                    "matchLabels": {"kubernetes.io/metadata.name": settings.ingress_namespace}
                                 }
                             }
                         ],
@@ -341,11 +329,7 @@ def _network_policies(
                     {
                         "to": [
                             {
-                                "namespaceSelector": {
-                                    "matchLabels": {
-                                        "kubernetes.io/metadata.name": "kube-system"
-                                    }
-                                },
+                                "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
                                 "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
                             }
                         ],
@@ -401,17 +385,13 @@ def _env_entries(c: Container, ref: WorkloadRef) -> list[dict[str, Any]]:
             out.append(
                 {
                     "name": e.name,
-                    "valueFrom": {
-                        "secretKeyRef": {"name": ref.name, "key": PASSWORD_KEY}
-                    },
+                    "valueFrom": {"secretKeyRef": {"name": ref.name, "key": PASSWORD_KEY}},
                 }
             )
         elif e.source == "team-name":
             out.append({"name": e.name, "value": ref.team})
         else:  # user-name
-            out.append(
-                {"name": e.name, "value": ref.user.name if ref.user else ref.team}
-            )
+            out.append({"name": e.name, "value": ref.user.name if ref.user else ref.team})
     return out
 
 
@@ -432,9 +412,7 @@ def _slot(values: Mapping[str, Any] | None, ref: WorkloadRef) -> Any:
     return None
 
 
-def _file_contents(
-    spec: AppSpec, ref: WorkloadRef, files: Mapping[str, Mapping[str, bytes]] | None
-):
+def _file_contents(spec: AppSpec, ref: WorkloadRef, files: Mapping[str, Mapping[str, bytes]] | None):
     """``[(variable, mountPath, bytes)]`` of the file variables ``ref`` got a file for."""
     out = []
     for v in spec.variables:
@@ -446,9 +424,7 @@ def _file_contents(
     return out
 
 
-def _variable_env(
-    spec: AppSpec, ref: WorkloadRef, values: Mapping[str, Any] | None
-) -> list[dict[str, Any]]:
+def _variable_env(spec: AppSpec, ref: WorkloadRef, values: Mapping[str, Any] | None) -> list[dict[str, Any]]:
     """Enum/string variables reach every container as ``APPSTORE_VAR_<NAME>``."""
     out = []
     for v in spec.variables:
@@ -492,16 +468,13 @@ def _workload_objects(
         mounts: list[dict[str, Any]] = []
         for i, path in enumerate(c.writable_paths):
             vol = f"{c.name}-tmp-{i}"
-            volumes.append(
-                {"name": vol, "emptyDir": {"sizeLimit": settings.scratch_size_limit}}
-            )
+            volumes.append({"name": vol, "emptyDir": {"sizeLimit": settings.scratch_size_limit}})
             mounts.append({"name": vol, "mountPath": path})
         if storage:
             mounts.append({"name": "data", "mountPath": storage.mount_path})
         if c.expose and file_items:
             mounts.extend(
-                {"name": "files", "mountPath": path, "subPath": key, "readOnly": True}
-                for key, path, _ in file_items
+                {"name": "files", "mountPath": path, "subPath": key, "readOnly": True} for key, path, _ in file_items
             )
         item: dict[str, Any] = {
             "name": c.name,
@@ -524,9 +497,7 @@ def _workload_objects(
             "volumeMounts": mounts,
         }
         if c.expose:
-            item["ports"] = [
-                {"name": "http", "containerPort": c.expose.port, "protocol": "TCP"}
-            ]
+            item["ports"] = [{"name": "http", "containerPort": c.expose.port, "protocol": "TCP"}]
             # Ready only once the exposed port accepts connections: without a
             # probe the pod is Ready at container start and the ingress answers
             # 502 until the app listens. A TCP check works for every app (an
@@ -606,16 +577,12 @@ def _workload_objects(
         "spec": {
             "type": "ClusterIP",
             "selector": sel,
-            "ports": [
-                {"name": "http", "port": exposed.expose.port, "targetPort": "http"}
-            ],
+            "ports": [{"name": "http", "port": exposed.expose.port, "targetPort": "http"}],
         },
     }
     ingress_meta = _meta(ref.name, dep, ref.name)
     if settings.cluster_issuer:
-        ingress_meta["annotations"] = {
-            "cert-manager.io/cluster-issuer": settings.cluster_issuer
-        }
+        ingress_meta["annotations"] = {"cert-manager.io/cluster-issuer": settings.cluster_issuer}
     host = ref.host(dep, settings)
     ingress_spec: dict[str, Any] = {
         "ingressClassName": settings.ingress_class,
@@ -627,9 +594,7 @@ def _workload_objects(
                         {
                             "path": exposed.expose.path,
                             "pathType": "Prefix",
-                            "backend": {
-                                "service": {"name": ref.name, "port": {"name": "http"}}
-                            },
+                            "backend": {"service": {"name": ref.name, "port": {"name": "http"}}},
                         }
                     ]
                 },
@@ -658,10 +623,7 @@ def _workload_objects(
                 "kind": "Secret",
                 "metadata": _meta(f"{ref.name}-files", dep, ref.name),
                 "type": "Opaque",
-                "data": {
-                    key: base64.b64encode(content).decode()
-                    for key, _, content in file_items
-                },
+                "data": {key: base64.b64encode(content).decode() for key, _, content in file_items},
             }
         )
     return [*objects, statefulset, service, ingress]
@@ -682,9 +644,7 @@ def _vm_namespace(dep: DeploymentCtx, settings: RenderSettings) -> dict[str, Any
     return {"apiVersion": "v1", "kind": "Namespace", "metadata": meta}
 
 
-def _vm_network_policies(
-    dep: DeploymentCtx, settings: RenderSettings
-) -> list[dict[str, Any]]:
+def _vm_network_policies(dep: DeploymentCtx, settings: RenderSettings) -> list[dict[str, Any]]:
     """Default-deny + ingress-controller + DNS for VM namespaces (no pod port known upfront)."""
 
     def policy(name: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -706,9 +666,7 @@ def _vm_network_policies(
                         "from": [
                             {
                                 "namespaceSelector": {
-                                    "matchLabels": {
-                                        "kubernetes.io/metadata.name": settings.ingress_namespace
-                                    }
+                                    "matchLabels": {"kubernetes.io/metadata.name": settings.ingress_namespace}
                                 }
                             }
                         ],
@@ -725,11 +683,7 @@ def _vm_network_policies(
                     {
                         "to": [
                             {
-                                "namespaceSelector": {
-                                    "matchLabels": {
-                                        "kubernetes.io/metadata.name": "kube-system"
-                                    }
-                                },
+                                "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
                                 "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
                             }
                         ],
@@ -748,13 +702,7 @@ def _vm_network_policies(
                 "policyTypes": ["Egress"],
                 "egress": [
                     {
-                        "to": [
-                            {
-                                "podSelector": {
-                                    "matchLabels": {"vm.kubevirt.io/name": "desktop"}
-                                }
-                            }
-                        ],
+                        "to": [{"podSelector": {"matchLabels": {"vm.kubevirt.io/name": "desktop"}}}],
                         "ports": [{"protocol": "TCP", "port": 5900}],
                     }
                 ],
@@ -810,21 +758,15 @@ def _vm_workload_objects(
         "spec": {
             "runStrategy": "Always",
             "template": {
-                "metadata": {
-                    "labels": {**labels, "vm.kubevirt.io/name": workload_name}
-                },
+                "metadata": {"labels": {**labels, "vm.kubevirt.io/name": workload_name}},
                 "spec": {
                     "domain": {
                         "cpu": {"cores": vm.cpu_cores},
                         "memory": {"guest": f"{vm.memory_gib}Gi"},
                         "devices": {
                             "disks": [{"name": "root", "disk": {"bus": "sata"}}],
-                            "interfaces": [
-                                {"name": "default", "masquerade": {}, "model": "e1000e"}
-                            ],
-                            "inputs": [
-                                {"name": "tablet", "type": "tablet", "bus": "usb"}
-                            ],
+                            "interfaces": [{"name": "default", "masquerade": {}, "model": "e1000e"}],
+                            "inputs": [{"name": "tablet", "type": "tablet", "bus": "usb"}],
                             "tpm": {},
                         },
                         "features": {"hyperv": {}, "acpi": {}},
@@ -842,9 +784,7 @@ def _vm_workload_objects(
         },
     }
     if ref.user:
-        virtual_machine["metadata"]["labels"][USER_LABEL] = label_value(
-            ref.user.user_id
-        )
+        virtual_machine["metadata"]["labels"][USER_LABEL] = label_value(ref.user.user_id)
 
     # Service: internal VNC + RDP targeting the virt-launcher pod
     vm_service: dict[str, Any] = {
@@ -878,9 +818,7 @@ def _vm_workload_objects(
         "metadata": {**_meta(novnc_name, dep, novnc_name), "labels": novnc_labels},
         "spec": {
             "replicas": 1,
-            "selector": {
-                "matchLabels": {WORKLOAD_LABEL: novnc_name, DEPLOYMENT_LABEL: dep.id}
-            },
+            "selector": {"matchLabels": {WORKLOAD_LABEL: novnc_name, DEPLOYMENT_LABEL: dep.id}},
             "template": {
                 "metadata": {"labels": novnc_labels},
                 "spec": {
@@ -956,9 +894,7 @@ def _vm_workload_objects(
     host = f"{novnc_name}-{dep.short_id}.{settings.app_domain}"
     ingress_meta = _meta(novnc_name, dep, novnc_name)
     if settings.cluster_issuer:
-        ingress_meta["annotations"] = {
-            "cert-manager.io/cluster-issuer": settings.cluster_issuer
-        }
+        ingress_meta["annotations"] = {"cert-manager.io/cluster-issuer": settings.cluster_issuer}
     tls_block: dict[str, Any] = {"hosts": [host]}
     if settings.tls_secret:
         tls_block["secretName"] = settings.tls_secret
@@ -1029,9 +965,7 @@ def render_vm(
         *_vm_network_policies(dep, settings),
     ]
     for ref in refs:
-        objects.extend(
-            _vm_workload_objects(spec, dep, ref, passwords[ref.name], settings)
-        )
+        objects.extend(_vm_workload_objects(spec, dep, ref, passwords[ref.name], settings))
     return objects
 
 
@@ -1066,11 +1000,7 @@ def render(
         *_network_policies(spec, dep, settings),
     ]
     for ref in refs:
-        objects.extend(
-            _workload_objects(
-                spec, dep, ref, passwords[ref.name], settings, files, variable_values
-            )
-        )
+        objects.extend(_workload_objects(spec, dep, ref, passwords[ref.name], settings, files, variable_values))
     return objects
 
 
@@ -1106,19 +1036,13 @@ def render_access(
         }
         username = None
         if pw and pw.username:
-            username = pw.username.format(
-                user=ref.user.name if ref.user else ref.team, team=ref.team
-            )
+            username = pw.username.format(user=ref.user.name if ref.user else ref.team, team=ref.team)
         entries.append(
             AccessEntry(
                 workload=ref.name,
                 team=ref.team,
                 user=ref.user,
-                url=(
-                    _checked_url(url_tpl.format(**fmt), ref.host(dep, settings))
-                    if url_tpl
-                    else None
-                ),
+                url=(_checked_url(url_tpl.format(**fmt), ref.host(dep, settings)) if url_tpl else None),
                 username=username,
                 password=passwords[ref.name] if pw else None,
             )

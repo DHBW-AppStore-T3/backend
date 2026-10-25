@@ -36,9 +36,7 @@ from pydantic import (
 API_VERSION = "appstore/v2"
 
 # registry[:port]/repo/path@sha256:<64 hex>. Tags are mutable, so only digests.
-_IMAGE_DIGEST_RE = re.compile(
-    r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9._-]+)+@sha256:[0-9a-f]{64}$"
-)
+_IMAGE_DIGEST_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9._-]+)+@sha256:[0-9a-f]{64}$")
 _NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CPU_RE = re.compile(r"^(\d+)m$|^(\d+(\.\d+)?)$")
@@ -63,17 +61,13 @@ def parse_cpu_millicores(value: str) -> int:
     m = _CPU_RE.match(value)
     if not m:
         raise ValueError(f"invalid CPU quantity {value!r} (use e.g. '500m' or '1')")
-    return (
-        int(m.group(1)) if m.group(1) is not None else round(float(m.group(2)) * 1000)
-    )
+    return int(m.group(1)) if m.group(1) is not None else round(float(m.group(2)) * 1000)
 
 
 def parse_memory_mib(value: str) -> int:
     m = _MEM_RE.match(value)
     if not m:
-        raise ValueError(
-            f"invalid memory quantity {value!r} (use e.g. '512Mi' or '1Gi')"
-        )
+        raise ValueError(f"invalid memory quantity {value!r} (use e.g. '512Mi' or '1Gi')")
     return int(m.group(1)) * (1024 if m.group(2) == "Gi" else 1)
 
 
@@ -112,9 +106,7 @@ def check_path(path: str, what: str, *, ingress: bool = False) -> None:
     neither.
     """
     if not path.startswith("/") or len(path) > MAX_PATH_LENGTH:
-        raise ValueError(
-            f"{what} must be an absolute path of at most {MAX_PATH_LENGTH} characters"
-        )
+        raise ValueError(f"{what} must be an absolute path of at most {MAX_PATH_LENGTH} characters")
     if path == "/":
         if ingress:
             return
@@ -124,9 +116,7 @@ def check_path(path: str, what: str, *, ingress: bool = False) -> None:
         segments = segments[:-1]
     for segment in segments:
         if segment in (".", "..") or not _PATH_SEGMENT_RE.match(segment):
-            raise ValueError(
-                f"{what} {path!r} may only contain plain segments (letters, digits, '.', '_', '-')"
-            )
+            raise ValueError(f"{what} {path!r} may only contain plain segments (letters, digits, '.', '_', '-')")
 
 
 class SpecValidationError(ValueError):
@@ -150,9 +140,7 @@ class PlatformLimits:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
-def limits_from(
-    registry_allowlist: str, max_cpu: str, max_memory: str, max_storage: str
-) -> PlatformLimits:
+def limits_from(registry_allowlist: str, max_cpu: str, max_memory: str, max_storage: str) -> PlatformLimits:
     """Platform limits from their settings (``APP_IMAGE_REGISTRY_ALLOWLIST``, ``APP_MAX_*``)."""
     return PlatformLimits(
         image_registry_allowlist=registry_prefixes(registry_allowlist),
@@ -238,9 +226,7 @@ class ResourceBounds(_Strict):
 
 class EnvVar(_Strict):
     name: str
-    source: Literal["generated-password", "team-name", "user-name"] | None = Field(
-        default=None, alias="from"
-    )
+    source: Literal["generated-password", "team-name", "user-name"] | None = Field(default=None, alias="from")
     value: str | None = None
 
     @model_validator(mode="after")
@@ -264,35 +250,19 @@ class Container(_Strict):
     @model_validator(mode="after")
     def _check(self) -> Container:
         if not _NAME_RE.match(self.name):
-            raise ValueError(
-                f"invalid container name {self.name!r} (lowercase letters, digits, '-')"
-            )
+            raise ValueError(f"invalid container name {self.name!r} (lowercase letters, digits, '-')")
         if not _IMAGE_DIGEST_RE.match(self.image):
-            raise ValueError(
-                "image must be pinned by digest: <registry>/<repo>@sha256:<64 hex> (tags are not allowed)"
-            )
+            raise ValueError("image must be pinned by digest: <registry>/<repo>@sha256:<64 hex> (tags are not allowed)")
         b = self.resource_bounds
         if b is not None:
             cpu, mem = (
                 parse_cpu_millicores(self.resources.cpu),
                 parse_memory_mib(self.resources.memory),
             )
-            if (
-                not parse_cpu_millicores(b.cpu.min)
-                <= cpu
-                <= parse_cpu_millicores(b.cpu.max)
-            ):
-                raise ValueError(
-                    "resources.cpu (the default) must lie within resourceBounds.cpu"
-                )
-            if (
-                not parse_memory_mib(b.memory.min)
-                <= mem
-                <= parse_memory_mib(b.memory.max)
-            ):
-                raise ValueError(
-                    "resources.memory (the default) must lie within resourceBounds.memory"
-                )
+            if not parse_cpu_millicores(b.cpu.min) <= cpu <= parse_cpu_millicores(b.cpu.max):
+                raise ValueError("resources.cpu (the default) must lie within resourceBounds.cpu")
+            if not parse_memory_mib(b.memory.min) <= mem <= parse_memory_mib(b.memory.max):
+                raise ValueError("resources.memory (the default) must lie within resourceBounds.memory")
         for p in self.writable_paths:
             check_path(p, "writablePaths entry")
         if len(set(self.writable_paths)) != len(self.writable_paths):
@@ -329,9 +299,7 @@ class Workload(_Strict):
             raise ValueError("container names must be unique")
         if sum(c.expose is not None for c in self.containers) != 1:
             raise ValueError("exactly one container must set 'expose'")
-        if self.storage is not None and any(
-            self.storage.mount_path in c.writable_paths for c in self.containers
-        ):
+        if self.storage is not None and any(self.storage.mount_path in c.writable_paths for c in self.containers):
             raise ValueError("storage.mountPath must not also be a writablePaths entry")
         return self
 
@@ -354,13 +322,8 @@ class Variable(_Strict):
             if not self.mount_path:
                 raise ValueError("file variables need an absolute mountPath")
             check_path(self.mount_path, "mountPath")
-            if (
-                self.max_size is not None
-                and parse_size_bytes(self.max_size) > MAX_FILE_VARIABLE_BYTES
-            ):
-                raise ValueError(
-                    "maxSize above 1Mi is not supported yet (Secret mount limit)"
-                )
+            if self.max_size is not None and parse_size_bytes(self.max_size) > MAX_FILE_VARIABLE_BYTES:
+                raise ValueError("maxSize above 1Mi is not supported yet (Secret mount limit)")
         if self.type == "enum":
             if not self.values:
                 raise ValueError("enum variables need 'values'")
@@ -395,9 +358,7 @@ class Access(_Strict):
 def _check_placeholders(template: str, allowed: set[str]) -> None:
     for _, field_name, _, _ in string.Formatter().parse(template):
         if field_name is not None and field_name not in allowed:
-            raise ValueError(
-                f"unknown placeholder {{{field_name}}} (allowed: {', '.join(sorted(allowed))})"
-            )
+            raise ValueError(f"unknown placeholder {{{field_name}}} (allowed: {', '.join(sorted(allowed))})")
 
 
 class UserChoices(_Strict):
@@ -421,9 +382,7 @@ class VmSpec(_Strict):
     @model_validator(mode="after")
     def _check(self) -> VmSpec:
         if not re.match(r"^[a-z][a-z0-9-]{0,62}$", self.image_ref):
-            raise ValueError(
-                f"invalid imageRef {self.image_ref!r} (lowercase letters, digits, '-')"
-            )
+            raise ValueError(f"invalid imageRef {self.image_ref!r} (lowercase letters, digits, '-')")
         return self
 
 
@@ -435,9 +394,7 @@ class AppSpec(_Strict):
     workload: Workload | None = None
     vm: VmSpec | None = None
     egress: Literal["none", "internet"] = "none"
-    pod_network: Literal["none", "namespace"] = Field(
-        default="none", alias="podNetwork"
-    )
+    pod_network: Literal["none", "namespace"] = Field(default="none", alias="podNetwork")
     user_choices: UserChoices | None = Field(default=None, alias="userChoices")
     variables: list[Variable] = Field(default_factory=list)
     access: list[Access] = Field(default_factory=list)
@@ -445,15 +402,11 @@ class AppSpec(_Strict):
     @model_validator(mode="after")
     def _check(self) -> AppSpec:
         if not _NAME_RE.match(self.name):
-            raise ValueError(
-                f"invalid app name {self.name!r} (lowercase letters, digits, '-')"
-            )
+            raise ValueError(f"invalid app name {self.name!r} (lowercase letters, digits, '-')")
         if self.runtime == "kubernetes" and self.workload is None:
             raise ValueError("runtime 'kubernetes' requires 'workload'")
         if self.runtime == "openstack-vm" and self.workload is not None:
-            raise ValueError(
-                "runtime 'openstack-vm' uses terraform/ + packer/, 'workload' is not allowed"
-            )
+            raise ValueError("runtime 'openstack-vm' uses terraform/ + packer/, 'workload' is not allowed")
         if self.runtime == "kubevirt-vm" and self.vm is None:
             raise ValueError("runtime 'kubevirt-vm' requires 'vm'")
         if self.runtime != "kubevirt-vm" and self.vm is not None:
@@ -463,9 +416,7 @@ class AppSpec(_Strict):
             raise ValueError("variable names must be unique")
         # File variables are mounted into the exposed container, next to its
         # other mounts; two mounts at one path are refused by the cluster.
-        files = [
-            v.mount_path for v in self.variables if v.type == "file" and v.mount_path
-        ]
+        files = [v.mount_path for v in self.variables if v.type == "file" and v.mount_path]
         if len(set(files)) != len(files):
             raise ValueError("file variables need distinct mountPaths")
         if self.workload is not None:
@@ -474,9 +425,7 @@ class AppSpec(_Strict):
             if self.workload.storage is not None:
                 taken.add(self.workload.storage.mount_path)
             if taken.intersection(files):
-                raise ValueError(
-                    "a file variable's mountPath is already used by writablePaths or storage"
-                )
+                raise ValueError("a file variable's mountPath is already used by writablePaths or storage")
         return self
 
 
@@ -523,10 +472,7 @@ def _limit_errors(spec: AppSpec, limits: PlatformLimits) -> list[dict[str, str]]
                 }
             )
         if c.resource_bounds is not None:
-            if (
-                parse_cpu_millicores(c.resource_bounds.cpu.max)
-                > limits.max_cpu_millicores
-            ):
+            if parse_cpu_millicores(c.resource_bounds.cpu.max) > limits.max_cpu_millicores:
                 errors.append(
                     {
                         "loc": f"{base}.resourceBounds.cpu.max",
@@ -559,9 +505,7 @@ def validate_spec(spec: AppSpec, limits: PlatformLimits | None = None) -> AppSpe
     return spec
 
 
-def parse_spec(
-    text: str | bytes | dict[str, Any], limits: PlatformLimits | None = None
-) -> AppSpec:
+def parse_spec(text: str | bytes | dict[str, Any], limits: PlatformLimits | None = None) -> AppSpec:
     """Parse and fully validate an ``appstore.yaml``. Raises :class:`SpecValidationError`."""
     if isinstance(text, dict):
         data: Any = text
@@ -569,21 +513,14 @@ def parse_spec(
         try:
             data = yaml.safe_load(text)
         except yaml.YAMLError as exc:
-            raise SpecValidationError(
-                [{"loc": "<root>", "msg": f"invalid YAML: {exc}"}]
-            ) from exc
+            raise SpecValidationError([{"loc": "<root>", "msg": f"invalid YAML: {exc}"}]) from exc
     if not isinstance(data, dict):
-        raise SpecValidationError(
-            [{"loc": "<root>", "msg": "spec must be a YAML mapping"}]
-        )
+        raise SpecValidationError([{"loc": "<root>", "msg": "spec must be a YAML mapping"}])
     try:
         spec = AppSpec.model_validate(data)
     except ValidationError as exc:
         raise SpecValidationError(
-            [
-                {"loc": _loc(e["loc"]), "msg": e["msg"].removeprefix("Value error, ")}
-                for e in exc.errors()
-            ]
+            [{"loc": _loc(e["loc"]), "msg": e["msg"].removeprefix("Value error, ")} for e in exc.errors()]
         ) from exc
     return validate_spec(spec, limits)
 
@@ -596,9 +533,7 @@ def _format_memory(mib: int) -> str:
     return f"{mib // 1024}Gi" if mib % 1024 == 0 else f"{mib}Mi"
 
 
-def apply_resource_overrides(
-    spec: AppSpec, overrides: Any, limits: PlatformLimits | None = None
-) -> AppSpec:
+def apply_resource_overrides(spec: AppSpec, overrides: Any, limits: PlatformLimits | None = None) -> AppSpec:
     """A copy of ``spec`` with the ``cpu``/``memory`` a person chose per container.
 
     ``overrides`` maps a container name to ``{"cpu": ..., "memory": ...}`` (either
@@ -612,9 +547,7 @@ def apply_resource_overrides(
     limits = limits or PlatformLimits()
     errors: list[dict[str, str]] = []
     if not isinstance(overrides, dict) or spec.workload is None:
-        raise SpecValidationError(
-            [{"loc": "resources", "msg": "must map container names to cpu/memory"}]
-        )
+        raise SpecValidationError([{"loc": "resources", "msg": "must map container names to cpu/memory"}])
     by_name = {c.name: c for c in spec.workload.containers}
     result = spec.model_copy(deep=True)
     new_by_name = {c.name: c for c in result.workload.containers}  # type: ignore[union-attr]
@@ -625,9 +558,7 @@ def apply_resource_overrides(
             errors.append({"loc": loc, "msg": "unknown container"})
             continue
         if container.resource_bounds is None:
-            errors.append(
-                {"loc": loc, "msg": "this container's resources cannot be changed"}
-            )
+            errors.append({"loc": loc, "msg": "this container's resources cannot be changed"})
             continue
         if not isinstance(choice, dict) or set(choice) - {"cpu", "memory"}:
             errors.append({"loc": loc, "msg": "only cpu and memory can be set"})
@@ -666,9 +597,7 @@ def apply_resource_overrides(
         if errors:
             continue
         target = new_by_name[name].resources
-        old_cpu, old_mem = parse_cpu_millicores(current.cpu), parse_memory_mib(
-            current.memory
-        )
+        old_cpu, old_mem = parse_cpu_millicores(current.cpu), parse_memory_mib(current.memory)
         if cpu is not None:
             target.cpu = _format_cpu(cpu)
         if mem is not None:
@@ -686,9 +615,7 @@ def apply_resource_overrides(
     return result
 
 
-def resource_choices(
-    spec: AppSpec, limits: PlatformLimits | None = None
-) -> list[dict[str, Any]]:
+def resource_choices(spec: AppSpec, limits: PlatformLimits | None = None) -> list[dict[str, Any]]:
     """What the wizard offers: per container with ``resourceBounds`` the default and range."""
     limits = limits or PlatformLimits()
     out: list[dict[str, Any]] = []
@@ -727,22 +654,16 @@ def apply_network_overrides(spec: AppSpec, choice: Any) -> AppSpec:
     if choice is None or choice == {}:
         return spec
     if not isinstance(choice, dict):
-        raise SpecValidationError(
-            [{"loc": "network", "msg": "must map internet/podNetwork to true or false"}]
-        )
+        raise SpecValidationError([{"loc": "network", "msg": "must map internet/podNetwork to true or false"}])
     allowed = spec.user_choices
     errors: list[dict[str, str]] = []
     for key, value in choice.items():
         loc = f"network.{key}"
         if key not in ("internet", "podNetwork"):
-            errors.append(
-                {"loc": loc, "msg": "unknown setting (allowed: internet, podNetwork)"}
-            )
+            errors.append({"loc": loc, "msg": "unknown setting (allowed: internet, podNetwork)"})
         elif not isinstance(value, bool):
             errors.append({"loc": loc, "msg": "must be true or false"})
-        elif allowed is None or not (
-            allowed.internet if key == "internet" else allowed.pod_network
-        ):
+        elif allowed is None or not (allowed.internet if key == "internet" else allowed.pod_network):
             errors.append({"loc": loc, "msg": "this setting cannot be changed"})
     if errors:
         raise SpecValidationError(errors)

@@ -31,9 +31,7 @@ VALID_VM_SPEC = {
         "storageClass": "cinder",
         "vncAccess": True,
     },
-    "access": [
-        {"type": "url", "template": "https://{workload}-{deployment}.apps.{zone}"}
-    ],
+    "access": [{"type": "url", "template": "https://{workload}-{deployment}.apps.{zone}"}],
 }
 
 DEP = DeploymentCtx(id="123e4567-e89b-12d3-a456-426614174000", owner="owner-id")
@@ -61,10 +59,7 @@ def test_kubevirt_vm_without_vm_block_is_rejected():
     del data["vm"]
     with pytest.raises(SpecValidationError) as exc:
         parse_spec(data)
-    assert any(
-        "vm" in e["msg"].lower() or "kubevirt" in e["msg"].lower()
-        for e in exc.value.errors
-    )
+    assert any("vm" in e["msg"].lower() or "kubevirt" in e["msg"].lower() for e in exc.value.errors)
 
 
 def test_kubernetes_runtime_with_vm_block_is_rejected():
@@ -142,9 +137,7 @@ def test_render_vm_returns_expected_object_kinds():
 def test_render_vm_namespace_is_privileged():
     _, objs, _ = _build_vm()
     ns = next(o for o in objs if o["kind"] == "Namespace")
-    assert (
-        ns["metadata"]["labels"]["pod-security.kubernetes.io/enforce"] == "privileged"
-    )
+    assert ns["metadata"]["labels"]["pod-security.kubernetes.io/enforce"] == "privileged"
     assert ns["metadata"]["labels"]["appstore.dhbw/vm-namespace"] == "true"
 
 
