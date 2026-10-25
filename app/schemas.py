@@ -494,7 +494,10 @@ class PodSetupProgress(BaseModel):
 
 
 class PodWorkloadSchema(BaseModel):
-    """One workload of a pod deployment, read live from the cluster (.github#4)."""
+    """One workload of a pod or kubevirt-vm deployment, read live from the cluster (.github#4).
+
+    The name is historic (pods came first); the schema serves both runtimes.
+    """
 
     workload: str
     team: str | None = None
