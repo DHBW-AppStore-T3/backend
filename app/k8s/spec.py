@@ -130,16 +130,29 @@ class PlatformLimits:
     max_memory_mib: int = 4096  # APP_MAX_MEMORY
     max_storage_mib: int = 20 * 1024  # APP_MAX_STORAGE
     max_containers: int = 3
+    # Namespaces a kubevirt-vm may clone its golden image from (APP_VM_IMAGE_NAMESPACES). The
+    # platform grants the clone access to exactly these, never to a namespace an app author names.
+    vm_image_namespaces: tuple[str, ...] = ("vm-poc",)
     extra: dict[str, Any] = field(default_factory=dict)
 
 
-def limits_from(registry_allowlist: str, max_cpu: str, max_memory: str, max_storage: str) -> PlatformLimits:
-    """Platform limits from their settings (``APP_IMAGE_REGISTRY_ALLOWLIST``, ``APP_MAX_*``)."""
+def limits_from(
+    registry_allowlist: str,
+    max_cpu: str,
+    max_memory: str,
+    max_storage: str,
+    vm_image_namespaces: str | None = None,
+) -> PlatformLimits:
+    """Platform limits from their settings (``APP_IMAGE_REGISTRY_ALLOWLIST``, ``APP_MAX_*``, ``APP_VM_IMAGE_NAMESPACES``)."""
+    extra = {}
+    if vm_image_namespaces is not None:
+        extra["vm_image_namespaces"] = tuple(n.strip() for n in vm_image_namespaces.split(",") if n.strip())
     return PlatformLimits(
         image_registry_allowlist=registry_prefixes(registry_allowlist),
         max_cpu_millicores=parse_cpu_millicores(max_cpu),
         max_memory_mib=parse_memory_mib(max_memory),
         max_storage_mib=parse_storage_mib(max_storage),
+        **extra,
     )
 
 
@@ -361,11 +374,36 @@ class UserChoices(_Strict):
     pod_network: StrictBool = Field(default=False, alias="podNetwork")
 
 
+class IntRange(_Strict):
+    """Inclusive ``min``..``max`` of a whole number (vCPU cores, GiB of memory)."""
+
+    min: int = Field(ge=1)
+    max: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def _order(self) -> IntRange:
+        if self.min > self.max:
+            raise ValueError("min must not exceed max")
+        return self
+
+
+class VmBounds(_Strict):
+    """What a person may choose for the VM's vCPUs and memory (opt-in, like ``resourceBounds``).
+
+    Without ``bounds`` the VM always runs with ``cpuCores``/``memoryGiB``, which are
+    the defaults of these ranges.
+    """
+
+    cpu_cores: IntRange = Field(alias="cpuCores")
+    memory_gib: IntRange = Field(alias="memoryGiB")
+
+
 class VmSpec(_Strict):
     """KubeVirt VM spec for runtime kubevirt-vm."""
 
     cpu_cores: int = Field(default=4, ge=1, le=16, alias="cpuCores")
     memory_gib: int = Field(default=8, ge=2, le=32, alias="memoryGiB")
+    bounds: VmBounds | None = None
     disk_gib: int = Field(default=80, ge=40, le=200, alias="diskGiB")
     # PVC name used as clone source; lives in imageNamespace
     image_ref: str = Field(alias="imageRef")
@@ -378,6 +416,16 @@ class VmSpec(_Strict):
     def _check(self) -> VmSpec:
         if not re.match(r"^[a-z][a-z0-9-]{0,62}$", self.image_ref):
             raise ValueError(f"invalid imageRef {self.image_ref!r} (lowercase letters, digits, '-')")
+        if not re.match(r"^[a-z][a-z0-9-]{0,62}$", self.image_namespace):
+            raise ValueError(f"invalid imageNamespace {self.image_namespace!r}")
+        b = self.bounds
+        if b is not None:
+            if not b.cpu_cores.min <= self.cpu_cores <= b.cpu_cores.max:
+                raise ValueError("cpuCores (the default) must lie within bounds.cpuCores")
+            if not b.memory_gib.min <= self.memory_gib <= b.memory_gib.max:
+                raise ValueError("memoryGiB (the default) must lie within bounds.memoryGiB")
+            if b.cpu_cores.max > 16 or b.memory_gib.min < 2 or b.memory_gib.max > 32:
+                raise ValueError("bounds exceed the VM limits (1-16 cores, 2-32 GiB)")
         return self
 
 
@@ -433,6 +481,13 @@ def _loc(parts: tuple[Any, ...]) -> str:
 
 def _limit_errors(spec: AppSpec, limits: PlatformLimits) -> list[dict[str, str]]:
     errors: list[dict[str, str]] = []
+    if spec.vm is not None and spec.vm.image_namespace not in limits.vm_image_namespaces:
+        errors.append(
+            {
+                "loc": "vm.imageNamespace",
+                "msg": f"namespace not allowed (allowed: {', '.join(limits.vm_image_namespaces)})",
+            }
+        )
     if spec.workload is None:
         return errors
     if len(spec.workload.containers) > limits.max_containers:
@@ -539,6 +594,8 @@ def apply_resource_overrides(spec: AppSpec, overrides: Any, limits: PlatformLimi
     """
     if not overrides:
         return spec
+    if spec.vm is not None:
+        return _apply_vm_overrides(spec, overrides)
     limits = limits or PlatformLimits()
     errors: list[dict[str, str]] = []
     if not isinstance(overrides, dict) or spec.workload is None:
@@ -610,10 +667,69 @@ def apply_resource_overrides(spec: AppSpec, overrides: Any, limits: PlatformLimi
     return result
 
 
+VM_RESOURCE_NAME = "vm"
+
+
+def _apply_vm_overrides(spec: AppSpec, overrides: Any) -> AppSpec:
+    """The VM's vCPUs/memory a person chose: ``{"vm": {"cpu": "4", "memory": "8Gi"}}``, whole cores and GiB."""
+    assert spec.vm is not None
+    if not isinstance(overrides, dict) or set(overrides) - {VM_RESOURCE_NAME}:
+        raise SpecValidationError([{"loc": "resources", "msg": f"a VM app has one resource, {VM_RESOURCE_NAME!r}"}])
+    choice = overrides[VM_RESOURCE_NAME]
+    loc = f"resources.{VM_RESOURCE_NAME}"
+    bounds = spec.vm.bounds
+    if bounds is None:
+        raise SpecValidationError([{"loc": loc, "msg": "this VM's resources cannot be changed"}])
+    if not isinstance(choice, dict) or set(choice) - {"cpu", "memory"}:
+        raise SpecValidationError([{"loc": loc, "msg": "only cpu and memory can be set"}])
+    errors: list[dict[str, str]] = []
+    cores, gib = spec.vm.cpu_cores, spec.vm.memory_gib
+    try:
+        if "cpu" in choice:
+            millis = parse_cpu_millicores(choice["cpu"])
+            if millis % 1000:
+                raise ValueError("whole cores only")
+            cores = millis // 1000
+        if "memory" in choice:
+            mib = parse_memory_mib(choice["memory"])
+            if mib % 1024:
+                raise ValueError("whole GiB only")
+            gib = mib // 1024
+    except (ValueError, TypeError) as exc:
+        raise SpecValidationError([{"loc": loc, "msg": str(exc)}]) from exc
+    if not bounds.cpu_cores.min <= cores <= bounds.cpu_cores.max:
+        errors.append(
+            {"loc": f"{loc}.cpu", "msg": f"must be between {bounds.cpu_cores.min} and {bounds.cpu_cores.max}"}
+        )
+    if not bounds.memory_gib.min <= gib <= bounds.memory_gib.max:
+        errors.append(
+            {"loc": f"{loc}.memory", "msg": f"must be between {bounds.memory_gib.min}Gi and {bounds.memory_gib.max}Gi"}
+        )
+    if errors:
+        raise SpecValidationError(errors)
+    result = spec.model_copy(deep=True)
+    assert result.vm is not None
+    result.vm.cpu_cores, result.vm.memory_gib = cores, gib
+    return result
+
+
 def resource_choices(spec: AppSpec, limits: PlatformLimits | None = None) -> list[dict[str, Any]]:
     """What the wizard offers: per container with ``resourceBounds`` the default and range."""
     limits = limits or PlatformLimits()
     out: list[dict[str, Any]] = []
+    if spec.vm is not None and spec.vm.bounds is not None:
+        b = spec.vm.bounds
+        return [
+            {
+                "container": VM_RESOURCE_NAME,
+                "cpu": {"default": str(spec.vm.cpu_cores), "min": str(b.cpu_cores.min), "max": str(b.cpu_cores.max)},
+                "memory": {
+                    "default": f"{spec.vm.memory_gib}Gi",
+                    "min": f"{b.memory_gib.min}Gi",
+                    "max": f"{b.memory_gib.max}Gi",
+                },
+            }
+        ]
     for c in spec.workload.containers if spec.workload else []:
         b = c.resource_bounds
         if b is None:

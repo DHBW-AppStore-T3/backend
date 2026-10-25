@@ -106,6 +106,8 @@ class Settings(BaseSettings):
     APP_MAX_CPU: str = "2"
     APP_MAX_MEMORY: str = "4Gi"
     APP_MAX_STORAGE: str = "20Gi"
+    # Namespaces a kubevirt-vm may clone its golden image from (comma separated).
+    APP_VM_IMAGE_NAMESPACES: str = "vm-poc"
     # At most this many workloads (one per team, or per person) in one
     # deployment, and optionally per owner across their live pod
     # deployments (0: no budget).

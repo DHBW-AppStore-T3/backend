@@ -57,12 +57,13 @@ class LoadedSpec:
 
 
 def platform_limits() -> PlatformLimits:
-    """Limits from the settings (``APP_IMAGE_REGISTRY_ALLOWLIST``, ``APP_MAX_*``)."""
+    """Limits from the settings (``APP_IMAGE_REGISTRY_ALLOWLIST``, ``APP_MAX_*``, ``APP_VM_IMAGE_NAMESPACES``)."""
     return limits_from(
         settings.APP_IMAGE_REGISTRY_ALLOWLIST,
         settings.APP_MAX_CPU,
         settings.APP_MAX_MEMORY,
         settings.APP_MAX_STORAGE,
+        settings.APP_VM_IMAGE_NAMESPACES,
     )
 
 
