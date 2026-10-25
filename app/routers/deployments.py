@@ -24,8 +24,7 @@ from app.crud import openstack_credentials as crud_openstack_credentials
 from app.crud import teams as crud_teams
 from app.crud import users as crud_users
 from app.database import SessionLocal, get_db
-from app.k8s.render import Member, workload_refs
-from app.k8s.render import Team as RenderTeam
+from app.k8s.render import Member, Team as RenderTeam, workload_refs
 from app.k8s.spec import MAX_FILE_VARIABLE_BYTES, parse_size_bytes
 from app.models import RUNTIME_K8S, RUNTIME_KUBEVIRT, RUNTIME_VM, TaskStatus, TaskType, User, UserRole
 from app.models import Task as TaskModel  # for ad-hoc state queries
