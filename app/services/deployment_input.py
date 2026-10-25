@@ -26,6 +26,7 @@ from fastapi import HTTPException, status
 
 from app.services import malware_scan
 from app.services.upload_validation import UploadRejected, inspect_upload
+from app.utils import upload_mac
 from app.utils.filenames import safe_filename
 
 logger = logging.getLogger(__name__)
@@ -261,14 +262,17 @@ def attach_files_to_user_input(
                     detail={"reason": "upload_scan_unavailable", "message": str(failed)},
                 )
 
+            stored_name = safe_filename(upload.name)
             encoded_slots[slot_key] = {
                 # Stored as a plain file name: apps write it to disk and the
                 # download route puts it into a header (.github#7 R).
-                "name": safe_filename(upload.name),
+                "name": stored_name,
                 "content_b64": content_b64,
                 "size": upload.size,
                 # Derived from the content; the client's claim is not stored.
                 "content_type": inspected.content_type,
+                # Proof for the worker that these bytes passed the checks above.
+                "mac": upload_mac.sign(var_name, slot_key, stored_name, decoded),
             }
         # scope=team|user: HCL type is map(map(object({...}))) —
         # outer key is the team/user slot, inner key is the upload slot.
@@ -570,5 +574,5 @@ def _file_var_metadata_only(value: dict) -> dict:
     """
     out: dict = {}
     for slot_key, slot in value.items():
-        out[slot_key] = {k: v for k, v in slot.items() if k != "content_b64"}
+        out[slot_key] = {k: v for k, v in slot.items() if k not in ("content_b64", "mac")}
     return out

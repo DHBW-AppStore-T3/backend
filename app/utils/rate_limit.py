@@ -77,7 +77,7 @@ def per_person(name: str, limit: int) -> Callable[..., User]:
 
 
 # The budgets: far above what a person clicks, far below what a script sends.
-DEPLOY = per_person("deploy", 30)
+DEPLOY = per_person("deploy", 10)
 REGISTER_APP = per_person("register-app", 30)
 SUBMIT_VERSION = per_person("submit-version", 60)
 USER_SEARCH = per_person("user-search", 120)

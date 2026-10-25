@@ -461,3 +461,29 @@ def test_soft_delete_drops_the_uploaded_bytes_but_keeps_the_metadata(
     assert row.deleted_at is not None
     assert "content_b64" not in row.userInputVar
     assert json.loads(row.userInputVar)["terraform"]["task_pdf"]["all"]["name"] == "x.pdf"
+
+
+@pytest.mark.integration
+def test_stored_file_carries_a_mac_the_worker_can_check(client, db, mock_user, patched_celery):
+    from app.utils import upload_mac
+
+    cred = _ensure_user_credentials(db, mock_user)
+    app = _ensure_app(db, mock_user)
+    pdf = b"%PDF-1.4\n" + b"PDF data" * 100
+    created = client.post(
+        "/deployments/",
+        json={
+            "name": "sealed",
+            "appId": str(app.appId),
+            "releaseTag": "v1",
+            "credentialId": str(cred.credentialId),
+            "files": {"task_pdf": {"all": {"name": "x.pdf", "content_b64": _b64(pdf), "size": len(pdf)}}},
+        },
+    ).json()
+    stored = db.query(Deployment).filter(Deployment.deploymentId == uuid.UUID(created["deploymentId"])).one()
+    entry = json.loads(stored.userInputVar)["terraform"]["task_pdf"]["all"]
+    assert entry["mac"] == upload_mac.sign("task_pdf", "all", "x.pdf", pdf)
+    assert entry["mac"] != upload_mac.sign("task_pdf", "all", "x.pdf", pdf + b"!")
+    # the seal is for the worker, not for API responses
+    detail = client.get(f"/deployments/{created['deploymentId']}").json()
+    assert "mac" not in detail["userInputVar"]["terraform"]["task_pdf"]["all"]
