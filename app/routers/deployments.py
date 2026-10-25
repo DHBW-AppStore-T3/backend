@@ -27,7 +27,7 @@ from app.database import SessionLocal, get_db
 from app.k8s.render import Member, workload_refs
 from app.k8s.render import Team as RenderTeam
 from app.k8s.spec import MAX_FILE_VARIABLE_BYTES, parse_size_bytes
-from app.models import RUNTIME_K8S, RUNTIME_VM, TaskStatus, TaskType, User, UserRole
+from app.models import RUNTIME_K8S, RUNTIME_KUBEVIRT, RUNTIME_VM, TaskStatus, TaskType, User, UserRole
 from app.models import Task as TaskModel  # for ad-hoc state queries
 from app.schemas import (
     DeploymentCreate,
@@ -414,16 +414,19 @@ def create_deployment(
             detail={"code": "version_not_approved", "version": deployment.releaseTag},
         )
 
-    # Pod app (appstore.yaml at the pinned commit) or VM app. Pods run in the
-    # cluster and never use an OpenStack credential, even a supplied one; the
-    # review of a public pod app covers exactly this spec (.github#4).
+    # Pod app or KubeVirt-VM app (appstore.yaml at the pinned commit) or VM app.
+    # Both cluster runtimes run in the cluster and never use an OpenStack
+    # credential; the review of a public pod/kubevirt app covers exactly this spec.
     loaded_spec = load_version_spec(target_app, deployment.releaseTag, commit_sha)
-    is_pods = loaded_spec is not None and loaded_spec.runtime == RUNTIME_K8S
+    spec_runtime = loaded_spec.runtime if loaded_spec is not None else None
+    is_cluster_app = spec_runtime in (RUNTIME_K8S, RUNTIME_KUBEVIRT)
+    is_pods = spec_runtime == RUNTIME_K8S
+    is_kubevirt = spec_runtime == RUNTIME_KUBEVIRT
     credential = None
-    if is_pods:
+    if is_cluster_app:
         approval = crud_approvals.get_approval(db, target_app.appId, deployment.releaseTag)
         if not target_app.is_private and (
-            approval is None or approval.runtime != RUNTIME_K8S or approval.spec_sha256 != loaded_spec.sha256
+            approval is None or approval.runtime not in (RUNTIME_K8S, RUNTIME_KUBEVIRT) or approval.spec_sha256 != loaded_spec.sha256
         ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -474,6 +477,8 @@ def create_deployment(
         loaded_spec = app_spec.with_resource_overrides(loaded_spec, deployment.userInputVar.get("resources"))
         loaded_spec = app_spec.with_network_overrides(loaded_spec, deployment.userInputVar.get("network"))
         workloads = _check_pod_workloads(db, current_user, loaded_spec, deployment.teams or [])
+    elif is_kubevirt:
+        workloads = _check_pod_workloads(db, current_user, loaded_spec, deployment.teams or [])
 
     db_deployment = crud_deployments.create_deployment(
         db,
@@ -481,7 +486,7 @@ def create_deployment(
         current_user.userId,
         commit_sha,
         os_project_id=credential.project_id if credential is not None else None,
-        runtime=RUNTIME_K8S if is_pods else RUNTIME_VM,
+        runtime=RUNTIME_KUBEVIRT if is_kubevirt else (RUNTIME_K8S if is_pods else RUNTIME_VM),
         k8s_workloads=workloads,
     )
 
@@ -528,8 +533,8 @@ def create_deployment(
             teams_dict[team.name] = team_users
 
     # The envelope carries ciphertext only — the worker decrypts in-process.
-    # Pods have none; their job carries the validated spec instead.
-    if is_pods:
+    # Cluster apps (pods + kubevirt) have none; their job carries the validated spec instead.
+    if is_cluster_app:
         openstack_envelope: dict = {}
         extra = {"spec": loaded_spec.payload(), "owner": str(current_user.userId)}
     else:
@@ -550,7 +555,7 @@ def create_deployment(
         celery_kwargs=_job_kwargs(db_deployment, user_vars, teams_dict, openstack_envelope, **extra),
         dispatch_error_label="Could not dispatch deployment task — please retry",
         rollback_on_conflict=True,
-        state_token=not is_pods,
+        state_token=not is_cluster_app,
     )
 
     db.refresh(db_deployment)
@@ -712,6 +717,11 @@ _TASK_NAMES = {
     (RUNTIME_K8S, TaskType.PAUSE): "pods.pause_deployment",
     (RUNTIME_K8S, TaskType.RESUME): "pods.resume_deployment",
     (RUNTIME_K8S, TaskType.REDEPLOY): "pods.redeploy_resource",
+    (RUNTIME_KUBEVIRT, TaskType.DEPLOY): "pods.deploy_vm_application",
+    (RUNTIME_KUBEVIRT, TaskType.DESTROY): "pods.destroy_deployment",
+    (RUNTIME_KUBEVIRT, TaskType.PAUSE): "pods.pause_deployment",
+    (RUNTIME_KUBEVIRT, TaskType.RESUME): "pods.resume_deployment",
+    (RUNTIME_KUBEVIRT, TaskType.REDEPLOY): "pods.redeploy_resource",
 }
 
 
@@ -1069,7 +1079,7 @@ def _dispatch_lifecycle_task(
         dispatch_error_label=f"Could not dispatch {task_type.value} task — please retry",
         rollback_on_conflict=False,
         after_task_id=after_task_id,
-        state_token=not is_pods,
+        state_token=not is_cluster_app,
     )
 
     return JSONResponse(

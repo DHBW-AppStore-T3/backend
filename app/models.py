@@ -23,11 +23,13 @@ from sqlalchemy.orm import relationship
 from app.database import Base
 from app.utils.time import utcnow
 
-# How a deployment runs: OpenTofu/Packer on OpenStack VMs (Windows apps), or
-# pods in the cluster rendered from the app's appstore.yaml (.github#4). The
-# values are the ``runtime`` names of the appstore.yaml contract.
+# How a deployment runs: OpenTofu/Packer on OpenStack VMs (Windows apps),
+# pods in the cluster rendered from the app's appstore.yaml (.github#4), or
+# KubeVirt VMs rendered from the app's appstore.yaml. The values are the
+# ``runtime`` names of the appstore.yaml contract.
 RUNTIME_VM = "openstack-vm"
 RUNTIME_K8S = "kubernetes"
+RUNTIME_KUBEVIRT = "kubevirt-vm"
 
 
 # ----------------------------------------------------------------
