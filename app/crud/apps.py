@@ -188,3 +188,17 @@ def set_recommended(db: Session, app_id: UUID, recommended: bool) -> App | None:
     db.commit()
     db.refresh(db_app)
     return db_app
+
+
+def set_deploy_version(db: Session, app_id: UUID, version_tag: str | None) -> App | None:
+    """Set (or with None clear) the version teachers deploy and commit; None if the app does not exist.
+
+    The caller checks that the version is approved. Soft-deleted apps are included.
+    """
+    db_app = get_app(db, app_id, include_deleted=True)
+    if not db_app:
+        return None
+    db_app.deploy_version = version_tag
+    db.commit()
+    db.refresh(db_app)
+    return db_app
