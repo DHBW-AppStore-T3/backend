@@ -169,7 +169,7 @@ def sync_user_from_keycloak(db: Session, keycloak_user_data: dict, *, _retry: bo
                 "Keycloak account %s changed its e-mail to one another account holds", keycloak_id
             )
     # Username is the login identifier shown in the UI and in
-    # Terraform-issued credentials; keep it in sync too.
+    # issued credentials; keep it in sync too.
     if username and user.username != username:
         user.username = username
         updated = True

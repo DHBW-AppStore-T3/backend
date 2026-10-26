@@ -22,7 +22,7 @@ password. Matching is exact now, never against the entry's own fields:
 No match, or more than one, means no credentials: the response is empty,
 never someone else's account.
 
-Output shape (what the app templates emit, ``terraform output -json``)::
+Output shape (the shape of the "outputs" a deploy task reports, ``{"<name>": {"value": ...}}``)::
 
     team_vms.value:      {"<team>": {"url" | "code_server_url": ..., ...}}
     user_accounts.value: {"<key>": {"type": "password" | "ssh_key" | "oauth"

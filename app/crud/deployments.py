@@ -287,7 +287,7 @@ def get_deployment_teams_with_members(db: Session, deployment_id: UUID) -> list[
 
 
 def get_deployment_outputs(db: Session, deployment_id: UUID) -> dict[str, Any] | None:
-    """Parsed Terraform outputs of the newest task that reported any.
+    """Parsed outputs of the newest task that reported any.
 
     Tasks without outputs (or with an empty set, e.g. a destroy) are
     skipped, so the outputs of the deploy behind them stay visible.
@@ -308,7 +308,7 @@ def get_deployment_outputs(db: Session, deployment_id: UUID) -> dict[str, Any] |
 def get_latest_successful_deploy_outputs(
     db: Session, deployment_id: UUID
 ) -> dict[str, Any] | None:
-    """Parsed Terraform outputs of the most recent *successful DEPLOY* task.
+    """Parsed outputs of the most recent *successful DEPLOY* task.
 
     Stricter than :func:`get_deployment_outputs`, which returns the latest
     task carrying any non-null ``outputs`` regardless of type or status — a

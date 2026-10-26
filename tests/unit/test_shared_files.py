@@ -32,7 +32,10 @@ SHARED = {
 @pytest.mark.parametrize("name", sorted(SHARED))
 def test_shared_file_matches_the_other_repository(name):
     content = (APP / name).read_bytes().replace(b"\r\n", b"\n")
-    assert hashlib.sha256(content).hexdigest() == SHARED[name], (
-        f"app/{name} differs from the version shared with the worker; "
-        "keep both copies identical and update the hash in both tests"
+    actual = hashlib.sha256(content).hexdigest()
+    assert actual == SHARED[name], (
+        f"app/{name} differs from the version shared with the worker (sha256 {actual}, pinned {SHARED[name]}). "
+        f"Changed it on purpose? Copy the file to worker/app/{name} and put the new hash into SHARED of "
+        "tests/unit/test_shared_files.py in BOTH repositories. Both services must roll out together "
+        "(the task contract is live between them). Otherwise restore the file."
     )

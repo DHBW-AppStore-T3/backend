@@ -9,7 +9,7 @@ Every endpoint enforces ``ensure_view_deployment_owner`` (which also prevents
 IDOR), so only the deployment creator, admins, and the course-teacher of a
 student owner's course can read task logs — which
 contain IPs and worker stack traces. Members get a 403 even though they can
-read deployment metadata. No endpoint returns a task's Terraform state or
+read deployment metadata. No endpoint returns a task's state or
 outputs (.github#7 E).
 """
 
