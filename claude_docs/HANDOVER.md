@@ -28,4 +28,3 @@ Lint (ruff, OpenAPI-Export als Artefakt) · Unit (`pytest -m unit`) · Integrati
 ## 4. Offen
 
 - Die Windows-App läuft über KubeVirt (`runtime: kubevirt-vm`); der Betrieb ist ein eigenes Thema (siehe `deployment/k8s/README.md`).
-- `tests/test_lti13_launch.py::test_lti13_routes_registered` schlägt im Dev-Container fehl (`AttributeError: '_IncludedRouter' object has no attribute 'path'`). Der Container installiert ohne `poetry.lock` (`Dockerfile.dev` kopiert nur `pyproject.toml`) und bekommt FastAPI 0.162.0 statt der gelockten 0.136.3.

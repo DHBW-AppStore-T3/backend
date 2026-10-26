@@ -50,19 +50,21 @@ Zwei Fallen im Dev-Container:
 1. Integrationstests leeren die Tabellen der Datenbank, auf die sie zeigen (`TRUNCATE`). Ohne `TEST_DATABASE_URL` ist das die Dev-Datenbank.
 2. Die Umgebung des Containers (`LTI13_SESSION_SECRET`, `KEYCLOAK_*` …) schlägt in die Tests durch; ein einfaches `poetry run pytest` im Container liefert Fehlschläge. Die Tests brauchen die Umgebung von CI: nur `DATABASE_URL`, `CREDENTIAL_ENCRYPTION_KEY`, `DISABLE_BACKGROUND_TASKS`.
 
-Rezept (in `deployment/`; Test-Datenbank einmalig anlegen, Tests mit leerer Umgebung):
+In `deployment/` erledigt das `make test-backend` (und `make test-backend-cov`): legt `backend_test` beim ersten Lauf an, läuft mit der Umgebung von CI und stellt danach das Login der Rolle `appstore_worker` wieder her. Das ist nötig, weil `tests/test_migrations.py` das Passwort dieser clusterweiten Rolle setzt und neue Verbindungen des Dev-Workers sonst scheitern. Der Befehl dahinter:
 
 ```bash
-docker compose -f docker-compose.dev.yml exec -T postgres psql -U postgres -c "CREATE DATABASE backend_test"
+docker compose -f docker-compose.dev.yml exec -T postgres psql -U postgres -c "CREATE DATABASE backend_test"   # nur beim ersten Mal
 docker compose -f docker-compose.dev.yml exec -T backend env -i HOME=/root \
   PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin \
   DATABASE_URL=postgresql://postgres:postgres@postgres:5432/backend_test \
   CREDENTIAL_ENCRYPTION_KEY=Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U= \
   DISABLE_BACKGROUND_TASKS=1 \
   poetry run pytest -m "unit or integration" -q --no-cov
+# danach: Login der Worker-Rolle wiederherstellen
+docker compose -f docker-compose.dev.yml exec -T backend poetry run python -m app.worker_db_role
 ```
 
-Ergebnis mit dem Stand `dev` und den gelockten Abhängigkeiten (`poetry.lock`, wie CI): 993 Tests bestanden. Im Dev-Container schlägt `tests/test_lti13_launch.py::test_lti13_routes_registered` fehl, solange `Dockerfile.dev` ohne `poetry.lock` installiert (siehe `claude_docs/HANDOVER.md`, Abschnitt Offen).
+Ergebnis mit dem Stand `dev`: 996 Tests bestanden.
 
 `tests/test_migrations.py` legt sich selbst eine Wegwerf-Datenbank an (braucht das Recht, Datenbanken anzulegen; sonst wird der Test übersprungen).
 

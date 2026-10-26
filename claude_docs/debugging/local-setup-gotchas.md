@@ -8,5 +8,6 @@
 - Port 8000 belegt: `BACKEND_PORT=8010 VITE_API_URL=http://localhost:8010 make init`.
 - App-Repositories klont/liest das Backend anonym von `github.com` (`APP_GIT_ALLOWED_HOSTS`); es gibt keinen Git-Token.
 - Security-Scan: `pip-audit` und Trivy laufen in CI (`.github/workflows/ci.yml`); Ausnahmen für Trivy stehen in `.trivyignore`.
-- `Dockerfile.dev` installiert ohne `poetry.lock`: der Dev-Container hat neuere Paketversionen als CI und Image (FastAPI 0.162.0 statt 0.136.3).
-- Die Umgebung des Dev-Containers verfälscht Tests; Rezept mit leerer Umgebung im `README.md`, Abschnitt Tests.
+- `Dockerfile.dev` installiert mit `poetry.lock`: der Dev-Container hat dieselben Paketversionen wie CI und Image. Nach Änderungen an `poetry.lock` `make dev-build`.
+- Die Umgebung des Dev-Containers verfälscht Tests. Tests nur über `make test-backend` (in `deployment/`) oder das Rezept im `README.md`.
+- `tests/test_migrations.py` ändert das Passwort der clusterweiten Rolle `appstore_worker`: neue Verbindungen des Dev-Workers scheitern, Deployments bleiben `pending`. Abhilfe: `make migrate-dev`.
