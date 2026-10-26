@@ -1434,6 +1434,7 @@ def get_my_access(
         return MyAccessResponse()
     return MyAccessResponse(
         user_accounts=result.get("user_accounts", {}),
+        team_endpoints=result.get("team_vms", {}),
         team_vms=result.get("team_vms", {}),
     )
 
