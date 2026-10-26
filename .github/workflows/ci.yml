@@ -496,6 +496,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write       # sign the image's origin (Sigstore, keyless)
+      attestations: write   # store that signature with GitHub
     outputs:
       digest: ${{ steps.push-image.outputs.digest }}
 
@@ -542,13 +544,23 @@ jobs:
           cache-to: type=gha,mode=max
           # Rebuilds the Debian upgrade layer (Dockerfile, APT_REFRESH).
           build-args: APT_REFRESH=${{ github.run_id }}
+      # Signs which repository, workflow, branch and commit built this digest (SLSA
+      # build provenance, keyless); the deployment repo rolls out only images that
+      # have it (.github/scripts/verify-image.sh there).
+      - name: Attest the image's origin
+        if: steps.push-image.outputs.digest != ''
+        uses: actions/attest@v4
+        with:
+          subject-name: ghcr.io/dhbw-appstore-t3/backend
+          subject-digest: ${{ steps.push-image.outputs.digest }}
 
   # ================================================================
   # ☸️ ROLL OUT ON KUBERNETES — dev -> staging, main -> prod
   # ================================================================
   # The deployment repo pins the image just pushed (tag sha-<commit>) by its
   # digest in k8s/images/<staging|prod>.yaml; Argo CD of that environment
-  # follows (see k8s-bump.yml there: a commit on dev, a PR on main).
+  # follows (see k8s-bump.yml there: a self-merging PR on dev,
+  # a PR on main that a person approves).
   k8s-rollout:
     name: "☸️ Roll out on k8s"
     runs-on: ubuntu-latest
@@ -558,10 +570,21 @@ jobs:
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
 
     steps:
+      # A one-hour token of the GitHub App "DHBW AppStore deploy" (installed only
+      # on the deployment repository, Actions: write), not a personal token.
+      - name: Token for the deployment repository
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.DEPLOY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
+          owner: DHBW-AppStore-T3
+          repositories: deployment
+          permission-actions: write
       - name: Pin the new image in the deployment repo
         run: |
           gh workflow run k8s-bump.yml --repo DHBW-AppStore-T3/deployment --ref "$GITHUB_REF_NAME" \
             -f component=backend -f tag="sha-${GITHUB_SHA::7}" -f digest="$DIGEST"
         env:
-          GH_TOKEN: ${{ secrets.DEPLOYMENT_PAT }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           DIGEST: ${{ needs.push.outputs.digest }}
