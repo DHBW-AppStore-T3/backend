@@ -77,7 +77,9 @@ from app.task_contract import (
     EVENT_SUCCEEDED,
     NOTIFY_TASK_CANCEL,
     TERMINAL_EVENTS,
+    USER_INPUT_VARIABLES_KEYS,
     terminal_payload,
+    user_input_variables,
 )
 from app.utils import rate_limit
 from app.utils.capabilities import (
@@ -739,7 +741,7 @@ def _check_pod_files(loaded_spec, user_input: dict | None) -> None:
     cluster, with an error nobody can act on. Conservative: the largest slot
     of every file variable is counted once.
     """
-    terraform_block = (user_input or {}).get("terraform") or {}
+    terraform_block = user_input_variables(user_input)
     total = 0
     for variable in loaded_spec.spec.variables:
         if variable.type != "file":
@@ -955,14 +957,13 @@ def _dispatch_lifecycle_task(
     # contents; keep them out of the job message. Redeploy and deploy do
     # (a reset recreates the files of the workload).
     if task_type in (TaskType.DESTROY, TaskType.PAUSE, TaskType.RESUME):
-        terraform_block = user_vars.get("terraform")
-        if isinstance(terraform_block, dict):
-            user_vars = {
-                **user_vars,
-                "terraform": {
-                    k: v for k, v in terraform_block.items() if not looks_like_file_var(v)
-                },
-            }
+        for block_key in USER_INPUT_VARIABLES_KEYS:
+            block = user_vars.get(block_key)
+            if isinstance(block, dict):
+                user_vars = {
+                    **user_vars,
+                    block_key: {k: v for k, v in block.items() if not looks_like_file_var(v)},
+                }
 
     teams_dict: dict = {}
     if deployment.teams:
@@ -1342,8 +1343,7 @@ def download_deployment_file(
     except json.JSONDecodeError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No files")
 
-    tf_block = user_input.get("terraform") if isinstance(user_input, dict) else None
-    var_value = (tf_block or {}).get(var_name)
+    var_value = user_input_variables(user_input).get(var_name)
     if not looks_like_file_var(var_value):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

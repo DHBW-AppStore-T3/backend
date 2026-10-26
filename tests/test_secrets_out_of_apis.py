@@ -80,7 +80,8 @@ def test_legacy_rows_are_sealed_and_scrubbed(db, mock_user, capsys):
     db.expire_all()
     row = db.get(Task, task.taskId)
     assert row.outputs is None and row.tf_state is None
-    assert open_results(crypto.results_cipher, row.outputs_enc) == {"terraform_outputs": OUTPUTS, "tf_state": state}
+    opened = open_results(crypto.results_cipher, row.outputs_enc)
+    assert (opened["terraform_outputs"], opened["tf_state"]) == (OUTPUTS, state)
     logs = json.loads(row.logs)
     assert logs[0] == plain
     assert logs[1]["output_names"] == ["ip", "user_accounts"]

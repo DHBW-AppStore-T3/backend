@@ -43,6 +43,7 @@ from sqlalchemy.orm import Session
 
 from app.crud import deployments as crud_deployments
 from app.models import User
+from app.task_contract import team_endpoints_output
 
 
 def _output_value(outputs: dict[str, Any] | None, key: str) -> Any:
@@ -56,9 +57,8 @@ def _output_value(outputs: dict[str, Any] | None, key: str) -> Any:
 
 
 def team_vms(outputs: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
-    """The ``team_vms`` output, or ``{}``."""
-    val = _output_value(outputs, "team_vms")
-    return val if isinstance(val, dict) else {}
+    """The team-endpoint output (``team_endpoints``, or the legacy ``team_vms``), or ``{}``."""
+    return team_endpoints_output(outputs)
 
 
 def user_accounts(outputs: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
