@@ -72,6 +72,14 @@ class VmiInfo:
 
 
 @dataclass
+class VmInfo:
+    """A KubeVirt VirtualMachine (the desired state; its VMI exists only while it runs)."""
+
+    name: str
+    run_strategy: str = "Always"  # Always, Halted, ...
+
+
+@dataclass
 class EventInfo:
     object: str
     reason: str
@@ -93,6 +101,12 @@ class Snapshot:
     vmis: list[VmiInfo] = field(default_factory=list)
     # Names of the volume claims, with the workload each belongs to.
     pvcs: list[tuple[str, str]] = field(default_factory=list)
+    # kubevirt-vm namespaces: the VirtualMachines themselves (also while halted).
+    virtual_machines: list[VmInfo] = field(default_factory=list)
+    # Phase per volume claim (Pending, Bound, ...) and the Warning events of the claims
+    # as (claim name, reason, message): a stuck clone shows up here, not on a pod.
+    pvc_phases: dict[str, str] = field(default_factory=dict)
+    pvc_issues: list[tuple[str, str, str]] = field(default_factory=list)
     pods: list[PodInfo] = field(default_factory=list)
     events: list[EventInfo] = field(default_factory=list)
 
@@ -108,6 +122,8 @@ class Kube(Protocol):
     def namespaces(self, label_selector: str) -> list[str]: ...
     def snapshot(self, namespace: str) -> Snapshot: ...
     def scale(self, namespace: str, statefulset: str, replicas: int) -> None: ...
+    def scale_deployment(self, namespace: str, name: str, replicas: int) -> None: ...
+    def set_run_strategy(self, namespace: str, vm_name: str, run_strategy: str) -> None: ...
     def delete_pod(self, namespace: str, pod: str) -> None: ...
     def delete_pvcs(self, namespace: str, workload: str) -> None: ...
 
@@ -192,12 +208,16 @@ class KubeApi:
                     DeploymentInfo(d.metadata.name, d.spec.replicas or 0, d.status.ready_replicas or 0)
                 )
             snap.vmis.extend(self._vmis(namespace))
+            snap.virtual_machines.extend(self._virtual_machines(namespace))
         for c in self._core.list_namespaced_persistent_volume_claim(namespace).items:
             snap.pvcs.append((c.metadata.name, (c.metadata.labels or {}).get(WORKLOAD_LABEL, "")))
+            snap.pvc_phases[c.metadata.name] = (c.status.phase if c.status else None) or "Pending"
         for p in self._core.list_namespaced_pod(namespace).items:
             snap.pods.append(_pod_info(p))
         for ev in self._core.list_namespaced_event(namespace).items:
             if ev.type == "Warning":
+                if ev.involved_object.kind == "PersistentVolumeClaim":
+                    snap.pvc_issues.append((ev.involved_object.name, ev.reason or "", ev.message or ""))
                 snap.events.append(
                     EventInfo(
                         f"{ev.involved_object.kind}/{ev.involved_object.name}",
@@ -225,6 +245,28 @@ class KubeApi:
                 )
             )
         return out
+
+    def _virtual_machines(self, namespace: str) -> list[VmInfo]:
+        resource = self._dyn.resources.get(api_version="kubevirt.io/v1", kind="VirtualMachine")
+        return [
+            VmInfo(item["metadata"]["name"], (item.get("spec") or {}).get("runStrategy") or "Always")
+            for item in resource.get(namespace=namespace).items
+        ]
+
+    def scale_deployment(self, namespace: str, name: str, replicas: int) -> None:
+        # The deployer may patch deployments but has no deployments/scale right.
+        self._apps.patch_namespaced_deployment(name, namespace, {"spec": {"replicas": replicas}})
+
+    def set_run_strategy(self, namespace: str, vm_name: str, run_strategy: str) -> None:
+        """Merge patch of ``spec.runStrategy`` (Halted stops the VM, Always starts it)."""
+        resource = self._dyn.resources.get(api_version="kubevirt.io/v1", kind="VirtualMachine")
+        self._dyn.patch(
+            resource,
+            body={"spec": {"runStrategy": run_strategy}},
+            name=vm_name,
+            namespace=namespace,
+            content_type="application/merge-patch+json",
+        )
 
     def scale(self, namespace: str, statefulset: str, replicas: int) -> None:
         self._apps.patch_namespaced_stateful_set_scale(statefulset, namespace, {"spec": {"replicas": replicas}})
