@@ -7,7 +7,7 @@ result backend) to reconcile against. What is left to look after:
 1. **Dead workers.** A RUNNING task whose lease ran out belongs to a worker
    that stopped renewing it (crashed, killed, cut off from the database).
    The task is failed as ``worker_lost`` with a terminal event, so open
-   streams end. Nothing is retried: a half-applied Terraform run needs a
+   streams end. Nothing is retried: a half-applied deployment needs a
    person to look at it (destroy or deploy again from the UI).
 2. **Lost dispatches.** A PENDING task without a queue message, older than
    ``DISPATCH_GRACE_SECONDS``: the API process died between committing the

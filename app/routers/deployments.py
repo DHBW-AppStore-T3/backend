@@ -209,7 +209,7 @@ def get_deployment(
     - User and App relations
     - Teams with members
     - Latest task status
-    - Terraform outputs
+    - Task outputs (the "terraform_outputs" of the result contract)
     - Optionally: full logs (use include_logs=true)
     """
     deployment = crud_deployments.get_deployment_with_details(db, deployment_id)
@@ -1313,7 +1313,7 @@ def download_deployment_file(
     """Stream the raw bytes of one wizard-uploaded file back to the owner.
 
     Path components mirror how the upload was indexed:
-      * ``var_name`` — the ``@openstack:file:*`` variable name
+      * ``var_name`` — the name of the file variable (``type: file`` in appstore.yaml)
       * ``slot_key`` — the inner-map key (``"all"`` for scope=all,
         team name for scope=team, ``Team-User`` composite for scope=user)
 
