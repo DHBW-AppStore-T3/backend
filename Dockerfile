@@ -68,9 +68,14 @@ ENV PYTHONUNBUFFERED=1 \
 # blocks the push on any HIGH/CRITICAL OS finding, so even though it
 # enlarges the layer slightly we'd rather take the bytes than burn a
 # .trivyignore line every time upstream debian releases a CVE-fix.
+# SECURITY_REFRESH changes on every CI build (ci.yml passes the run id), so this
+# layer is never taken from the build cache: a cached layer kept the package
+# state of its first build and missed every Debian fix released since (the
+# Trivy gate then failed on e.g. libbrotli1 CVE-2026-111497 although
+# 1.1.0-2+deb13u1 was out).
+ARG SECURITY_REFRESH=""
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     git \
-    openssh-client \
     postgresql-client \
     curl \
     ca-certificates \

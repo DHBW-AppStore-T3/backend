@@ -116,6 +116,30 @@ TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engin
 
 
 # ----------------------------------------------------------------
+# Marker-Pflicht
+# ----------------------------------------------------------------
+def pytest_collection_modifyitems(config, items):
+    """Refuse tests that CI would never run.
+
+    CI runs ``pytest -m unit`` and ``pytest -m integration`` and nothing
+    else, so a test with neither marker passes or fails unseen. Mark a whole
+    file with ``pytestmark = pytest.mark.unit`` (no database: put it in
+    ``tests/unit/``) or ``pytest.mark.integration``.
+    """
+    unmarked = sorted(
+        {
+            item.nodeid.split("::")[0]
+            for item in items
+            if item.get_closest_marker("unit") is None and item.get_closest_marker("integration") is None
+        }
+    )
+    if unmarked:
+        raise pytest.UsageError(
+            "tests without a 'unit' or 'integration' marker are never run by CI: " + ", ".join(unmarked)
+        )
+
+
+# ----------------------------------------------------------------
 # Schema-Lifecycle — einmal pro pytest-Session.
 # ----------------------------------------------------------------
 @pytest.fixture(scope="session", autouse=True)
@@ -163,21 +187,49 @@ def _truncate_tables(_setup_schema):
 # ----------------------------------------------------------------
 # Fake Git remote — no test reaches a real Git host.
 # ----------------------------------------------------------------
+DEFAULT_SPEC = {
+    "apiVersion": "appstore/v2",
+    "name": "test-app",
+    "runtime": "kubernetes",
+    "scope": "team",
+    "workload": {
+        "containers": [
+            {
+                "name": "app",
+                "image": "ghcr.io/dhbw-appstore-t3/apps/test-app@sha256:" + "a" * 64,
+                "expose": {"port": 8080},
+                "resources": {"cpu": "500m", "memory": "1Gi"},
+            }
+        ],
+    },
+}
+
+
+def spec_with(**changes) -> str:
+    """The default ``appstore.yaml`` with top-level keys replaced (``None`` removes one)."""
+    import yaml
+
+    spec = {**DEFAULT_SPEC, **changes}
+    return yaml.safe_dump({k: v for k, v in spec.items() if v is not None})
+
+
 class FakeGitRemote:
     """Stands in for the app repositories behind ``git_service``.
 
     ``tags`` maps tag -> commit SHA. With ``any_tag`` (the default) every
     tag a test asks for exists and points to ``sha_for(tag)``; set
     ``any_tag = False`` to make only ``tags`` exist. ``files`` maps a path
-    inside the repository to its content and is written into every sparse
-    clone, so ``load_variable_definitions`` parses it. ``moved`` makes a
+    inside the repository to its content (by default a valid
+    ``appstore.yaml``) and is written into every sparse clone, so
+    ``load_variable_definitions`` parses it. ``moved`` makes a
     tag point to another commit from now on (a moved tag).
     """
 
     def __init__(self) -> None:
         self.any_tag = True
         self.tags: dict[str, str] = {}
-        self.files: dict[str, str] = {}
+        # Every commit holds a valid appstore.yaml unless a test replaces it.
+        self.files: dict[str, str] = {"appstore.yaml": spec_with()}
         self.clones: list[tuple[str, str, str]] = []
         self.readable = True
 
@@ -219,6 +271,15 @@ class FakeGitRemote:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
         return str(path)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_rate_limits():
+    """Every test starts with untouched per-person budgets (app/utils/rate_limit.py)."""
+    from app.utils import rate_limit
+
+    rate_limit.limiter.reset()
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -397,8 +458,11 @@ def unauth_client():
 # ----------------------------------------------------------------
 # SHARED DB HELPERS
 # ----------------------------------------------------------------
-def approve_version_in_db(db, app, version_tag="v1.0.0", commit_sha=None, status=None):
-    """Store an approval of ``version_tag`` at ``commit_sha`` (default: what the fake remote resolves)."""
+def approve_version_in_db(db, app, version_tag="v1.0.0", commit_sha=None, status=None, spec_sha256=None):
+    """Store an approval of ``version_tag`` at ``commit_sha`` (default: what the fake remote resolves).
+
+    It covers the default ``appstore.yaml`` of ``FakeGitRemote`` unless ``spec_sha256`` says otherwise.
+    """
     from app.models import AppVersionApproval, AppVersionApprovalStatus
 
     approval = AppVersionApproval(
@@ -406,6 +470,8 @@ def approve_version_in_db(db, app, version_tag="v1.0.0", commit_sha=None, status
         version_tag=version_tag,
         commit_sha=commit_sha or FakeGitRemote.sha_for(version_tag),
         status=status or AppVersionApprovalStatus.APPROVED,
+        runtime="kubernetes",
+        spec_sha256=spec_sha256 or hashlib.sha256(spec_with().encode()).hexdigest(),
     )
     db.add(approval)
     db.commit()
@@ -425,43 +491,3 @@ def create_app_in_db(db, user, *, name="Test App", git_link="https://github.com/
     db.commit()
     db.refresh(db_app)
     return db_app
-
-
-TEST_PROJECT = "project-1"
-
-
-def add_credential(
-    db,
-    user,
-    project_id=TEST_PROJECT,
-    *,
-    project_name="Projekt 1",
-    identifier="app-cred-id",
-    verified=True,
-    auth_url="https://keystone.example/v3",
-    credential_id=None,
-):
-    """A stored application credential of ``user`` for ``project_id``.
-
-    ``verified=False`` is a credential from before projects were taken from
-    Keystone (``project_id`` is whatever was typed).
-    """
-    from app.models import OpenStackAuthType, UserOpenStackCredential
-    from app.utils import crypto
-
-    row = UserOpenStackCredential(
-        credentialId=credential_id or uuid.uuid4(),
-        userId=user.userId,
-        auth_type=OpenStackAuthType.APPLICATION_CREDENTIAL,
-        auth_url=auth_url,
-        region_name="RegionOne",
-        project_id=project_id,
-        project_name=project_name,
-        project_verified=verified,
-        encrypted_identifier=crypto.encrypt(identifier),
-        encrypted_secret=crypto.encrypt("app-cred-secret"),
-    )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return row

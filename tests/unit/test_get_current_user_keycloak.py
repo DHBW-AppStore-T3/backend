@@ -1,3 +1,4 @@
+import uuid
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -17,19 +18,59 @@ def _credentials(token: str) -> HTTPAuthorizationCredentials:
 def test_rejects_missing_credentials():
     db = MagicMock()
     with pytest.raises(HTTPException) as exc_info:
-        get_current_user_keycloak(credentials=None, db=db)
+        get_current_user_keycloak(credentials=None, x_dev_user=None, db=db)
     assert exc_info.value.status_code == 401
+
+
+def test_dev_user_header_returns_db_user_in_development():
+    db = MagicMock()
+    mock_user = MagicMock(email="prof@dhbw.de")
+    db.query.return_value.filter.return_value.first.return_value = mock_user
+
+    with patch.object(settings, "APP_ENV", "development"):
+        result = get_current_user_keycloak(credentials=None, x_dev_user="prof@dhbw.de", db=db)
+
+    assert result.email == "prof@dhbw.de"
+
+
+def test_dev_user_header_unknown_email_raises_401():
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = None
+
+    with patch.object(settings, "APP_ENV", "development"), pytest.raises(HTTPException) as exc_info:
+        get_current_user_keycloak(credentials=None, x_dev_user="ghost@dhbw.de", db=db)
+
+    assert exc_info.value.status_code == 401
+
+
+def test_dev_user_header_ignored_in_production():
+    db = MagicMock()
+    with (
+        patch.object(settings, "APP_ENV", "production"),
+        patch.object(settings, "LTI13_SESSION_SECRET", "change-me-in-production"),
+        patch(
+            "app.utils.keycloak_auth.verify_keycloak_token_offline",
+            return_value={"sub": "kc-1", "email": "kc@example.com", "realm_access": {"roles": []}},
+        ),
+        patch("app.utils.keycloak_auth.sync_user_from_keycloak") as mock_sync,
+    ):
+        mock_sync.return_value = MagicMock(email="kc@example.com")
+        result = get_current_user_keycloak(
+            credentials=_credentials("some-token"), x_dev_user="prof@dhbw.de", db=db
+        )
+
+    assert result.email == "kc@example.com"
 
 
 def test_lti_token_valid_but_no_matching_user_falls_through_to_keycloak():
     db = MagicMock()
-    db.query.return_value.filter.return_value.first.return_value = None
+    db.get.return_value = None
 
     with (
         patch.object(settings, "LTI13_SESSION_SECRET", "test-secret"),
         patch(
             "app.utils.keycloak_auth.lti13_service.verify_session_token",
-            return_value="ghost@example.com",
+            return_value=uuid.uuid4(),
         ),
         patch(
             "app.utils.keycloak_auth.verify_keycloak_token_offline",
@@ -39,7 +80,7 @@ def test_lti_token_valid_but_no_matching_user_falls_through_to_keycloak():
     ):
         mock_sync.return_value = MagicMock(email="kc@example.com")
         result = get_current_user_keycloak(
-            credentials=_credentials("lti-token-for-unknown-user"), db=db
+            credentials=_credentials("lti-token-for-unknown-user"), x_dev_user=None, db=db
         )
 
     assert result.email == "kc@example.com"
@@ -56,7 +97,9 @@ def test_skips_lti_check_when_secret_is_default():
         patch("app.utils.keycloak_auth.sync_user_from_keycloak") as mock_sync,
     ):
         mock_sync.return_value = MagicMock(email="kc@example.com")
-        result = get_current_user_keycloak(credentials=_credentials("some-token"), db=db)
+        result = get_current_user_keycloak(
+            credentials=_credentials("some-token"), x_dev_user=None, db=db
+        )
 
     assert result.email == "kc@example.com"
 
@@ -71,6 +114,8 @@ def test_rejects_keycloak_token_missing_sub():
         ),
         pytest.raises(HTTPException) as exc_info,
     ):
-        get_current_user_keycloak(credentials=_credentials("some-token"), db=db)
+        get_current_user_keycloak(
+            credentials=_credentials("some-token"), x_dev_user=None, db=db
+        )
 
     assert exc_info.value.status_code == 401

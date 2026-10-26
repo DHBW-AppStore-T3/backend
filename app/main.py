@@ -16,11 +16,7 @@ from app.routers import (
     courses,
     dashboard,
     deployments,
-    internal_tfstate,
     lti13,
-    openstack_credentials,
-    openstack_resources,
-    quotas,
     tasks,
     teams,
     users,
@@ -28,6 +24,7 @@ from app.routers import (
 from app.services import task_service
 from app.services.reconciler import run_reconciler
 from app.services.task_events import hub
+from app.utils.cross_site import CrossSiteWriteGuard
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +149,13 @@ app.add_middleware(
 )
 
 # ----------------------------------------------------------------
+# CROSS-SITE WRITES
+# ----------------------------------------------------------------
+# Student apps share the platform's site; a write a browser sends for
+# another page is refused (review S3). Outermost, so it runs first.
+app.add_middleware(CrossSiteWriteGuard, trusted_origins=settings.trusted_write_origins)
+
+# ----------------------------------------------------------------
 # ROUTERS
 # ----------------------------------------------------------------
 app.include_router(auth_keycloak.router, prefix="/auth", tags=["Authentication"])
@@ -164,19 +168,6 @@ app.include_router(tasks.router, prefix="/tasks", tags=["Tasks"])
 app.include_router(teams.router, prefix="/teams", tags=["Teams"])
 app.include_router(dashboard.router, prefix="/dashboard", tags=["Dashboard"])
 app.include_router(lti13.router)
-app.include_router(openstack_credentials.router, tags=["OpenStack Credentials"])
-app.include_router(quotas.router, tags=["OpenStack Credentials"])
-# Read API for the OpenStack resources of one of the caller's credentials
-# (networks, flavors, images, ...), used by the wizard's value-help
-# dropdowns so users don't have to type UUIDs from Horizon.
-app.include_router(
-    openstack_resources.router,
-    prefix="/me/openstack-credentials/{credential_id}/resources",
-    tags=["OpenStack Resources"],
-)
-# OpenTofu's HTTP state backend for the worker's VM jobs. Not in the
-# OpenAPI document; the ingress does not route /api/internal/.
-app.include_router(internal_tfstate.router, prefix="/internal/tfstate")
 
 
 # ----------------------------------------------------------------

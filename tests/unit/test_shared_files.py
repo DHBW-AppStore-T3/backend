@@ -2,8 +2,7 @@
 
 ``app/pgq.py`` (the Kombu transport), ``app/task_contract.py`` (event
 types, payloads, sealed results), ``app/git_urls.py`` (the Git host
-allowlist, .github#7 B), ``app/keystone_urls.py`` (the Keystone URL
-allowlist, .github#7 C) and ``app/k8s/`` (the pod contract, renderer and
+allowlist, .github#7 B) and ``app/k8s/`` (the pod contract, renderer and
 cluster access, .github#4) exist in ``backend`` and ``worker`` until a shared
 package is decided. The same test in both repositories pins their
 content: change a file in one repository, copy it to the other and update
@@ -19,14 +18,13 @@ APP = Path(__file__).resolve().parents[2] / "app"
 
 SHARED = {
     "git_urls.py": "c9b06a9fd9fc28b226e365eb4f90aa002a0205c11d2ba2abcda99b2e95258583",
-    "keystone_urls.py": "a1f8533680323af3e943a98a3fe27812b2e2501484a30516309bb00d2d2a254f",
     "k8s/__init__.py": "500314b04df7e61475d0e29efb5c22a3b7bd2d4b6df7f0ebf3ab55f150d53274",
-    "k8s/fake.py": "723c36ec725922ff45937c9b9df61019730ef8b7123c39dd69413f753bd647d5",
-    "k8s/kube.py": "c9aafff959cb13b8deb49b4c546a48421ecaca5a41f29d301a229c6cb66229e3",
-    "k8s/render.py": "0f5117422fb22a322f87e95e6f83e08716773a66a83246245838470cc8fc4562",
-    "k8s/spec.py": "a6f337207ca6f4388dae5bc75d82da6fc2024ccb8e1e710af84c5e55a22c2604",
+    "k8s/fake.py": "c032151238b66e3ad4f04e4853f21b04112e064f7087dd5a0082977b01782306",
+    "k8s/kube.py": "652fdb8018f0eced7863398a2e9931a5006452b54a527963b248167766a7094b",
+    "k8s/render.py": "7b7a7a9e55803dc5d702b171b61ed4c6b0c7289210cf6994ef03446cb7a03e0c",
+    "k8s/spec.py": "d1c05b57aca2641806af3fe393e95a587319da44ec8099567b594dfd636901bc",
     "pgq.py": "57f323480984fbad424662810cfec1ebc39256fa2ec7b77680863b1f416b62e4",
-    "task_contract.py": "4c77d4e3d5e986ab61bf3eb497a34f34c27c97881522660d2871b1faf58a7ad1",
+    "task_contract.py": "009fa263871d74a0cf020033f13d81543e971b278d4a80ba3d35b8983940afd4",
 }
 
 
@@ -34,7 +32,10 @@ SHARED = {
 @pytest.mark.parametrize("name", sorted(SHARED))
 def test_shared_file_matches_the_other_repository(name):
     content = (APP / name).read_bytes().replace(b"\r\n", b"\n")
-    assert hashlib.sha256(content).hexdigest() == SHARED[name], (
-        f"app/{name} differs from the version shared with the worker; "
-        "keep both copies identical and update the hash in both tests"
+    actual = hashlib.sha256(content).hexdigest()
+    assert actual == SHARED[name], (
+        f"app/{name} differs from the version shared with the worker (sha256 {actual}, pinned {SHARED[name]}). "
+        f"Changed it on purpose? Copy the file to worker/app/{name} and put the new hash into SHARED of "
+        "tests/unit/test_shared_files.py in BOTH repositories. Both services must roll out together "
+        "(the task contract is live between them). Otherwise restore the file."
     )

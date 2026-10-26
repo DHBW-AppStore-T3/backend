@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.crud import apps as crud_apps
@@ -9,6 +9,7 @@ from app.crud import users as crud_users
 from app.database import get_db
 from app.models import User, UserRole
 from app.schemas import UserResponse, UserStatistics, UserUpdate, UserWithCourse
+from app.utils import rate_limit
 from app.utils.capabilities import ensure_change_user_role, ensure_view_user
 from app.utils.keycloak_auth import (
     get_current_user_keycloak,
@@ -81,10 +82,11 @@ def list_users(
 # ----------------------------------------------------------------
 # SEARCH USERS FROM KEYCLOAK
 # ----------------------------------------------------------------
-@router.get("/search")
+@router.get("/search", dependencies=[Depends(rate_limit.USER_SEARCH)])
 def search_users_keycloak(
     query: str,
-    limit: int = 10,
+    # Passed on to Keycloak's admin API: bounded (review S17).
+    limit: int = Query(10, ge=1, le=50),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_staff)
 ):

@@ -1,6 +1,7 @@
 import base64
 import binascii
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
@@ -43,6 +44,13 @@ class Settings(BaseSettings):
     # deployment step that runs that command needs it.
     WORKER_DB_PASSWORD: str = ""
 
+    # Virus scan of uploaded files (ClamAV daemon, ``app/services/malware_scan.py``). Empty
+    # ``CLAMD_HOST``: no scan. Once a host is set, scanning is mandatory: an upload is refused
+    # (503) while the daemon cannot be reached.
+    CLAMD_HOST: str = ""
+    CLAMD_PORT: int = 3310
+    CLAMD_TIMEOUT: float = 20.0
+
     # Git: app repositories are public and read anonymously (.github#7 B).
     # Apps may only be registered from these hosts (comma-separated, exact
     # names); the worker checks the same list before it clones.
@@ -67,33 +75,30 @@ class Settings(BaseSettings):
 
     # CORS
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:5173"]
+    # Origins of the UIs besides APP_BASE_URL and CORS_ORIGINS (comma-separated,
+    # e.g. the self-service-ui's https://self-service.<zone>). A browser write
+    # from any other origin is refused (app/utils/cross_site.py, review S3).
+    CSRF_TRUSTED_ORIGINS: str = ""
 
-    # Symmetric Fernet key shared with the worker. Used to encrypt OpenStack
-    # credentials at rest and to seal the envelope shipped through Celery.
+    # Symmetric Fernet key shared with the worker. Seals task results unless
+    # RESULTS_ENCRYPTION_KEY is set, and opens results sealed with it earlier.
     # Generate: python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
     CREDENTIAL_ENCRYPTION_KEY: str
     # Fernet key of task results (``tasks.outputs_enc``), shared with the
-    # worker. A key of its own, so the pod deployer, which seals results but
-    # has nothing to do with OpenStack, never holds the credential key (it
-    # can read the job queue, where the VM jobs' credential envelopes
-    # travel). Empty: the credential key, as before. Results sealed with
-    # the credential key open either way.
+    # worker. Empty: the credential key, as before. Results sealed with the
+    # credential key open either way.
     RESULTS_ENCRYPTION_KEY: str = ""
-
-    # Keystone URLs OpenStack credentials may point to, comma-separated
-    # (e.g. ``https://keystone.example.org:5000/v3``; a trailing ``/v3`` is
-    # ignored). API and worker send no login anywhere else (.github#7 C).
-    # Empty: in development any https URL, in production none.
-    OPENSTACK_ALLOWED_AUTH_URLS: str = ""
 
     # Pod apps (.github#4) -------------------------------------------------
     # Images in an appstore.yaml must come from these registries (prefixes,
     # D10: our own registry only) and every container stay within these
     # limits; the worker checks the same settings again.
-    APP_IMAGE_REGISTRY_ALLOWLIST: str = "ghcr.io/dhbw-appstore-t3/"
+    APP_IMAGE_REGISTRY_ALLOWLIST: str = "ghcr.io/dhbw-appstore-t3/apps/"
     APP_MAX_CPU: str = "2"
     APP_MAX_MEMORY: str = "4Gi"
     APP_MAX_STORAGE: str = "20Gi"
+    # Namespaces a kubevirt-vm may clone its golden image from (comma separated).
+    APP_VM_IMAGE_NAMESPACES: str = "vm-poc"
     # At most this many workloads (one per team, or per person) in one
     # deployment, and optionally per owner across their live pod
     # deployments (0: no budget).
@@ -125,6 +130,7 @@ class Settings(BaseSettings):
     LTI13_PLATFORM_JWKS_URL: str = "http://localhost:8081/mod/lti/certs.php"
     LTI13_REDIRECT_URI: str = "http://localhost:8000/lti13/launch"
     LTI13_SESSION_SECRET: str = "change-me-in-production"
+
 
     @property
     def is_development(self) -> bool:
@@ -181,6 +187,15 @@ class Settings(BaseSettings):
     @property
     def oidc_allowed_clients(self) -> frozenset[str]:
         return frozenset(c.strip() for c in self.OIDC_ALLOWED_CLIENTS.split(",") if c.strip())
+
+    @property
+    def trusted_write_origins(self) -> frozenset[str]:
+        """Origins whose pages may change state: the frontend, the CORS origins, CSRF_TRUSTED_ORIGINS."""
+        base = urlsplit(self.APP_BASE_URL)
+        origins = {f"{base.scheme}://{base.netloc}"} if base.scheme and base.netloc else set()
+        origins.update(o for o in self.CORS_ORIGINS if o != "*")
+        origins.update(o.strip() for o in self.CSRF_TRUSTED_ORIGINS.split(",") if o.strip())
+        return frozenset(o.rstrip("/").lower() for o in origins)
 
     @property
     def lti13_enabled(self) -> bool:

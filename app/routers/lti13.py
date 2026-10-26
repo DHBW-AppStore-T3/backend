@@ -4,8 +4,9 @@ Flow:
   1.  Moodle → GET or POST /lti13/login   (3rd-party OIDC initiation)
   2.  Backend → 302 to Moodle auth.php with state + nonce
   3.  Moodle → POST /lti13/launch  (id_token + state)
-  4.  Backend validates JWT → JIT-provisions user → issues session token
-  5.  Backend → frontend with #lti=1&email=…&role=…&session_token=… (fragment)
+  4.  Backend validates JWT → JIT-provisions user (by iss + sub) → one-time code
+  5.  Backend → frontend with #lti=1&code=… (fragment) and a binding cookie
+  6.  Frontend → POST /lti13/session {code} (+ cookie) → session token
 """
 
 import logging
@@ -15,14 +16,17 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import delete
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
 from app.models import Course, LtiNonce, User, UserRole
 from app.services import lti13_service
-from app.utils.keycloak_auth import higher_role
+from app.utils import roles
+from app.utils.keycloak_auth import account_by_email
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +37,23 @@ router = APIRouter(prefix="/lti13", tags=["LTI 1.3"])
 # launch are two requests that can reach different API processes
 # (``uvicorn --workers``) or replicas.
 NONCE_TTL = 300  # 5 minutes
+# The cookies of an LTI login: the state of the OIDC initiation, and the
+# binding of a launch's one-time code to this browser (review S19).
+STATE_COOKIE = "lti13_state"
+BINDING_COOKIE = "lti13_binding"
+
+
+def cookie_name(name: str) -> str:
+    """``name`` with the ``__Host-`` prefix, except over plain HTTP (development).
+
+    Every host under the zone, and under ``dhbw.site`` (which no browser treats
+    as a public suffix), is one site, and any of them, e.g. a page a student app
+    serves, may set a cookie for the parent domain. A planted binding cookie
+    would sign the visitor in with the planter's code (login CSRF). Browsers
+    accept a ``__Host-`` cookie only from this very host, with ``Secure`` and
+    ``Path=/`` and without ``Domain``, so it cannot be planted from elsewhere.
+    """
+    return name if settings.is_development else f"__Host-{name}"
 
 
 def _store_nonce(db: Session, state: str, nonce: str) -> None:
@@ -130,9 +151,10 @@ def _login(params, db: Session) -> RedirectResponse:
     # mismatch", not just in production. APP_ENV=development is the one
     # carve-out, for plain-HTTP localhost development.
     redirect.set_cookie(
-        key="lti13_state",
+        key=cookie_name(STATE_COOKIE),
         value=state,
         max_age=NONCE_TTL,
+        path="/",
         httponly=True,
         samesite="none",
         secure=not settings.is_development,
@@ -155,7 +177,7 @@ async def lti13_launch(request: Request, db: Session = Depends(get_db)) -> HTMLR
         raise HTTPException(status_code=400, detail="Missing id_token")
 
     # Verify state matches the cookie we set in step 1
-    cookie_state = request.cookies.get("lti13_state", "")
+    cookie_state = request.cookies.get(cookie_name(STATE_COOKIE), "")
     if not cookie_state or cookie_state != state:
         raise HTTPException(status_code=400, detail="State mismatch — possible CSRF")
 
@@ -177,89 +199,191 @@ async def lti13_launch(request: Request, db: Session = Depends(get_db)) -> HTMLR
             expected_nonce=nonce,
             platform_issuer=settings.LTI13_PLATFORM_ISSUER,
             jwks_url=settings.LTI13_PLATFORM_JWKS_URL,
+            deployment_id=settings.LTI13_DEPLOYMENT_ID,
         )
     except ValueError as exc:
         logger.warning("LTI 1.3 launch rejected: %s", exc)
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     info = lti13_service.extract_user_info(claims)
-    email = info["email"]
-    if not email:
+    if not info["email"]:
         raise HTTPException(status_code=400, detail="id_token contains no email claim")
+    if not info["subject"]:
+        raise HTTPException(status_code=400, detail="id_token contains no sub claim (anonymous launch)")
+    issuer = info["issuer"] or settings.LTI13_PLATFORM_ISSUER
 
-    # JIT-provision course
-    course_id = ""
-    if info["course"]:
-        course = db.query(Course).filter(Course.name == info["course"]).first()
-        if not course:
-            course = Course(name=info["course"])
-            db.add(course)
-            db.commit()
-            db.refresh(course)
-        course_id = str(course.courseId)
+    user = _provision(db, issuer, info)
+    code, binding = lti13_service.issue_login_code(db, user.userId)
+    db.commit()
 
-    # JIT-provision user. Moodle is the authoritative role source (real users
-    # carry no role in Keycloak). Role is monotonic — only promote an existing
-    # user, never demote, so a later self-service login can't reset it.
-    role = UserRole.TEACHER if info["role"] == "instructor" else UserRole.STUDENT
-    user = db.query(User).filter(User.email == email).first()
-    if user is None:
-        user = User(
-            email=email,
-            username=email,
-            firstName=info["name"].split()[0] if info["name"] else None,
-            lastName=" ".join(info["name"].split()[1:]) if len(info["name"].split()) > 1 else None,
-            role=role,
-            courseId=course_id or None,
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-    else:
-        updated = False
-        promoted = higher_role(user.role, role)
-        if user.role != promoted:
-            user.role = promoted
-            updated = True
-        if course_id:
-            user.courseId = course_id
-            updated = True
-        if updated:
-            db.commit()
-
-    # Issue an app-internal session token — lets the frontend call the API
-    # without a Keycloak PKCE flow.
-    session_token = lti13_service.issue_session_token(email, settings.LTI13_SESSION_SECRET)
-
-    # The session goes in the URL fragment: a browser never sends a fragment
-    # to a server, so the token stays out of the frontend's access logs and
-    # out of Referer headers (in the query it landed in both). Only what the
-    # frontend reads travels; name and course come from ``/users/me``.
-    fragment = urllib.parse.urlencode(
-        {
-            "lti": "1",
-            "email": email,
-            "role": info["role"],
-            "session_token": session_token,
-        }
-    )
+    # Only a one-time code goes to the browser, in the URL fragment (never
+    # sent to a server, so out of access logs and Referer headers). The
+    # frontend redeems it with the binding cookie set here; a link with
+    # somebody else's code thus signs nobody in (review S19).
+    fragment = urllib.parse.urlencode({"lti": "1", "code": code})
     target = f"{settings.APP_BASE_URL}#{fragment}"
 
-    # Use a JS redirect so the browser also clears the state cookie (a Set-Cookie
-    # on a 302 to a cross-origin URL is unreliable in practice).
-    return HTMLResponse(
+    # A page that redirects with JavaScript, so the Set-Cookie headers below
+    # (a 302 to another origin handles them unreliably in practice) take effect.
+    response = HTMLResponse(
         content=f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <script>
-  document.cookie = "lti13_state=; Max-Age=0; path=/";
   window.location.href = "{target}";
 </script>
 </head><body>Weiterleitung zum App-Store…</body></html>
 """
     )
+    # The state is used up (HttpOnly: the page's JavaScript could not clear it).
+    response.delete_cookie(
+        cookie_name(STATE_COOKIE), path="/", secure=not settings.is_development, httponly=True, samesite="none"
+    )
+    # Path=/ as __Host- requires. Lax: the redemption is a same-origin request.
+    response.set_cookie(
+        key=cookie_name(BINDING_COOKIE),
+        value=binding,
+        max_age=lti13_service.LTI_CODE_TTL,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=not settings.is_development,
+    )
+    return response
 
 
-# ── 3. Tool JWKS (optional) ───────────────────────────────────────────────────
+def _provision(db: Session, issuer: str, info: dict, *, retry: bool = True) -> User:
+    """The launch's course and user, created or updated; committed.
+
+    A parallel launch of the same new person can win the insert: then once more.
+    """
+    try:
+        course = _course_of_launch(db, issuer, info)
+        user = _user_of_launch(db, issuer, info)
+        # Re-evaluated on every launch (.github#7 F.5): the role this launch
+        # states replaces the one the previous launch stated (app.utils.roles).
+        user.lti_role = roles.from_lti(info["role"])
+        roles.refresh(user)
+        if course is not None:
+            db.flush()
+            user.courseId = course.courseId
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if not retry:
+            raise
+        return _provision(db, issuer, info, retry=False)
+    db.refresh(user)
+    return user
+
+
+def _course_of_launch(db: Session, issuer: str, info: dict) -> Course | None:
+    """The course of the launch's context, by ``context.id``; the title is its name.
+
+    A course of before (matched by its name then) or one a teacher created by
+    hand is adopted once by its name, while it has no context yet. Two
+    contexts with the same title thus stay two courses, and a course renamed
+    in Moodle keeps its members (review S9).
+    """
+    context_id, title = info["context_id"], info["course"]
+    if not context_id:
+        return None
+    course = db.query(Course).filter(Course.lti_issuer == issuer, Course.lti_context_id == context_id).first()
+    if course is None and title:
+        course = db.query(Course).filter(Course.name == title, Course.lti_context_id.is_(None)).first()
+        if course is not None:
+            course.lti_issuer, course.lti_context_id = issuer, context_id
+    if course is None:
+        course = Course(name=title or context_id, lti_issuer=issuer, lti_context_id=context_id)
+        db.add(course)
+    elif title and course.name != title:
+        course.name = title
+    return course
+
+
+def _user_of_launch(db: Session, issuer: str, info: dict) -> User:
+    """The account of the launch's LTI identity (``iss`` + ``sub``).
+
+    The first launch of an identity is linked to the account with its e-mail
+    address (so a Moodle launch and the SSO login meet the same person), and
+    from then on the identity decides, not the address: a platform account
+    that later carries somebody else's address does not get that person's
+    account (review S9). Never linked by address: an account that already
+    has another LTI identity, and an admin's account.
+    """
+    email, subject = info["email"], info["subject"]
+    user = db.query(User).filter(User.lti_issuer == issuer, User.lti_subject == subject).first()
+    if user is not None:
+        # Keycloak keeps the address of an account it knows; otherwise follow
+        # the platform, unless another account holds the new address.
+        if user.keycloak_id is None and user.email != email and account_by_email(db, email, other_than=user.userId) is None:
+            user.email = email
+        return user
+    user = account_by_email(db, email)
+    if user is None:
+        names = info["name"].split() if info["name"] else []
+        user = User(
+            email=email,
+            username=email,
+            firstName=names[0] if names else None,
+            lastName=" ".join(names[1:]) or None,
+            role=UserRole.STUDENT,
+            lti_issuer=issuer,
+            lti_subject=subject,
+        )
+        db.add(user)
+        return user
+    if user.lti_subject is not None:
+        logger.warning("LTI launch of %s/%s: the address belongs to an account of another LTI identity", issuer, subject)
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "lti_identity_mismatch", "message": "This e-mail address belongs to another person's account."},
+        )
+    if user.role == UserRole.ADMIN:
+        logger.warning("LTI launch of %s/%s: not linking an admin account by e-mail", issuer, subject)
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "lti_admin_not_linked", "message": "Admin accounts sign in with SSO, not through the LMS."},
+        )
+    user.lti_issuer, user.lti_subject = issuer, subject
+    return user
+
+
+# ── 3. Redeem the launch's one-time code ─────────────────────────────────────
+
+
+class LtiSessionRequest(BaseModel):
+    code: str = Field(min_length=16, max_length=256)
+
+
+@router.post("/session")
+def lti13_session(body: LtiSessionRequest, request: Request, db: Session = Depends(get_db)) -> JSONResponse:
+    """Step 6: the frontend trades the launch's code (+ the binding cookie) for a session token.
+
+    400 ``lti_code_invalid`` for an unknown, used, expired or foreign code;
+    the code is gone after the first attempt either way.
+    """
+    user_id = lti13_service.redeem_login_code(db, body.code, request.cookies.get(cookie_name(BINDING_COOKIE), ""))
+    user = db.get(User, user_id) if user_id is not None else None
+    if user is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "lti_code_invalid", "message": "The sign-in link is invalid or expired; start again from the course."},
+        )
+    response = JSONResponse(
+        content={
+            "session_token": lti13_service.issue_session_token(str(user.userId), settings.LTI13_SESSION_SECRET),
+            "expires_in": lti13_service.LTI_SESSION_TTL_MINUTES * 60,
+            "email": user.email,
+            "role": user.role.value,
+        }
+    )
+    response.delete_cookie(
+        cookie_name(BINDING_COOKIE), path="/", secure=not settings.is_development, httponly=True, samesite="lax"
+    )
+    return response
+
+
+# ── 4. Tool JWKS (optional) ───────────────────────────────────────────────────
 
 
 @router.get("/jwks")

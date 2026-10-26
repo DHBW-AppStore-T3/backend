@@ -41,9 +41,7 @@ def get_dashboard_stats(
     """
     Aggregate counts for the dashboard KPI strip.
 
-    Cheap DB-only aggregates — intentionally separated from the OpenStack
-    quota call (`GET /quotas/overview`) so the dashboard renders fast even
-    when the OpenStack API is slow or unavailable.
+    Cheap DB-only aggregates.
 
     Deployments counter MUST mirror the visibility rules of
     ``GET /deployments`` so the KPI matches what the user actually sees

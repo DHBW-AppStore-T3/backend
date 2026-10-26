@@ -1,3 +1,4 @@
+import contextlib
 import json
 import uuid
 from datetime import datetime
@@ -9,8 +10,8 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.k8s.render import DeploymentCtx
 from app.models import (
+    CLUSTER_RUNTIMES,
     RUNTIME_K8S,
-    RUNTIME_VM,
     Deployment,
     Task,
     TaskStatus,
@@ -32,36 +33,6 @@ def _is_destroyed_subq():
         & (Task.type == TaskType.DESTROY)
         & (Task.status == TaskStatus.SUCCESS)
     )
-
-
-def count_active_user_deployments(
-    db: Session, user_id: UUID, project_id: str | None = None, *, unplaced: bool = False
-) -> int:
-    """Number of *active* deployments owned by ``user_id``.
-
-    "Active" here matches what the user sees on the Deployments page:
-
-      * Owned by them (``Deployment.userId == user_id``).
-      * Not soft-deleted (``deleted_at IS NULL``).
-      * Has not been fully destroyed (no successful DESTROY task) —
-        soft-delete happens after destroy completes, so the check
-        covers the destroy-in-flight window too.
-
-    With ``project_id`` only those in that OpenStack project; with
-    ``unplaced`` only VM deployments whose project is not known yet (made
-    before projects were verified).
-    """
-    query = (
-        db.query(Deployment)
-        .filter(Deployment.userId == user_id)
-        .filter(Deployment.deleted_at.is_(None))
-        .filter(~_is_destroyed_subq())
-    )
-    if project_id is not None:
-        query = query.filter(Deployment.os_project_id == project_id)
-    elif unplaced:
-        query = query.filter(Deployment.os_project_id.is_(None), Deployment.runtime == RUNTIME_VM)
-    return query.count()
 
 
 def get_deployment(
@@ -316,7 +287,7 @@ def get_deployment_teams_with_members(db: Session, deployment_id: UUID) -> list[
 
 
 def get_deployment_outputs(db: Session, deployment_id: UUID) -> dict[str, Any] | None:
-    """Parsed Terraform outputs of the newest task that reported any.
+    """Parsed outputs of the newest task that reported any.
 
     Tasks without outputs (or with an empty set, e.g. a destroy) are
     skipped, so the outputs of the deploy behind them stay visible.
@@ -337,7 +308,7 @@ def get_deployment_outputs(db: Session, deployment_id: UUID) -> dict[str, Any] |
 def get_latest_successful_deploy_outputs(
     db: Session, deployment_id: UUID
 ) -> dict[str, Any] | None:
-    """Parsed Terraform outputs of the most recent *successful DEPLOY* task.
+    """Parsed outputs of the most recent *successful DEPLOY* task.
 
     Stricter than :func:`get_deployment_outputs`, which returns the latest
     task carrying any non-null ``outputs`` regardless of type or status — a
@@ -369,7 +340,6 @@ def get_deployments(
     limit: int = 100,
     user_id: UUID | None = None,
     member_user_id: UUID | None = None,
-    peer_project_ids: list[str] | None = None,
     app_id: UUID | None = None,
     status: str | None = None,
     include_deleted: bool = False,
@@ -382,8 +352,7 @@ def get_deployments(
     matches when the user is the creator OR appears in any team's
     ``UserToTeam`` row OR has a direct ``UserToDeployment`` mapping.
     Mutually exclusive with ``user_id``; if both are set ``user_id``
-    wins. ``peer_project_ids`` widens either to every deployment in those
-    OpenStack projects (the caller's verified credentials: project peers).
+    wins.
     """
     query = db.query(Deployment)
 
@@ -391,9 +360,8 @@ def get_deployments(
         # Backed by the partial index ix_deployments_live so this stays
         # cheap even with many rows.
         query = query.filter(Deployment.deleted_at.is_(None))
-    in_peer_project = Deployment.os_project_id.in_(peer_project_ids or [])
     if user_id:
-        query = query.filter((Deployment.userId == user_id) | in_peer_project)
+        query = query.filter(Deployment.userId == user_id)
     elif member_user_id:
         # Owner OR team member OR direct mapping, via a subquery on the
         # user's teamIds so the OR doesn't explode into a cartesian.
@@ -411,7 +379,6 @@ def get_deployments(
             (Deployment.userId == member_user_id)
             | (Deployment.deploymentId.in_(member_deployment_ids_via_teams))
             | (Deployment.deploymentId.in_(member_deployment_ids_direct))
-            | in_peer_project
         )
     if app_id:
         query = query.filter(Deployment.appId == app_id)
@@ -494,7 +461,7 @@ def count_live_workloads(db: Session, user_id: UUID) -> int:
     total = (
         db.query(func.coalesce(func.sum(Deployment.k8s_workloads), 0))
         .filter(Deployment.userId == user_id)
-        .filter(Deployment.runtime == RUNTIME_K8S)
+        .filter(Deployment.runtime.in_(CLUSTER_RUNTIMES))
         .filter(Deployment.deleted_at.is_(None))
         .filter(~_is_destroyed_subq())
         .scalar()
@@ -508,8 +475,7 @@ def create_deployment(
     user_id: UUID,
     commit_sha: str,
     *,
-    os_project_id: str | None = None,
-    runtime: str = RUNTIME_VM,
+    runtime: str = RUNTIME_K8S,
     k8s_workloads: int | None = None,
 ) -> Deployment:
     """Insert a deployment row in the current transaction.
@@ -517,16 +483,15 @@ def create_deployment(
     Does NOT commit — the caller is expected to also insert teams/tasks
     in the same TX and commit once at the end. This is necessary so the
     advisory lock acquired at the start of the request stays held across
-    all related inserts. ``os_project_id``: the OpenStack project of the
-    credential a VM deployment is made with. A pod deployment (``runtime``
-    ``kubernetes``) gets its namespace and the number of its workloads.
+    all related inserts. A pod deployment (``runtime`` ``kubernetes``) gets
+    its namespace and the number of its workloads.
     """
     # Convert userInputVar dict to JSON string for database storage
     user_input_var_json = None
     if deployment.userInputVar is not None:
         user_input_var_json = json.dumps(deployment.userInputVar)
 
-    deployment_id, namespace = _free_pod_identity(db) if runtime == RUNTIME_K8S else (uuid.uuid4(), None)
+    deployment_id, namespace = _free_pod_identity(db) if runtime in CLUSTER_RUNTIMES else (uuid.uuid4(), None)
     db_deployment = Deployment(
         deploymentId=deployment_id,
         name=deployment.name,
@@ -534,7 +499,6 @@ def create_deployment(
         userId=user_id,
         releaseTag=deployment.releaseTag,
         commit_sha=commit_sha,
-        os_project_id=os_project_id,
         runtime=runtime,
         k8s_namespace=namespace,
         k8s_workloads=k8s_workloads,
@@ -553,12 +517,23 @@ def soft_delete_deployment(db: Session, deployment_id: UUID) -> bool:
     they're useful for audit and the partial-unique index on active
     tasks already prevents the deployment from accepting new work.
 
+    The uploaded files are dropped from ``userInputVar`` (name and size
+    stay): nothing reads them after the deployment is gone, and the row
+    would otherwise keep every upload for good.
+
     Returns ``False`` if the deployment doesn't exist (or was already
     deleted), ``True`` on a successful soft-delete.
     """
     db_deployment = get_deployment(db, deployment_id)
     if not db_deployment:
         return False
+    if db_deployment.userInputVar:
+        from app.services.deployment_input import strip_file_vars_from_user_input
+
+        with contextlib.suppress(json.JSONDecodeError):
+            db_deployment.userInputVar = json.dumps(
+                strip_file_vars_from_user_input(json.loads(db_deployment.userInputVar))
+            )
     db_deployment.deleted_at = utcnow()
     db.commit()
     return True

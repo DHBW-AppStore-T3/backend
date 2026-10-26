@@ -2,8 +2,7 @@
 
 Covers the round-trip from POST /deployments (with ``files`` field)
 to GET detail (file bytes stripped) to GET /files/... (full payload
-returned to owner). Celery is patched out — these tests don't go to
-RabbitMQ.
+returned to owner). Celery is patched out.
 """
 import base64
 import json
@@ -18,15 +17,20 @@ from app.models import (
     User,
     UserRole,
 )
-from tests.conftest import add_credential
+from tests.conftest import spec_with
 
 
 def _b64(b: bytes) -> str:
     return base64.b64encode(b).decode("ascii")
 
 
-def _ensure_user_credentials(db, user):
-    return add_credential(db, user)
+@pytest.fixture(autouse=True)
+def _app_declares_the_file_variable(fake_git):
+    fake_git.files["appstore.yaml"] = spec_with(variables=[{"name": "task_pdf", "type": "file", "mountPath": "/data/task.pdf"}])
+
+
+def _teams(user):
+    return [{"name": "T", "userIds": [str(user.userId)]}]
 
 
 def _ensure_app(db, user) -> App:
@@ -60,7 +64,6 @@ def patched_celery():
 def test_post_deployment_persists_files_under_terraform(
     client, db, mock_user, patched_celery
 ):
-    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     pdf = b"%PDF-1.4\n%fake pdf bytes for the test\n"
@@ -68,8 +71,7 @@ def test_post_deployment_persists_files_under_terraform(
         "name": "with-files",
         "appId": str(app.appId),
         "releaseTag": "v1",
-        "credentialId": str(cred.credentialId),
-        "userInputVar": {"terraform": {"some_other": "x"}, "packer": {}},
+        "userInputVar": {"terraform": {"some_other": "x"}},
         "files": {
             "task_pdf": {
                 "all": {
@@ -80,7 +82,7 @@ def test_post_deployment_persists_files_under_terraform(
                 }
             }
         },
-        "teams": [],
+        "teams": _teams(mock_user),
     }
     response = client.post("/deployments/", json=payload)
     assert response.status_code == 201, response.text
@@ -119,7 +121,6 @@ def test_post_deployment_413_when_single_file_too_large(
     client, db, mock_user, patched_celery
 ):
     """One file over 2 MB → 413, no row created, no celery dispatch."""
-    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     big = b"x" * (2 * 1024 * 1024 + 10)
@@ -129,7 +130,7 @@ def test_post_deployment_413_when_single_file_too_large(
             "name": "too-big",
             "appId": str(app.appId),
             "releaseTag": "v1",
-            "credentialId": str(cred.credentialId),
+            "teams": _teams(mock_user),
             "files": {
                 "task_pdf": {
                     "all": {
@@ -156,7 +157,6 @@ def test_post_deployment_413_when_single_file_too_large(
 def test_post_deployment_422_on_invalid_base64(
     client, db, mock_user, patched_celery
 ):
-    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     response = client.post(
@@ -165,7 +165,7 @@ def test_post_deployment_422_on_invalid_base64(
             "name": "bad-b64",
             "appId": str(app.appId),
             "releaseTag": "v1",
-            "credentialId": str(cred.credentialId),
+            "teams": _teams(mock_user),
             "files": {
                 "task_pdf": {
                     "all": {
@@ -186,17 +186,16 @@ def test_post_deployment_422_on_invalid_base64(
 def test_detail_endpoint_strips_file_bytes(
     client, db, mock_user, patched_celery
 ):
-    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
-    pdf = b"PDF data" * 100
+    pdf = b"%PDF-1.4\n" + b"PDF data" * 100
     create = client.post(
         "/deployments/",
         json={
             "name": "stripped-detail",
             "appId": str(app.appId),
             "releaseTag": "v1",
-            "credentialId": str(cred.credentialId),
+            "teams": _teams(mock_user),
             "files": {
                 "task_pdf": {
                     "all": {
@@ -221,7 +220,6 @@ def test_detail_endpoint_strips_file_bytes(
 def test_download_endpoint_returns_owner_bytes(
     client, db, mock_user, patched_celery
 ):
-    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     payload_bytes = b"hello, world\n" * 10
@@ -231,7 +229,7 @@ def test_download_endpoint_returns_owner_bytes(
             "name": "downloadable",
             "appId": str(app.appId),
             "releaseTag": "v1",
-            "credentialId": str(cred.credentialId),
+            "teams": _teams(mock_user),
             "files": {
                 "task_pdf": {
                     "all": {
@@ -257,22 +255,21 @@ def test_download_endpoint_returns_owner_bytes(
 
 @pytest.mark.integration
 def test_upload_names_are_stored_without_paths_or_header_breakers(client, db, mock_user, patched_celery):
-    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
-    payload_bytes = b"x"
+    payload_bytes = b"%PDF-1.4 x"
     create = client.post(
         "/deployments/",
         json={
             "name": "names",
             "appId": str(app.appId),
             "releaseTag": "v1",
-            "credentialId": str(cred.credentialId),
+            "teams": _teams(mock_user),
             "files": {
                 "task_pdf": {
                     "all": {
                         "name": '../../etc/cron.d/a"\r\nSet-Cookie: x=1.pdf',
                         "content_b64": _b64(payload_bytes),
-                        "size": 1,
+                        "size": len(payload_bytes),
                         "content_type": "text/html",
                     }
                 }
@@ -295,7 +292,6 @@ def test_upload_names_are_stored_without_paths_or_header_breakers(client, db, mo
 def test_download_endpoint_404_for_unknown_slot(
     client, db, mock_user, patched_celery
 ):
-    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     payload_bytes = b"x" * 32
@@ -305,7 +301,7 @@ def test_download_endpoint_404_for_unknown_slot(
             "name": "with-one-slot",
             "appId": str(app.appId),
             "releaseTag": "v1",
-            "credentialId": str(cred.credentialId),
+            "teams": _teams(mock_user),
             "files": {
                 "task_pdf": {
                     "all": {
@@ -336,7 +332,6 @@ def test_download_endpoint_member_403(
 ):
     """A team member with read-access to the deployment must NOT be
     able to fetch file bytes — only the owner-view does."""
-    cred = _ensure_user_credentials(db, mock_user)
     app = _ensure_app(db, mock_user)
 
     payload_bytes = b"secret" * 100
@@ -346,7 +341,7 @@ def test_download_endpoint_member_403(
             "name": "owner-only-download",
             "appId": str(app.appId),
             "releaseTag": "v1",
-            "credentialId": str(cred.credentialId),
+            "teams": _teams(mock_user),
             "files": {
                 "task_pdf": {
                     "all": {
@@ -395,3 +390,156 @@ def test_download_endpoint_member_403(
         # in the same session aren't affected.
         fastapi_app.dependency_overrides[get_current_user_keycloak] = lambda: mock_user
     assert resp.status_code == 403
+
+
+@pytest.mark.integration
+def test_rejected_upload_is_logged_as_a_security_event(
+    client, db, mock_user, patched_celery, caplog
+):
+    app = _ensure_app(db, mock_user)
+
+    evil = b"MZ" + b"\x00" * 200  # a Windows program
+    with caplog.at_level("WARNING", logger="app.services.deployment_input"):
+        response = client.post(
+            "/deployments/",
+            json={
+                "name": "rejected",
+                "appId": str(app.appId),
+                "releaseTag": "v1",
+                "files": {"task_pdf": {"all": {
+                    "name": "evil\nupload_rejected user=forged.exe",
+                    "content_b64": _b64(evil),
+                    "size": len(evil),
+                }}},
+            },
+        )
+    assert response.status_code == 422
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("upload_rejected")]
+    assert len(lines) == 1
+    assert f"user={mock_user.userId}" in lines[0]
+    assert 'reason="file_content_rejected"' in lines[0]
+    assert 'variable="task_pdf"' in lines[0]
+    assert "forged" not in lines[0]
+
+
+@pytest.mark.integration
+def test_soft_delete_drops_the_uploaded_bytes_but_keeps_the_metadata(
+    client, db, mock_user, patched_celery
+):
+    from app.crud import deployments as crud_deployments
+
+    app = _ensure_app(db, mock_user)
+    pdf = b"%PDF-1.4\n" + b"PDF data" * 100
+    created = client.post(
+        "/deployments/",
+        json={
+            "name": "to-delete",
+            "appId": str(app.appId),
+            "releaseTag": "v1",
+            "teams": _teams(mock_user),
+            "files": {"task_pdf": {"all": {
+                "name": "x.pdf", "content_b64": _b64(pdf), "size": len(pdf),
+            }}},
+        },
+    ).json()
+    dep_id = uuid.UUID(created["deploymentId"])
+    stored = db.query(Deployment).filter(Deployment.deploymentId == dep_id).one()
+    assert "content_b64" in stored.userInputVar
+
+    assert crud_deployments.soft_delete_deployment(db, dep_id) is True
+
+    db.expire_all()
+    row = db.query(Deployment).filter(Deployment.deploymentId == dep_id).one()
+    assert row.deleted_at is not None
+    assert "content_b64" not in row.userInputVar
+    assert json.loads(row.userInputVar)["terraform"]["task_pdf"]["all"]["name"] == "x.pdf"
+
+
+@pytest.mark.integration
+def test_stored_file_carries_a_mac_the_worker_can_check(client, db, mock_user, patched_celery):
+    from app.utils import upload_mac
+
+    app = _ensure_app(db, mock_user)
+    pdf = b"%PDF-1.4\n" + b"PDF data" * 100
+    created = client.post(
+        "/deployments/",
+        json={
+            "name": "sealed",
+            "appId": str(app.appId),
+            "releaseTag": "v1",
+            "teams": _teams(mock_user),
+            "files": {"task_pdf": {"all": {"name": "x.pdf", "content_b64": _b64(pdf), "size": len(pdf)}}},
+        },
+    ).json()
+    stored = db.query(Deployment).filter(Deployment.deploymentId == uuid.UUID(created["deploymentId"])).one()
+    entry = json.loads(stored.userInputVar)["terraform"]["task_pdf"]["all"]
+    assert entry["mac"] == upload_mac.sign("task_pdf", "all", "x.pdf", pdf)
+    assert entry["mac"] != upload_mac.sign("task_pdf", "all", "x.pdf", pdf + b"!")
+    # the seal is for the worker, not for API responses
+    detail = client.get(f"/deployments/{created['deploymentId']}").json()
+    assert "mac" not in detail["userInputVar"]["terraform"]["task_pdf"]["all"]
+
+
+@pytest.mark.unit
+def test_strip_covers_team_and_user_scoped_file_vars():
+    from app.services.deployment_input import strip_file_vars_from_user_input
+
+    slot = {"name": "x.pdf", "content_b64": "QQ==", "size": 1, "content_type": "application/pdf", "mac": "ab"}
+    out = strip_file_vars_from_user_input(
+        {"terraform": {"f": {"Team-1": {"uploaded": dict(slot)}}, "g": {"all": dict(slot)}}}
+    )["terraform"]
+    for entry in (out["f"]["Team-1"]["uploaded"], out["g"]["all"]):
+        assert "content_b64" not in entry and "mac" not in entry
+        assert entry["name"] == "x.pdf"
+
+
+@pytest.mark.unit
+def test_is_stored_file_var_knows_both_shapes():
+    from app.services.deployment_input import is_stored_file_var
+
+    slot = {"name": "x.pdf", "content_b64": "QQ==", "size": 1, "content_type": "application/pdf"}
+    assert is_stored_file_var({"all": dict(slot)})
+    assert is_stored_file_var({"Team-1": {"uploaded": dict(slot)}})
+    assert not is_stored_file_var({"Team-1": {"other": 1}})
+    assert not is_stored_file_var({})
+    assert not is_stored_file_var("x")
+
+
+@pytest.mark.integration
+def test_download_endpoint_serves_team_scoped_files(client, db, mock_user, patched_celery):
+    app = _ensure_app(db, mock_user)
+    payload_bytes = b"team file\n"
+    create = client.post(
+        "/deployments/",
+        json={
+            "name": "team-scoped-download",
+            "appId": str(app.appId),
+            "releaseTag": "v1",
+            "teams": _teams(mock_user),
+            "files": {
+                "task_pdf": {
+                    "all": {
+                        "name": "t.txt",
+                        "content_b64": _b64(payload_bytes),
+                        "size": len(payload_bytes),
+                        "content_type": "text/plain",
+                    }
+                }
+            },
+        },
+    ).json()
+    deployment_id = create["deploymentId"]
+
+    # Rewrite the stored variable into the scope=team|user shape.
+    from app.models import Deployment
+
+    row = db.query(Deployment).filter(Deployment.deploymentId == deployment_id).one()
+    stored = json.loads(row.userInputVar)
+    block_key = next(k for k in ("variables", "terraform") if k in stored)
+    stored[block_key]["task_pdf"] = {"Team-1": {"uploaded": stored[block_key]["task_pdf"]["all"]}}
+    row.userInputVar = json.dumps(stored)
+    db.commit()
+
+    response = client.get(f"/deployments/{deployment_id}/files/task_pdf/Team-1")
+    assert response.status_code == 200
+    assert response.content == payload_bytes

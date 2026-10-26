@@ -307,6 +307,37 @@ jobs:
   # Runs in parallel with lint/test-unit. Findings appear in the
   # GitHub Security tab via SARIF upload. Whitelist false positives
   # in `.trivyignore` (with a comment explaining why).
+  # The validator of app-registry (scripts/validate_appstore_yaml.py, which every
+  # app's CI runs) must give the same verdict as app/k8s/spec.py. app-registry
+  # checks that weekly; here a change to the contract shows its drift in its own
+  # pull request. Not in the needs of the build: it informs, it does not block.
+  contract-drift:
+    name: "🔗 App contract vs app-registry validator"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Checkout app-registry
+        uses: actions/checkout@v4
+        with:
+          repository: DHBW-AppStore-T3/app-registry
+          path: app-registry
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Same verdict as the validator
+        working-directory: app-registry
+        env:
+          BACKEND_SPEC_PY: ${{ github.workspace }}/app/k8s/spec.py
+        run: |
+          pip install --quiet pyyaml jsonschema pydantic
+          python -m unittest discover -s tests -p "test_contract_drift.py" -v
+
   security:
     name: "🔒 Security"
     runs-on: ubuntu-latest
@@ -419,6 +450,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Rebuilds the Debian upgrade layer (Dockerfile, SECURITY_REFRESH).
+          build-args: SECURITY_REFRESH=${{ github.run_id }}
 
   # ================================================================
   # 🔒 IMAGE SCAN — Trivy CVE scan against the built image
@@ -452,6 +485,7 @@ jobs:
           platforms: linux/amd64
           tags: backend:scan
           cache-from: type=gha
+          build-args: SECURITY_REFRESH=${{ github.run_id }}
 
       - name: Trivy image scan (gate)
         uses: aquasecurity/trivy-action@v0.36.0
@@ -493,6 +527,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write       # sign the image's origin (Sigstore, keyless)
+      attestations: write   # store that signature with GitHub
     outputs:
       digest: ${{ steps.push-image.outputs.digest }}
 
@@ -537,13 +573,25 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Rebuilds the Debian upgrade layer (Dockerfile, SECURITY_REFRESH).
+          build-args: SECURITY_REFRESH=${{ github.run_id }}
+      # Signs which repository, workflow, branch and commit built this digest (SLSA
+      # build provenance, keyless); the deployment repo rolls out only images that
+      # have it (.github/scripts/verify-image.sh there).
+      - name: Attest the image's origin
+        if: steps.push-image.outputs.digest != ''
+        uses: actions/attest@v4
+        with:
+          subject-name: ghcr.io/dhbw-appstore-t3/backend
+          subject-digest: ${{ steps.push-image.outputs.digest }}
 
   # ================================================================
   # ☸️ ROLL OUT ON KUBERNETES — dev -> staging, main -> prod
   # ================================================================
   # The deployment repo pins the image just pushed (tag sha-<commit>) by its
   # digest in k8s/images/<staging|prod>.yaml; Argo CD of that environment
-  # follows (see k8s-bump.yml there: a commit on dev, a PR on main).
+  # follows (see k8s-bump.yml there: a self-merging PR on dev,
+  # a PR on main that a person approves).
   k8s-rollout:
     name: "☸️ Roll out on k8s"
     runs-on: ubuntu-latest
@@ -553,10 +601,21 @@ jobs:
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
 
     steps:
+      # A one-hour token of the GitHub App "DHBW AppStore deploy" (installed only
+      # on the deployment repository, Actions: write), not a personal token.
+      - name: Token for the deployment repository
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.DEPLOY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
+          owner: DHBW-AppStore-T3
+          repositories: deployment
+          permission-actions: write
       - name: Pin the new image in the deployment repo
         run: |
           gh workflow run k8s-bump.yml --repo DHBW-AppStore-T3/deployment --ref "$GITHUB_REF_NAME" \
             -f component=backend -f tag="sha-${GITHUB_SHA::7}" -f digest="$DIGEST"
         env:
-          GH_TOKEN: ${{ secrets.DEPLOYMENT_PAT }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           DIGEST: ${{ needs.push.outputs.digest }}

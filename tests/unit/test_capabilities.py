@@ -344,9 +344,8 @@ class TestCanViewDeploymentOwner:
 
 
 class TestCanOperateDeployment:
-    """Operate is for the owner and project peers. Teachers get no blanket
-    right via the staff bypass, and admins are read-only on VM deployments:
-    every action runs with the caller's own credential for the project."""
+    """Operate is for the owner and admins. Teachers get no blanket
+    right via the staff bypass."""
 
     def test_owner_can_operate(self, student, db_mock):
         dep = _deployment(student.userId)
@@ -358,26 +357,24 @@ class TestCanOperateDeployment:
         dep = _deployment(uuid.uuid4())
         assert caps.can_operate_deployment(teacher, dep, db_mock) is False
 
-    def test_admin_cannot_operate_a_vm_deployment(self, admin, db_mock):
+    def test_admin_can_operate(self, admin, db_mock):
         dep = _deployment(uuid.uuid4())
-        assert caps.can_operate_deployment(admin, dep, db_mock) is False
+        assert caps.can_operate_deployment(admin, dep, db_mock) is True
 
-    def test_project_peer_can_operate_and_inspect(self, teacher, db_mock, monkeypatch):
-        dep = SimpleNamespace(deploymentId=uuid.uuid4(), userId=uuid.uuid4(), os_project_id="p-1")
-        holds = MagicMock(side_effect=lambda _db, _user_id, project_id: project_id == "p-1")
-        monkeypatch.setattr(caps.crud_openstack_credentials, "holds_project", holds)
+    @pytest.mark.parametrize("runtime", ["kubernetes", "kubevirt-vm"])
+    def test_admin_operates_a_cluster_deployment_without_any_credential(self, admin, db_mock, runtime):
+        dep = SimpleNamespace(deploymentId=uuid.uuid4(), userId=uuid.uuid4(), runtime=runtime)
+        assert caps.can_operate_deployment(admin, dep, db_mock) is True
 
-        assert caps.can_operate_deployment(teacher, dep, db_mock) is True
-        assert caps.can_view_deployment_owner(teacher, dep, db_mock) is True
-        holds.assert_called_with(db_mock, teacher.userId, "p-1")
-
-    def test_no_project_makes_no_peer(self, teacher, db_mock, monkeypatch):
-        holds = MagicMock(return_value=True)
-        monkeypatch.setattr(caps.crud_openstack_credentials, "holds_project", holds)
-        dep = SimpleNamespace(deploymentId=uuid.uuid4(), userId=uuid.uuid4(), os_project_id=None)
-
+    @pytest.mark.parametrize("runtime", ["kubernetes", "kubevirt-vm"])
+    def test_teacher_and_stranger_cannot_operate_a_cluster_deployment(self, teacher, student, db_mock, runtime):
+        dep = SimpleNamespace(deploymentId=uuid.uuid4(), userId=uuid.uuid4(), runtime=runtime)
         assert caps.can_operate_deployment(teacher, dep, db_mock) is False
-        holds.assert_not_called()
+        assert caps.can_operate_deployment(student, dep, db_mock) is False
+
+    def test_owner_operates_a_kubevirt_deployment(self, student, db_mock):
+        dep = SimpleNamespace(deploymentId=uuid.uuid4(), userId=student.userId, runtime="kubevirt-vm")
+        assert caps.can_operate_deployment(student, dep, db_mock) is True
 
     def test_unrelated_student_cannot_operate(self, student, db_mock):
         dep = _deployment(uuid.uuid4())

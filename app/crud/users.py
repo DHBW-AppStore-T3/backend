@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.models import User, UserRole
 from app.schemas import UserCreate, UserUpdate
+from app.utils import roles
 
 
 def get_user(db: Session, user_id: UUID) -> User | None:
@@ -46,6 +47,8 @@ def create_user(db: Session, user: UserCreate) -> User:
         email=user.email,
         username=user.username,
         role=user.role,
+        # Created with a role: an admin's grant (app.utils.roles).
+        granted_role=user.role,
         courseId=user.courseId
     )
     db.add(db_user)
@@ -62,7 +65,12 @@ def update_user(db: Session, user_id: UUID, user_update: UserUpdate) -> User | N
 
     update_data = user_update.model_dump(exclude_unset=True)
     for field, value in update_data.items():
-        setattr(db_user, field, value)
+        if field == "role":
+            # A source of its own next to Keycloak and LTI (app.utils.roles).
+            if value is not None:
+                roles.grant(db_user, value)
+        else:
+            setattr(db_user, field, value)
 
     db.commit()
     db.refresh(db_user)

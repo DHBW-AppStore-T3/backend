@@ -12,6 +12,7 @@ Identical in backend and worker (``test_shared_files``).
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -22,6 +23,7 @@ from app.k8s.render import (
     MANAGED_BY_LABEL,
     TEAM_LABEL,
     USER_LABEL,
+    VM_NAMESPACE_LABEL,
     WORKLOAD_LABEL,
     label_value,
 )
@@ -52,6 +54,32 @@ class StatefulSetInfo:
 
 
 @dataclass
+class DeploymentInfo:
+    name: str
+    replicas: int
+    ready_replicas: int
+
+
+@dataclass
+class VmiInfo:
+    """A running KubeVirt VirtualMachineInstance (``phase``: Pending, Scheduling, Running, Failed, ...)."""
+
+    name: str
+    phase: str = "Pending"
+    ready: bool = False
+    team: str = ""
+    user: str = ""  # the member's user id (``scope: user``)
+
+
+@dataclass
+class VmInfo:
+    """A KubeVirt VirtualMachine (the desired state; its VMI exists only while it runs)."""
+
+    name: str
+    run_strategy: str = "Always"  # Always, Halted, ...
+
+
+@dataclass
 class EventInfo:
     object: str
     reason: str
@@ -68,8 +96,17 @@ class Snapshot:
     # The namespace's labels; ``DEPLOYMENT_LABEL`` says whose it is.
     labels: dict[str, str] = field(default_factory=dict)
     statefulsets: list[StatefulSetInfo] = field(default_factory=list)
+    # kubevirt-vm namespaces: the noVNC proxies and the VMs.
+    deployments: list[DeploymentInfo] = field(default_factory=list)
+    vmis: list[VmiInfo] = field(default_factory=list)
     # Names of the volume claims, with the workload each belongs to.
     pvcs: list[tuple[str, str]] = field(default_factory=list)
+    # kubevirt-vm namespaces: the VirtualMachines themselves (also while halted).
+    virtual_machines: list[VmInfo] = field(default_factory=list)
+    # Phase per volume claim (Pending, Bound, ...) and the Warning events of the claims
+    # as (claim name, reason, message): a stuck clone shows up here, not on a pod.
+    pvc_phases: dict[str, str] = field(default_factory=dict)
+    pvc_issues: list[tuple[str, str, str]] = field(default_factory=list)
     pods: list[PodInfo] = field(default_factory=list)
     events: list[EventInfo] = field(default_factory=list)
 
@@ -80,10 +117,13 @@ class Snapshot:
 
 class Kube(Protocol):
     def apply(self, obj: dict[str, Any]) -> None: ...
+    def delete_object(self, api_version: str, kind: str, namespace: str, name: str) -> None: ...
     def delete_namespace(self, name: str) -> None: ...
     def namespaces(self, label_selector: str) -> list[str]: ...
     def snapshot(self, namespace: str) -> Snapshot: ...
     def scale(self, namespace: str, statefulset: str, replicas: int) -> None: ...
+    def scale_deployment(self, namespace: str, name: str, replicas: int) -> None: ...
+    def set_run_strategy(self, namespace: str, vm_name: str, run_strategy: str) -> None: ...
     def delete_pod(self, namespace: str, pod: str) -> None: ...
     def delete_pvcs(self, namespace: str, workload: str) -> None: ...
 
@@ -115,6 +155,13 @@ class KubeApi:
             field_manager=FIELD_MANAGER,
             force_conflicts=True,
         )
+
+    def delete_object(self, api_version: str, kind: str, namespace: str, name: str) -> None:
+        from kubernetes.dynamic.exceptions import NotFoundError
+
+        resource = self._dyn.resources.get(api_version=api_version, kind=kind)
+        with contextlib.suppress(NotFoundError):
+            self._dyn.delete(resource, name=name, namespace=namespace)
 
     def delete_namespace(self, name: str) -> None:
         from kubernetes.client.rest import ApiException
@@ -155,16 +202,71 @@ class KubeApi:
                     labels.get(USER_LABEL, ""),
                 )
             )
+        if snap.labels.get(VM_NAMESPACE_LABEL) == "true":
+            for d in self._apps.list_namespaced_deployment(namespace).items:
+                snap.deployments.append(
+                    DeploymentInfo(d.metadata.name, d.spec.replicas or 0, d.status.ready_replicas or 0)
+                )
+            snap.vmis.extend(self._vmis(namespace))
+            snap.virtual_machines.extend(self._virtual_machines(namespace))
         for c in self._core.list_namespaced_persistent_volume_claim(namespace).items:
             snap.pvcs.append((c.metadata.name, (c.metadata.labels or {}).get(WORKLOAD_LABEL, "")))
+            snap.pvc_phases[c.metadata.name] = (c.status.phase if c.status else None) or "Pending"
         for p in self._core.list_namespaced_pod(namespace).items:
             snap.pods.append(_pod_info(p))
         for ev in self._core.list_namespaced_event(namespace).items:
             if ev.type == "Warning":
+                if ev.involved_object.kind == "PersistentVolumeClaim":
+                    snap.pvc_issues.append((ev.involved_object.name, ev.reason or "", ev.message or ""))
                 snap.events.append(
-                    EventInfo(f"{ev.involved_object.kind}/{ev.involved_object.name}", ev.reason or "", ev.message or "")
+                    EventInfo(
+                        f"{ev.involved_object.kind}/{ev.involved_object.name}",
+                        ev.reason or "",
+                        ev.message or "",
+                    )
                 )
         return snap
+
+    def _vmis(self, namespace: str) -> list[VmiInfo]:
+        resource = self._dyn.resources.get(api_version="kubevirt.io/v1", kind="VirtualMachineInstance")
+        out = []
+        for item in resource.get(namespace=namespace).items:
+            status = item.get("status") or {}
+            conditions = status.get("conditions") or []
+            ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions)
+            labels = item["metadata"].get("labels") or {}
+            out.append(
+                VmiInfo(
+                    item["metadata"]["name"],
+                    status.get("phase") or "Pending",
+                    ready,
+                    labels.get(TEAM_LABEL, ""),
+                    labels.get(USER_LABEL, ""),
+                )
+            )
+        return out
+
+    def _virtual_machines(self, namespace: str) -> list[VmInfo]:
+        resource = self._dyn.resources.get(api_version="kubevirt.io/v1", kind="VirtualMachine")
+        return [
+            VmInfo(item["metadata"]["name"], (item.get("spec") or {}).get("runStrategy") or "Always")
+            for item in resource.get(namespace=namespace).items
+        ]
+
+    def scale_deployment(self, namespace: str, name: str, replicas: int) -> None:
+        # The deployer may patch deployments but has no deployments/scale right.
+        self._apps.patch_namespaced_deployment(name, namespace, {"spec": {"replicas": replicas}})
+
+    def set_run_strategy(self, namespace: str, vm_name: str, run_strategy: str) -> None:
+        """Merge patch of ``spec.runStrategy`` (Halted stops the VM, Always starts it)."""
+        resource = self._dyn.resources.get(api_version="kubevirt.io/v1", kind="VirtualMachine")
+        self._dyn.patch(
+            resource,
+            body={"spec": {"runStrategy": run_strategy}},
+            name=vm_name,
+            namespace=namespace,
+            content_type="application/merge-patch+json",
+        )
 
     def scale(self, namespace: str, statefulset: str, replicas: int) -> None:
         self._apps.patch_namespaced_stateful_set_scale(statefulset, namespace, {"spec": {"replicas": replicas}})

@@ -28,10 +28,8 @@ celery_app.conf.update(
     worker_send_task_events=False,
     worker_enable_remote_control=False,
 
-    # VM jobs go to the OpenTofu/Packer executor (no cluster rights), pod
-    # jobs to the pod deployer (no OpenTofu, no root; .github#4). Each
-    # worker consumes only its queue.
-    task_routes={"tasks.*": {"queue": "vm"}, "pods.*": {"queue": "pods"}},
+    # Pod jobs go to the pod deployer (no root; .github#4), queue ``pods``.
+    task_routes={"pods.*": {"queue": "pods"}},
 )
 
 if __name__ == "__main__":

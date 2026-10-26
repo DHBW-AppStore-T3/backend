@@ -68,6 +68,16 @@ def test_matches_golden_file():
     assert objs == json.loads(GOLDEN.read_text(encoding="utf-8"))
 
 
+GOLDEN_NETWORKED = GOLDEN.with_name("online_ide_networked.json")
+
+
+def test_networked_pods_match_golden_file():
+    _, objs, _ = build({**VALID, "egress": "internet", "podNetwork": "namespace"})
+    if os.environ.get("UPDATE_GOLDEN"):
+        GOLDEN_NETWORKED.write_text(json.dumps(objs, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    assert objs == json.loads(GOLDEN_NETWORKED.read_text(encoding="utf-8"))
+
+
 def test_render_is_deterministic():
     assert build()[1] == build()[1]
 
@@ -143,6 +153,22 @@ def test_egress_none_has_no_internet_policy():
     assert names == {"default-deny", "allow-ingress-controller", "allow-dns"}
 
 
+def test_pod_network_none_has_no_intra_namespace_policy():
+    names = {p["metadata"]["name"] for p in of_kind(build()[1], "NetworkPolicy")}
+    assert "allow-intra-namespace" not in names
+
+
+def test_pod_network_namespace_allows_only_own_pods_on_the_expose_port_both_ways():
+    spec, objs, _ = build({**VALID, "egress": "none", "podNetwork": "namespace"})
+    pol = next(p for p in of_kind(objs, "NetworkPolicy") if p["metadata"]["name"] == "allow-intra-namespace")["spec"]
+    port = [{"protocol": "TCP", "port": spec.workload.containers[0].expose.port}]
+    assert pol["podSelector"] == {} and pol["policyTypes"] == ["Ingress", "Egress"]
+    assert pol["ingress"] == [{"from": [{"podSelector": {}}], "ports": port}]
+    assert pol["egress"] == [{"to": [{"podSelector": {}}], "ports": port}]
+    names = {p["metadata"]["name"] for p in of_kind(objs, "NetworkPolicy")}
+    assert names == {"default-deny", "allow-ingress-controller", "allow-dns", "allow-intra-namespace"}
+
+
 def test_extra_egress_except_split_by_family():
     s = RenderSettings(zone="z", extra_egress_except=("100.64.0.0/10", "2001:db8::/32"))
     pol = next(
@@ -216,13 +242,10 @@ def test_colliding_team_names_rejected():
         workload_refs(parse_spec({**VALID, "scope": "team"}), [Team("A b"), Team("a-b")])
 
 
-def test_missing_password_and_vm_runtime_rejected():
+def test_missing_password_rejected():
     spec = parse_spec(VALID)
     with pytest.raises(ValueError, match="missing passwords"):
         render(spec, DEP, TEAMS, SETTINGS, {})
-    vm = parse_spec({"apiVersion": "appstore/v2", "name": "win", "runtime": "openstack-vm"})
-    with pytest.raises(ValueError, match="kubernetes"):
-        render(vm, DEP, TEAMS, SETTINGS, {})
 
 
 def test_file_variables_become_a_secret_mounted_as_a_single_file():
@@ -310,3 +333,13 @@ def test_requests_above_limits_are_rejected():
     bad["workload"]["containers"][0]["resources"] = {"cpu": "500m", "memory": "1Gi", "requests": {"cpu": "1", "memory": "1Gi"}}
     with pytest.raises(SpecValidationError, match="requests.cpu"):
         parse_spec(bad)
+
+
+def test_exposed_container_has_tcp_readiness_probe_on_named_port():
+    _, objs, _ = build()
+    for sts in of_kind(objs, "StatefulSet"):
+        for c in sts["spec"]["template"]["spec"]["containers"]:
+            if any(p["name"] == "http" for p in c.get("ports", [])):
+                assert c["readinessProbe"]["tcpSocket"] == {"port": "http"}
+            else:
+                assert "readinessProbe" not in c

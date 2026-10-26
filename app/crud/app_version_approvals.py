@@ -11,7 +11,7 @@ from uuid import UUID
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.models import RUNTIME_VM, App, AppVersionApproval, AppVersionApprovalStatus
+from app.models import RUNTIME_K8S, App, AppVersionApproval, AppVersionApprovalStatus
 from app.utils.time import utcnow
 
 
@@ -22,7 +22,7 @@ def submit_version(
     commit_sha: str,
     diff_url: str | None = None,
     notes: str | None = None,
-    runtime: str = RUNTIME_VM,
+    runtime: str = RUNTIME_K8S,
     spec_sha256: str | None = None,
     image_digests: str | None = None,
 ) -> AppVersionApproval:
@@ -49,7 +49,9 @@ def submit_version(
                 detail="Version is already approved",
             )
     if existing:
-        # Rejected, or reviewed for another commit: start over.
+        # Rejected, or reviewed for another commit: start over. An app never
+        # keeps pointing at a version whose review is gone.
+        _clear_deploy_version(db, app_id, version_tag)
         db.delete(existing)
         db.flush()
 
@@ -95,15 +97,25 @@ def get_approvals_for_app(db: Session, app_id: UUID) -> list[AppVersionApproval]
     )
 
 
-def get_approval(db: Session, app_id: UUID, version_tag: str) -> AppVersionApproval | None:
-    """The review entry of ``version_tag`` (any status), or None."""
-    return (
-        db.query(AppVersionApproval)
-        .filter(
-            AppVersionApproval.appId == app_id,
-            AppVersionApproval.version_tag == version_tag,
-        )
-        .first()
+def get_approval(db: Session, app_id: UUID, version_tag: str, lock: bool = False) -> AppVersionApproval | None:
+    """The review entry of ``version_tag`` (any status), or None.
+
+    ``lock`` keeps the row locked until the transaction ends, so a revocation
+    cannot slip in between a check of the status and what is written on it.
+    """
+    query = db.query(AppVersionApproval).filter(
+        AppVersionApproval.appId == app_id,
+        AppVersionApproval.version_tag == version_tag,
+    )
+    if lock:
+        query = query.with_for_update()
+    return query.first()
+
+
+def _clear_deploy_version(db: Session, app_id: UUID, version_tag: str) -> None:
+    """Clear ``apps.deploy_version`` if it is ``version_tag`` (no commit; the caller commits)."""
+    db.query(App).filter(App.appId == app_id, App.deploy_version == version_tag).update(
+        {App.deploy_version: None}, synchronize_session=False
     )
 
 
@@ -246,7 +258,8 @@ def revoke(
 ) -> AppVersionApproval:
     """Revoke a previously APPROVED version (sets status back to REJECTED).
 
-    Existing deployments of the version are not touched.
+    Existing deployments of the version are not touched. If it is the
+    app's deploy version, that setting is cleared.
     """
     approval = _get_approval_or_404(db, app_id, version_tag)
 
@@ -260,6 +273,7 @@ def revoke(
     approval.reviewed_by = admin_id
     approval.reviewed_at = utcnow()
     approval.rejection_reason = rejection_reason
+    _clear_deploy_version(db, app_id, version_tag)
     db.commit()
     db.refresh(approval)
     return approval

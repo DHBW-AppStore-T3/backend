@@ -41,11 +41,27 @@ MANAGED_BY_LABEL = "app.kubernetes.io/managed-by"
 ENVIRONMENT_LABEL = f"{LABEL_PREFIX}/environment"
 FIELD_MANAGER = "appstore"
 PASSWORD_KEY = "password"
+USERNAME_KEY = "username"
+VM_NAMESPACE_LABEL = f"{LABEL_PREFIX}/vm-namespace"
+REFERENCE_GRANT_API = "gateway.networking.k8s.io/v1beta1"
+# Pod roles inside a kubevirt-vm namespace, for the network policies.
+ROLE_LABEL = f"{LABEL_PREFIX}/role"
+ROLE_VM = "vm"
+ROLE_VNC_PROXY = "vnc-proxy"
+VNC_PROXY_ACCOUNT = "vnc-proxy"
 
 # Never reachable from student pods: pod/service/node networks, RFC1918,
 # link-local (incl. metadata service 169.254.169.254), ULA and IPv6 link-local.
 _EGRESS_EXCEPT_V4 = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"]
 _EGRESS_EXCEPT_V6 = ["fc00::/7", "fe80::/10"]
+
+# Readiness of the exposed container: the named port ``http`` (= ``expose.port``).
+_READINESS_PROBE: dict[str, Any] = {
+    "tcpSocket": {"port": "http"},
+    "periodSeconds": 3,
+    "timeoutSeconds": 2,
+    "failureThreshold": 3,
+}
 
 
 @dataclass(frozen=True)
@@ -98,6 +114,8 @@ class RenderSettings:
     scratch_size_limit: str = "1Gi"
     # The installation the namespaces belong to (ENVIRONMENT_LABEL); empty: none.
     environment: str = ""
+    # Image of the noVNC proxy of a kubevirt-vm workload (the chart pins it).
+    vnc_proxy_image: str = "ghcr.io/dhbw-appstore-t3/novnc-proxy:latest"
 
     @property
     def app_domain(self) -> str:
@@ -190,7 +208,13 @@ def _labels(dep: DeploymentCtx, workload: str | None = None) -> dict[str, str]:
     return {k: v for k, v in labels.items() if v}
 
 
-def _meta(name: str, dep: DeploymentCtx, workload: str | None = None, *, namespaced: bool = True) -> dict[str, Any]:
+def _meta(
+    name: str,
+    dep: DeploymentCtx,
+    workload: str | None = None,
+    *,
+    namespaced: bool = True,
+) -> dict[str, Any]:
     meta: dict[str, Any] = {"name": name, "labels": _labels(dep, workload)}
     if namespaced:
         meta["namespace"] = dep.namespace
@@ -215,16 +239,27 @@ def _storage_mib(spec: AppSpec) -> int:
     return parse_storage_mib(spec.workload.storage.size)
 
 
-def _namespace(dep: DeploymentCtx, settings: RenderSettings) -> dict[str, Any]:
+def _namespace_object(
+    dep: DeploymentCtx,
+    settings: RenderSettings,
+    pod_security: str,
+    extra_labels: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """The deployment's Namespace; ``pod_security`` is the Pod Security level it enforces."""
     meta = _meta(dep.namespace, dep, namespaced=False)
     meta["labels"] = {
         **meta["labels"],
-        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce": pod_security,
         "pod-security.kubernetes.io/enforce-version": "latest",
+        **(extra_labels or {}),
     }
     if settings.environment:
         meta["labels"][ENVIRONMENT_LABEL] = label_value(settings.environment)
     return {"apiVersion": "v1", "kind": "Namespace", "metadata": meta}
+
+
+def _namespace(dep: DeploymentCtx, settings: RenderSettings) -> dict[str, Any]:
+    return _namespace_object(dep, settings, "restricted")
 
 
 def _quota_and_limits(spec: AppSpec, dep: DeploymentCtx, n: int) -> list[dict[str, Any]]:
@@ -254,7 +289,10 @@ def _quota_and_limits(spec: AppSpec, dep: DeploymentCtx, n: int) -> list[dict[st
             "limits": [
                 {
                     "type": "Container",
-                    "default": {"cpu": biggest.resources.cpu, "memory": biggest.resources.memory},
+                    "default": {
+                        "cpu": biggest.resources.cpu,
+                        "memory": biggest.resources.memory,
+                    },
                     "defaultRequest": {
                         "cpu": biggest.resources.request_cpu,
                         "memory": biggest.resources.request_memory,
@@ -266,73 +304,171 @@ def _quota_and_limits(spec: AppSpec, dep: DeploymentCtx, n: int) -> list[dict[st
     return [quota, limit_range]
 
 
+def _netpol(dep: DeploymentCtx, name: str, body: dict[str, Any], pod_selector: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": _meta(name, dep),
+        "spec": {"podSelector": pod_selector, **body},
+    }
+
+
+def _np_default_deny(dep: DeploymentCtx) -> dict[str, Any]:
+    return _netpol(dep, "default-deny", {"policyTypes": ["Ingress", "Egress"]}, {})
+
+
+def _np_allow_ingress_controller(
+    dep: DeploymentCtx, settings: RenderSettings, port: int, pod_selector: dict[str, Any]
+) -> dict[str, Any]:
+    """The ingress controller's namespace may reach ``port`` of the selected pods."""
+    return _netpol(
+        dep,
+        "allow-ingress-controller",
+        {
+            "policyTypes": ["Ingress"],
+            "ingress": [
+                {
+                    "from": [
+                        {
+                            "namespaceSelector": {
+                                "matchLabels": {"kubernetes.io/metadata.name": settings.ingress_namespace}
+                            }
+                        }
+                    ],
+                    "ports": [{"protocol": "TCP", "port": port}],
+                }
+            ],
+        },
+        pod_selector,
+    )
+
+
+def _np_allow_dns(dep: DeploymentCtx) -> dict[str, Any]:
+    return _netpol(
+        dep,
+        "allow-dns",
+        {
+            "policyTypes": ["Egress"],
+            "egress": [
+                {
+                    "to": [
+                        {
+                            "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
+                            "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
+                        }
+                    ],
+                    "ports": [
+                        {"protocol": "UDP", "port": 53},
+                        {"protocol": "TCP", "port": 53},
+                    ],
+                }
+            ],
+        },
+        {},
+    )
+
+
+def _np_allow_egress_internet(
+    dep: DeploymentCtx, settings: RenderSettings, pod_selector: dict[str, Any]
+) -> dict[str, Any]:
+    """Internet for the selected pods, without pod/service/node networks, private and link-local ranges."""
+    extra = list(settings.extra_egress_except)
+    v4 = _EGRESS_EXCEPT_V4 + [c for c in extra if ":" not in c]
+    v6 = _EGRESS_EXCEPT_V6 + [c for c in extra if ":" in c]
+    return _netpol(
+        dep,
+        "allow-egress-internet",
+        {
+            "policyTypes": ["Egress"],
+            "egress": [
+                {"to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": v4}}]},
+                {"to": [{"ipBlock": {"cidr": "::/0", "except": v6}}]},
+            ],
+        },
+        pod_selector,
+    )
+
+
+def _np_allow_intra_namespace(
+    dep: DeploymentCtx,
+    peer: list[dict[str, Any]],
+    pod_selector: dict[str, Any],
+    ports: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Both directions between the selected pods and ``peer`` (default-deny blocks both).
+
+    Without ``ports`` every port is open.
+    """
+    port_part = {"ports": ports} if ports else {}
+    return _netpol(
+        dep,
+        "allow-intra-namespace",
+        {
+            "policyTypes": ["Ingress", "Egress"],
+            "ingress": [{"from": peer, **port_part}],
+            "egress": [{"to": peer, **port_part}],
+        },
+        pod_selector,
+    )
+
+
 def _network_policies(spec: AppSpec, dep: DeploymentCtx, settings: RenderSettings) -> list[dict[str, Any]]:
     assert spec.workload is not None
     port = next(c.expose.port for c in spec.workload.containers if c.expose)
-
-    def policy(name: str, body: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "apiVersion": "networking.k8s.io/v1",
-            "kind": "NetworkPolicy",
-            "metadata": _meta(name, dep),
-            "spec": {"podSelector": {}, **body},
-        }
-
     policies = [
-        policy("default-deny", {"policyTypes": ["Ingress", "Egress"]}),
-        policy(
-            "allow-ingress-controller",
-            {
-                "policyTypes": ["Ingress"],
-                "ingress": [
-                    {
-                        "from": [
-                            {
-                                "namespaceSelector": {
-                                    "matchLabels": {"kubernetes.io/metadata.name": settings.ingress_namespace}
-                                }
-                            }
-                        ],
-                        "ports": [{"protocol": "TCP", "port": port}],
-                    }
-                ],
-            },
-        ),
-        policy(
-            "allow-dns",
-            {
-                "policyTypes": ["Egress"],
-                "egress": [
-                    {
-                        "to": [
-                            {
-                                "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
-                                "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
-                            }
-                        ],
-                        "ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}],
-                    }
-                ],
-            },
-        ),
+        _np_default_deny(dep),
+        _np_allow_ingress_controller(dep, settings, port, {}),
+        _np_allow_dns(dep),
     ]
     if spec.egress == "internet":
-        extra = list(settings.extra_egress_except)
-        v4 = _EGRESS_EXCEPT_V4 + [c for c in extra if ":" not in c]
-        v6 = _EGRESS_EXCEPT_V6 + [c for c in extra if ":" in c]
-        policies.append(
-            policy(
-                "allow-egress-internet",
-                {
-                    "policyTypes": ["Egress"],
-                    "egress": [
-                        {"to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": v4}}]},
-                        {"to": [{"ipBlock": {"cidr": "::/0", "except": v6}}]},
-                    ],
-                },
-            )
-        )
+        policies.append(_np_allow_egress_internet(dep, settings, {}))
+    if spec.pod_network == "namespace":
+        # No namespaceSelector or ipBlock, so it reaches only pods of this
+        # deployment's namespace; the admission policy demands TCP ports here.
+        policies.append(_np_allow_intra_namespace(dep, [{"podSelector": {}}], {}, [{"protocol": "TCP", "port": port}]))
     return policies
+
+
+def _ingress(
+    dep: DeploymentCtx, settings: RenderSettings, name: str, path: str, host: str | None = None
+) -> dict[str, Any]:
+    """Ingress of the Service ``name`` (port ``http``) at ``host``, default ``<name>-<deployment>.<app domain>``.
+
+    Always a tls section: without one the ingress controller serves plain HTTP only.
+    No secretName means the controller's default certificate (a cluster wildcard).
+    """
+    meta = _meta(name, dep, name)
+    if settings.cluster_issuer:
+        meta["annotations"] = {"cert-manager.io/cluster-issuer": settings.cluster_issuer}
+    host = host or f"{name}-{dep.short_id}.{settings.app_domain}"
+    tls: dict[str, Any] = {"hosts": [host]}
+    if settings.tls_secret:
+        tls["secretName"] = settings.tls_secret
+    elif settings.cluster_issuer:
+        tls["secretName"] = f"{name}-tls"
+    return {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "Ingress",
+        "metadata": meta,
+        "spec": {
+            "ingressClassName": settings.ingress_class,
+            "rules": [
+                {
+                    "host": host,
+                    "http": {
+                        "paths": [
+                            {
+                                "path": path,
+                                "pathType": "Prefix",
+                                "backend": {"service": {"name": name, "port": {"name": "http"}}},
+                            }
+                        ]
+                    },
+                }
+            ],
+            "tls": [tls],
+        },
+    }
 
 
 def _env_entries(c: Container, ref: WorkloadRef) -> list[dict[str, Any]]:
@@ -341,7 +477,12 @@ def _env_entries(c: Container, ref: WorkloadRef) -> list[dict[str, Any]]:
         if e.value is not None:
             out.append({"name": e.name, "value": e.value})
         elif e.source == "generated-password":
-            out.append({"name": e.name, "valueFrom": {"secretKeyRef": {"name": ref.name, "key": PASSWORD_KEY}}})
+            out.append(
+                {
+                    "name": e.name,
+                    "valueFrom": {"secretKeyRef": {"name": ref.name, "key": PASSWORD_KEY}},
+                }
+            )
         elif e.source == "team-name":
             out.append({"name": e.name, "value": ref.team})
         else:  # user-name
@@ -390,7 +531,12 @@ def _variable_env(spec: AppSpec, ref: WorkloadRef, values: Mapping[str, Any] | N
             if raw is None:
                 raw = v.default
         if raw is not None:
-            out.append({"name": f"APPSTORE_VAR_{re.sub(r'[^A-Za-z0-9]', '_', v.name).upper()}", "value": str(raw)})
+            out.append(
+                {
+                    "name": f"APPSTORE_VAR_{re.sub(r'[^A-Za-z0-9]', '_', v.name).upper()}",
+                    "value": str(raw),
+                }
+            )
     return out
 
 
@@ -430,7 +576,10 @@ def _workload_objects(
             "image": c.image,
             "env": _env_entries(c, ref) + var_env,
             "resources": {
-                "requests": {"cpu": c.resources.request_cpu, "memory": c.resources.request_memory},
+                "requests": {
+                    "cpu": c.resources.request_cpu,
+                    "memory": c.resources.request_memory,
+                },
                 "limits": {"cpu": c.resources.cpu, "memory": c.resources.memory},
             },
             "securityContext": {
@@ -444,10 +593,20 @@ def _workload_objects(
         }
         if c.expose:
             item["ports"] = [{"name": "http", "containerPort": c.expose.port, "protocol": "TCP"}]
+            # Ready only once the exposed port accepts connections: without a
+            # probe the pod is Ready at container start and the ingress answers
+            # 502 until the app listens. A TCP check works for every app (an
+            # HTTP check would need a path that answers 2xx/3xx without login).
+            item["readinessProbe"] = dict(_READINESS_PROBE)
         containers.append(item)
 
     if file_items:
-        volumes.append({"name": "files", "secret": {"secretName": f"{ref.name}-files", "defaultMode": 0o444}})
+        volumes.append(
+            {
+                "name": "files",
+                "secret": {"secretName": f"{ref.name}-files", "defaultMode": 0o444},
+            }
+        )
 
     pod_spec: dict[str, Any] = {
         "automountServiceAccountToken": False,
@@ -471,7 +630,10 @@ def _workload_objects(
         "replicas": 1,
         "serviceName": ref.name,
         "selector": {"matchLabels": sel},
-        "template": {"metadata": {"labels": {**_labels(dep, ref.name)}}, "spec": pod_spec},
+        "template": {
+            "metadata": {"labels": {**_labels(dep, ref.name)}},
+            "spec": pod_spec,
+        },
     }
     if storage:
         claim: dict[str, Any] = {
@@ -513,41 +675,7 @@ def _workload_objects(
             "ports": [{"name": "http", "port": exposed.expose.port, "targetPort": "http"}],
         },
     }
-    ingress_meta = _meta(ref.name, dep, ref.name)
-    if settings.cluster_issuer:
-        ingress_meta["annotations"] = {"cert-manager.io/cluster-issuer": settings.cluster_issuer}
-    host = ref.host(dep, settings)
-    ingress_spec: dict[str, Any] = {
-        "ingressClassName": settings.ingress_class,
-        "rules": [
-            {
-                "host": host,
-                "http": {
-                    "paths": [
-                        {
-                            "path": exposed.expose.path,
-                            "pathType": "Prefix",
-                            "backend": {"service": {"name": ref.name, "port": {"name": "http"}}},
-                        }
-                    ]
-                },
-            }
-        ],
-    }
-    # Always a tls section: without one the ingress controller serves plain HTTP only.
-    # No secretName means the controller's default certificate (a cluster wildcard).
-    tls: dict[str, Any] = {"hosts": [host]}
-    if settings.tls_secret:
-        tls["secretName"] = settings.tls_secret
-    elif settings.cluster_issuer:
-        tls["secretName"] = f"{ref.name}-tls"
-    ingress_spec["tls"] = [tls]
-    ingress = {
-        "apiVersion": "networking.k8s.io/v1",
-        "kind": "Ingress",
-        "metadata": ingress_meta,
-        "spec": ingress_spec,
-    }
+    ingress = _ingress(dep, settings, ref.name, exposed.expose.path)
     objects = [secret]
     if file_items:
         objects.append(
@@ -560,6 +688,302 @@ def _workload_objects(
             }
         )
     return [*objects, statefulset, service, ingress]
+
+
+def _vm_namespace(dep: DeploymentCtx, settings: RenderSettings) -> dict[str, Any]:
+    """Namespace for a kubevirt-vm deployment; PSS privileged (virt-launcher needs it)."""
+    return _namespace_object(dep, settings, "privileged", {VM_NAMESPACE_LABEL: "true"})
+
+
+def vm_clone_grant_name(dep: DeploymentCtx) -> str:
+    return f"clone-{dep.namespace}"
+
+
+def _vm_clone_grant(spec: AppSpec, dep: DeploymentCtx) -> dict[str, Any]:
+    """Lets this deployment's PVCs clone the golden image of another namespace.
+
+    The grant lives in the image namespace and names the one deployment namespace
+    it is for (a ReferenceGrant has no wildcards); the worker removes it with the deployment.
+    """
+    assert spec.vm is not None
+    meta = _meta(vm_clone_grant_name(dep), dep, namespaced=False)
+    meta["namespace"] = spec.vm.image_namespace
+    return {
+        "apiVersion": REFERENCE_GRANT_API,
+        "kind": "ReferenceGrant",
+        "metadata": meta,
+        "spec": {
+            "from": [{"group": "", "kind": "PersistentVolumeClaim", "namespace": dep.namespace}],
+            "to": [{"group": "", "kind": "PersistentVolumeClaim", "name": spec.vm.image_ref}],
+        },
+    }
+
+
+def _vm_network_policies(spec: AppSpec, dep: DeploymentCtx, settings: RenderSettings) -> list[dict[str, Any]]:
+    """Default-deny, then only what a VM namespace needs.
+
+    The browser reaches the VNC proxy through the ingress controller; the proxy
+    reaches the VM through the Kubernetes API (KubeVirt's VNC subresource), never
+    through a pod port. The VM itself gets DNS, and internet / the other VMs of
+    the namespace when the app (or the person, see ``userChoices``) allows it.
+    """
+    proxy = {"matchLabels": {ROLE_LABEL: ROLE_VNC_PROXY}}
+    vm = {"matchLabels": {ROLE_LABEL: ROLE_VM}}
+    policies = [
+        _np_default_deny(dep),
+        _np_allow_ingress_controller(dep, settings, 8080, proxy),
+        _np_allow_dns(dep),
+        # The proxy talks to the API server (kubernetes.default: service port 443, node port 6443).
+        # The destination is any address on purpose: where the API server sits differs per
+        # cluster (service IP, node IPs, an external endpoint) and a NetworkPolicy cannot name
+        # the "kubernetes" service. What this opens is limited to the proxy pods (``proxy``
+        # selector, the app's code never runs there) and to ports 443/6443; the proxy has no
+        # other egress and its service account may only open VNC streams (vnc-proxy role).
+        _netpol(
+            dep,
+            "allow-vnc-proxy-to-apiserver",
+            {
+                "policyTypes": ["Egress"],
+                "egress": [
+                    {
+                        "to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}, {"ipBlock": {"cidr": "::/0"}}],
+                        "ports": [{"protocol": "TCP", "port": 443}, {"protocol": "TCP", "port": 6443}],
+                    }
+                ],
+            },
+            proxy,
+        ),
+    ]
+    if spec.egress == "internet":
+        policies.append(_np_allow_egress_internet(dep, settings, vm))
+    if spec.pod_network == "namespace":
+        # The VMs of this namespace see each other (any port); the proxies are not part of it.
+        policies.append(_np_allow_intra_namespace(dep, [{"podSelector": vm}], vm))
+    return policies
+
+
+def _vm_workload_objects(
+    spec: AppSpec,
+    dep: DeploymentCtx,
+    ref: WorkloadRef,
+    vnc_password: str,
+    settings: RenderSettings,
+) -> list[dict[str, Any]]:
+    """All Kubernetes/KubeVirt objects for one kubevirt-vm workload slot.
+
+    Known limitation: all proxies of a namespace share the one ServiceAccount
+    ``vnc-proxy`` (its role may open the VNC stream of every VM of the namespace). With
+    ``scope: user`` that is many VMs per namespace, so a compromised proxy of one person
+    could reach the VNC stream of another person's VM in the same deployment (not of
+    another deployment). Binding one account per VM would need a ServiceAccount, Role
+    (resourceNames) and RoleBinding per VM and matching admission-policy rules.
+    """
+    assert spec.vm is not None
+    vm = spec.vm
+    workload_name = ref.name
+    disk_name = f"{workload_name}-disk"
+    novnc_name = f"{workload_name}-novnc"
+    namespace = dep.namespace
+
+    labels = _labels(dep, workload_name)
+    novnc_labels = {**labels, WORKLOAD_LABEL: novnc_name, ROLE_LABEL: ROLE_VNC_PROXY}
+
+    # PVC — a clone of the golden image; the platform grants the access (see _vm_clone_grant)
+    pvc: dict[str, Any] = {
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": _meta(disk_name, dep, workload_name),
+        "spec": {
+            "storageClassName": vm.storage_class,
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": f"{vm.disk_gib}Gi"}},
+            "dataSourceRef": {
+                "apiGroup": "",
+                "kind": "PersistentVolumeClaim",
+                "name": vm.image_ref,
+                "namespace": vm.image_namespace,
+            },
+        },
+    }
+
+    # The VM and its pod carry whose they are, so the live view can tell the rows apart.
+    vm_labels = {**labels, TEAM_LABEL: label_value(ref.team)}
+    if ref.user:
+        vm_labels[USER_LABEL] = label_value(ref.user.user_id)
+
+    # VirtualMachine CR
+    virtual_machine: dict[str, Any] = {
+        "apiVersion": "kubevirt.io/v1",
+        "kind": "VirtualMachine",
+        "metadata": {
+            **_meta(workload_name, dep, workload_name),
+            "labels": vm_labels,
+        },
+        "spec": {
+            "runStrategy": "Always",
+            "template": {
+                "metadata": {"labels": {**vm_labels, "vm.kubevirt.io/name": workload_name, ROLE_LABEL: ROLE_VM}},
+                "spec": {
+                    "domain": {
+                        "cpu": {"cores": vm.cpu_cores},
+                        "memory": {"guest": f"{vm.memory_gib}Gi"},
+                        "devices": {
+                            "disks": [{"name": "root", "disk": {"bus": "sata"}}],
+                            "interfaces": [{"name": "default", "masquerade": {}, "model": "e1000e"}],
+                            "inputs": [{"name": "tablet", "type": "tablet", "bus": "usb"}],
+                            "tpm": {},
+                        },
+                        "features": {"hyperv": {}, "acpi": {}},
+                        "firmware": {"bootloader": {"efi": {"secureBoot": False}}},
+                    },
+                    "networks": [{"name": "default", "pod": {}}],
+                    "volumes": [
+                        {
+                            "name": "root",
+                            "persistentVolumeClaim": {"claimName": disk_name},
+                        }
+                    ],
+                },
+            },
+        },
+    }
+    # What the person signs in to the proxy with (HTTP basic auth, see docker/novnc-proxy).
+    vnc_secret: dict[str, Any] = {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": _meta(workload_name, dep, workload_name),
+        "type": "Opaque",
+        "stringData": {PASSWORD_KEY: vnc_password, USERNAME_KEY: ref.user.name if ref.user else ref.team},
+    }
+
+    # noVNC proxy deployment: noVNC in the browser, bridged to KubeVirt's VNC subresource of this VM
+    novnc_deploy: dict[str, Any] = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {**_meta(novnc_name, dep, novnc_name), "labels": novnc_labels},
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": {WORKLOAD_LABEL: novnc_name, DEPLOYMENT_LABEL: dep.id}},
+            "template": {
+                "metadata": {"labels": novnc_labels},
+                "spec": {
+                    "serviceAccountName": VNC_PROXY_ACCOUNT,
+                    "automountServiceAccountToken": True,
+                    "enableServiceLinks": False,
+                    "securityContext": {
+                        "runAsNonRoot": True,
+                        "runAsUser": 1000,
+                        "runAsGroup": 1000,
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                    "containers": [
+                        {
+                            "name": "novnc",
+                            "image": settings.vnc_proxy_image,
+                            "ports": [
+                                {
+                                    "name": "http",
+                                    "containerPort": 8080,
+                                    "protocol": "TCP",
+                                }
+                            ],
+                            "env": [
+                                {"name": "VM_NAME", "value": workload_name},
+                                {"name": "VM_NAMESPACE", "value": namespace},
+                                {
+                                    "name": "PROXY_USER",
+                                    "valueFrom": {"secretKeyRef": {"name": workload_name, "key": USERNAME_KEY}},
+                                },
+                                {
+                                    "name": "PROXY_PASSWORD",
+                                    "valueFrom": {"secretKeyRef": {"name": workload_name, "key": PASSWORD_KEY}},
+                                },
+                            ],
+                            "securityContext": {
+                                "allowPrivilegeEscalation": False,
+                                "readOnlyRootFilesystem": True,
+                                "runAsNonRoot": True,
+                                "capabilities": {"drop": ["ALL"]},
+                                "seccompProfile": {"type": "RuntimeDefault"},
+                            },
+                            "resources": {
+                                "requests": {"cpu": "50m", "memory": "64Mi"},
+                                "limits": {"cpu": "200m", "memory": "128Mi"},
+                            },
+                            "readinessProbe": {
+                                "tcpSocket": {"port": "http"},
+                                "periodSeconds": 5,
+                                "timeoutSeconds": 2,
+                                "failureThreshold": 3,
+                            },
+                        }
+                    ],
+                },
+            },
+        },
+    }
+
+    # Service for noVNC proxy
+    novnc_service: dict[str, Any] = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": _meta(novnc_name, dep, novnc_name),
+        "spec": {
+            "type": "ClusterIP",
+            "selector": {WORKLOAD_LABEL: novnc_name, DEPLOYMENT_LABEL: dep.id},
+            "ports": [{"name": "http", "port": 8080, "targetPort": "http"}],
+        },
+    }
+
+    # Ingress for noVNC (browser access). Its host is the workload's own,
+    # ``ref.host`` = <workload>-<deployment>.<app domain>, the one ``render_access``
+    # checks the access URL against (the app declares https://{workload}-{deployment}.{domain}).
+    # The Ingress and its Service keep the proxy's name; only the host drops the "-novnc".
+    ingress = _ingress(dep, settings, novnc_name, "/", host=ref.host(dep, settings))
+
+    return [
+        vnc_secret,
+        pvc,
+        virtual_machine,
+        novnc_deploy,
+        novnc_service,
+        ingress,
+    ]
+
+
+def render_vm(
+    spec: AppSpec,
+    dep: DeploymentCtx,
+    teams: list[Team],
+    settings: RenderSettings,
+    passwords: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    """Return all objects of a kubevirt-vm deployment in apply order.
+
+    ``passwords`` maps workload name (see :func:`workload_refs`) to its generated VNC password.
+    """
+    if spec.runtime != "kubevirt-vm" or spec.vm is None:
+        raise ValueError("render_vm() only supports runtime 'kubevirt-vm'")
+    refs = workload_refs(spec, teams)
+    if not refs:
+        raise ValueError("no workloads: teams are empty")
+    missing = [r.name for r in refs if r.name not in passwords]
+    if missing:
+        raise ValueError(f"missing passwords for workloads: {', '.join(missing)}")
+
+    # No ResourceQuota/LimitRange here, on purpose: the admission policy demands
+    # limits.cpu/limits.memory in every quota, and a quota with them rejects each
+    # pod without limits (KubeVirt's virt-launcher, CDI clone pods). Capping the
+    # VM namespaces needs limits on those pods first.
+    objects: list[dict[str, Any]] = [
+        _vm_namespace(dep, settings),
+        *_vm_network_policies(spec, dep, settings),
+        _vm_clone_grant(spec, dep),
+        {"apiVersion": "v1", "kind": "ServiceAccount", "metadata": _meta(VNC_PROXY_ACCOUNT, dep)},
+    ]
+    for ref in refs:
+        objects.extend(_vm_workload_objects(spec, dep, ref, passwords[ref.name], settings))
+    return objects
 
 
 def render(
@@ -635,7 +1059,7 @@ def render_access(
                 workload=ref.name,
                 team=ref.team,
                 user=ref.user,
-                url=_checked_url(url_tpl.format(**fmt), ref.host(dep, settings)) if url_tpl else None,
+                url=(_checked_url(url_tpl.format(**fmt), ref.host(dep, settings)) if url_tpl else None),
                 username=username,
                 password=passwords[ref.name] if pw else None,
             )

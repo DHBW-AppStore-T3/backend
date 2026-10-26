@@ -23,11 +23,14 @@ from sqlalchemy.orm import relationship
 from app.database import Base
 from app.utils.time import utcnow
 
-# How a deployment runs: OpenTofu/Packer on OpenStack VMs (Windows apps), or
-# pods in the cluster rendered from the app's appstore.yaml (.github#4). The
-# values are the ``runtime`` names of the appstore.yaml contract.
-RUNTIME_VM = "openstack-vm"
+# How a deployment runs: pods in the cluster rendered from the app's
+# appstore.yaml (.github#4), or KubeVirt VMs rendered from the app's
+# appstore.yaml. The values are the ``runtime`` names of the appstore.yaml
+# contract.
 RUNTIME_K8S = "kubernetes"
+RUNTIME_KUBEVIRT = "kubevirt-vm"
+# Runtimes whose objects live in this cluster (no OpenStack, no OpenTofu state).
+CLUSTER_RUNTIMES = (RUNTIME_K8S, RUNTIME_KUBEVIRT)
 
 
 # ----------------------------------------------------------------
@@ -51,9 +54,8 @@ class TaskType(str, enum.Enum):
     DESTROY = "destroy"
     PAUSE = "pause"
     RESUME = "resume"
-    # Single-resource redeploy of ONE Compute-Instance via
-    # ``terraform apply -replace=<addr> -target=<addr>``, without
-    # touching the other team VMs of the same deployment.
+    # Restart (or reset) of ONE workload, without touching the others of
+    # the same deployment.
     REDEPLOY = "redeploy"
 
 
@@ -65,11 +67,6 @@ class TaskStatus(str, enum.Enum):
     CANCELLED = "cancelled"
 
 
-class OpenStackAuthType(str, enum.Enum):
-    APPLICATION_CREDENTIAL = "v3applicationcredential"
-    PASSWORD = "password"
-
-
 # ----------------------------------------------------------------
 # COURSE MODEL
 # ----------------------------------------------------------------
@@ -78,6 +75,14 @@ class Course(Base):
 
     courseId = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String, nullable=False)
+    # The LTI context (``iss`` of the platform + ``context.id``) of a course an
+    # LTI launch created or adopted; the name is only its label (review S9).
+    lti_issuer = Column(String, nullable=True)
+    lti_context_id = Column(String, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("lti_issuer", "lti_context_id", name="uq_courses_lti_context"),
+    )
 
     # Relationships
     users = relationship("User", back_populates="course")
@@ -104,9 +109,23 @@ class User(Base):
     username = Column(String, nullable=False)
     firstName = Column(String, nullable=True)
     lastName = Column(String, nullable=True)
+    # The effective role: the highest of the three sources below, recomputed
+    # whenever one of them changes (app.utils.roles, review S8).
     role = Column(Enum(UserRole), nullable=False, default=UserRole.STUDENT)
+    # What each source said last: the realm roles of the latest Keycloak
+    # token, the role of the latest LTI launch, and an admin's grant
+    # (``PUT /users/{id}``). NULL: that source never said anything.
+    keycloak_role = Column(Enum(UserRole), nullable=True)
+    lti_role = Column(Enum(UserRole), nullable=True)
+    granted_role = Column(Enum(UserRole), nullable=True)
+    # The LTI identity (``iss`` + ``sub`` of the platform's id_token) this
+    # account is linked to; the e-mail is only an attribute (review S9).
+    lti_issuer = Column(String, nullable=True)
+    lti_subject = Column(String, nullable=True)
     courseId = Column(UUID(as_uuid=True), ForeignKey("courses.courseId"), nullable=True, index=True)
     created_at = Column(DateTime, default=utcnow)
+
+    __table_args__ = (UniqueConstraint("lti_issuer", "lti_subject", name="uq_users_lti_identity"),)
 
     # Relationships
     course = relationship("Course", back_populates="users")
@@ -116,13 +135,6 @@ class User(Base):
     user_to_teams = relationship("UserToTeam", back_populates="user")
     course_teacher_links = relationship(
         "CourseTeacher",
-        back_populates="user",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
-    # One credential per OpenStack project (dhbw-appstore's model).
-    openstack_credentials = relationship(
-        "UserOpenStackCredential",
         back_populates="user",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -139,13 +151,22 @@ class App(Base):
     name = Column(String, nullable=False)
     description = Column(String, nullable=True)
     image = Column(LargeBinary, nullable=True)  # raw bytes of the uploaded logo
-    image_mime = Column(String(64), nullable=True)  # e.g. "image/png" — needed to build a data-URL on read
+    image_mime = Column(
+        String(64), nullable=True
+    )  # e.g. "image/png" — needed to build a data-URL on read
     git_link = Column(String, nullable=True)
     is_private = Column(Boolean, nullable=False, default=False)
     # Set by an admin's emergency deactivation: the app is private and only
     # an admin may make it public again, so the owner cannot undo the
     # deactivation (.github#7 R, dhbw-appstore).
     hidden_by_admin = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    # Set by an admin: the app is highlighted in the catalog. Only the admin
+    # endpoint ``PUT /admin/apps/{id}/recommended`` changes it.
+    recommended = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    # The version tag teachers deploy; set by an admin, only to an approved
+    # version. NULL: nothing set. Cleared when that version's approval ends
+    # (revoked, or replaced by a new submission).
+    deploy_version = Column(String, nullable=True)
     userId = Column(UUID(as_uuid=True), ForeignKey("users.userId"), nullable=False, index=True)
     created_at = Column(DateTime, default=utcnow)
     # Soft-delete marker. When set, the app is hidden from default
@@ -181,14 +202,7 @@ class Deployment(Base):
     # The commit ``releaseTag`` pointed to when the deployment was created.
     # Every job of the deployment runs exactly this commit (.github#7 G).
     commit_sha = Column(String(40), nullable=True)
-    # VM deployments: the OpenStack project of the credential they were
-    # created with (as Keystone scoped it). Everyone holding an own verified
-    # credential for this project is a peer: owner view and operate, each
-    # with their own credential. None for pod deployments, and for VM
-    # deployments made before projects were verified until their owner's
-    # old credential is re-checked (``crud.openstack_credentials``).
-    os_project_id = Column(String, nullable=True, index=True)
-    runtime = Column(String(16), nullable=False, default=RUNTIME_VM, server_default=RUNTIME_VM)
+    runtime = Column(String(16), nullable=False, default=RUNTIME_K8S, server_default=RUNTIME_K8S)
     # Pod deployments: their namespace (``dep-<first 8 hex of the id>``),
     # unique across all deployments, deleted ones included, so a destroy can
     # never reach another deployment's namespace; and how many workloads
@@ -200,13 +214,16 @@ class Deployment(Base):
     appId = Column(UUID(as_uuid=True), ForeignKey("apps.appId"), nullable=False, index=True)
     # Soft-delete marker. Set to hide the deployment from default
     # queries while keeping the row for audit/restore. DELETE is only
-    # allowed in terminal states, so OpenStack resources are already
-    # gone by the time this is set.
+    # allowed in terminal states.
     deleted_at = Column(DateTime, nullable=True)
 
     __table_args__ = (
         # Default queries hide soft-deleted deployments.
-        Index("ix_deployments_live", "deploymentId", postgresql_where=text("deleted_at IS NULL")),
+        Index(
+            "ix_deployments_live",
+            "deploymentId",
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
         Index(
             "uq_deployments_k8s_namespace",
             "k8s_namespace",
@@ -282,10 +299,6 @@ class Task(Base):
     # worker reported them (``app.services.task_results``). Replaces the
     # plaintext ``outputs``/``tf_state`` for tasks run since .github#5.
     outputs_enc = Column(LargeBinary, nullable=True)
-    # SHA-256 of the random token that lets this task's OpenTofu reach the
-    # state of its deployment through ``/internal/tfstate`` while the task
-    # is RUNNING. The token itself travels sealed in the job message only.
-    state_token_hash = Column(String(64), nullable=True)
 
     __table_args__ = (
         # At most one PENDING/RUNNING task per deployment: the database
@@ -325,8 +338,17 @@ class CeleryQueueMessage(Base):
 
     __table_args__ = (
         Index("ix_celery_queue_ready", "queue", "visible_after", "id"),
-        Index("uq_celery_queue_task_id", "task_id", unique=True, postgresql_where=text("task_id IS NOT NULL")),
-        Index("ix_celery_queue_after_task", "after_task", postgresql_where=text("after_task IS NOT NULL")),
+        Index(
+            "uq_celery_queue_task_id",
+            "task_id",
+            unique=True,
+            postgresql_where=text("task_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_celery_queue_after_task",
+            "after_task",
+            postgresql_where=text("after_task IS NOT NULL"),
+        ),
     )
 
 
@@ -347,33 +369,6 @@ class TaskEvent(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 
     __table_args__ = (Index("ix_task_events_task", "task_id", "id"),)
-
-
-# ----------------------------------------------------------------
-# TERRAFORM STATE MODEL
-# ----------------------------------------------------------------
-# The OpenTofu state of one VM deployment, written and read by OpenTofu
-# through the API's HTTP state backend (``routers/internal_tfstate``), never
-# by the worker directly; the job holds no database credentials. It lists
-# every resource with its attributes, generated passwords included, so it is
-# stored Fernet-encrypted. Deleted once a destroy has succeeded.
-class TerraformState(Base):
-    __tablename__ = "terraform_states"
-
-    deploymentId = Column(
-        UUID(as_uuid=True),
-        ForeignKey("deployments.deploymentId", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    state = Column(LargeBinary, nullable=True)  # Fernet, JSON inside
-    # OpenTofu's lock: its id, the lock info it sent (returned to a
-    # competing client) and the task that took it. A lock whose task no
-    # longer runs is stale and may be taken over, so a worker that died
-    # mid-apply cannot block the deployment for good.
-    lock_id = Column(String, nullable=True)
-    lock_info = Column(Text, nullable=True)
-    lock_task_id = Column(UUID(as_uuid=True), nullable=True)
-    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 # ----------------------------------------------------------------
@@ -452,71 +447,6 @@ class UserToTeam(Base):
 
 
 # ----------------------------------------------------------------
-# USER OPENSTACK CREDENTIAL MODEL
-# ----------------------------------------------------------------
-class UserOpenStackCredential(Base):
-    __tablename__ = "user_openstack_credentials"
-
-    credentialId = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    userId = Column(
-        UUID(as_uuid=True),
-        ForeignKey("users.userId", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    auth_type = Column(
-        Enum(
-            OpenStackAuthType,
-            name="openstackauthtype",
-            values_callable=lambda x: [e.value for e in x],
-        ),
-        nullable=False,
-    )
-
-    # Non-secret display fields (plaintext)
-    auth_url = Column(String, nullable=False)
-    region_name = Column(String, nullable=True)
-    interface = Column(String, nullable=True, default="public")
-    identity_api_version = Column(String, nullable=True, default="3")
-    # The project Keystone scoped the token to, once ``project_verified``:
-    # it decides who is a project peer, so a typed value must never count.
-    # For password auth it is also the scope requested at login.
-    project_id = Column(String, nullable=True, index=True)
-    project_name = Column(String, nullable=True)
-    user_domain_name = Column(String, nullable=True)
-    project_domain_name = Column(String, nullable=True)
-    # True once ``project_id`` came from a Keystone token. Credentials saved
-    # before projects were taken from Keystone carry whatever the user typed
-    # (an application credential ignores it entirely), so they are False
-    # until re-checked and count for nobody's project.
-    project_verified = Column(Boolean, nullable=False, default=False, server_default=text("false"))
-
-    # Encrypted (Fernet ciphertext) — never logged, never returned via API
-    encrypted_identifier = Column(LargeBinary, nullable=False)
-    encrypted_secret = Column(LargeBinary, nullable=False)
-
-    last_validated_at = Column(DateTime, nullable=True)
-    last_validation_error = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=utcnow)
-    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
-
-    __table_args__ = (
-        # One verified credential per user and project; saving another one
-        # for the same project replaces it (that is how a secret is rotated).
-        # Unverified old rows stay out of it until re-checked.
-        Index(
-            "uq_user_openstack_credentials_project",
-            "userId",
-            "project_id",
-            unique=True,
-            postgresql_where=text("project_verified"),
-        ),
-    )
-
-    user = relationship("User", back_populates="openstack_credentials")
-
-
-# ----------------------------------------------------------------
 # APP VERSION APPROVAL MODEL
 # ----------------------------------------------------------------
 class AppVersionApproval(Base):
@@ -552,15 +482,13 @@ class AppVersionApproval(Base):
     reviewed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=utcnow, nullable=False)
     # What the review covered besides the commit (.github#4): how the version
-    # runs and, for pods, the SHA-256 of its appstore.yaml and the image
+    # runs and the SHA-256 of its appstore.yaml and the image
     # digests it names (JSON list). A deploy refuses a spec that differs.
-    runtime = Column(String(16), nullable=False, default=RUNTIME_VM, server_default=RUNTIME_VM)
+    runtime = Column(String(16), nullable=False, default=RUNTIME_K8S, server_default=RUNTIME_K8S)
     spec_sha256 = Column(String(64), nullable=True)
     image_digests = Column(Text, nullable=True)
 
-    __table_args__ = (
-        UniqueConstraint("appId", "version_tag", name="uq_app_version_approval"),
-    )
+    __table_args__ = (UniqueConstraint("appId", "version_tag", name="uq_app_version_approval"),)
 
     # Relationships
     app = relationship("App", back_populates="version_approvals")
@@ -582,6 +510,30 @@ class LtiNonce(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 
     __table_args__ = (Index("ix_lti_nonces_created_at", "created_at"),)
+
+
+class LtiLoginCode(Base):
+    """A one-time code of an LTI launch, redeemed by the frontend for a session.
+
+    The launch hands the browser the code (in the URL fragment) and sets a
+    cookie with a random binding; only a request with both gets the session
+    token, so a link with somebody else's code signs nobody in (review S19).
+    Only hashes are stored. Redeemed once, within ``LTI_CODE_TTL``.
+    """
+
+    __tablename__ = "lti_login_codes"
+
+    code_hash = Column(String(64), primary_key=True)
+    binding_hash = Column(String(64), nullable=False)
+    userId = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.userId", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
+
+    __table_args__ = (Index("ix_lti_login_codes_created_at", "created_at"),)
 
 
 # ----------------------------------------------------------------

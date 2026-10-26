@@ -6,7 +6,6 @@ import pytest
 from fastapi import HTTPException
 
 from app.config import settings
-from app.models import UserRole
 from app.routers import lti13
 
 pytestmark = pytest.mark.unit
@@ -177,87 +176,67 @@ async def test_lti13_launch_rejects_missing_email_claim():
     assert exc_info.value.status_code == 400
 
 
-async def test_lti13_launch_creates_new_user_and_course_jit():
+INFO = {
+    "issuer": "https://moodle.example.com",
+    "subject": "42",
+    "email": "new@example.com",
+    "name": "New Person",
+    "role": "student",
+    "context_id": "ctx",
+    "course": "Course 101",
+}
+
+
+async def test_lti13_launch_hands_out_only_a_code_and_a_binding_cookie():
+    """The provisioning itself is covered with a database in tests/test_lti13_launch.py."""
     request = _mock_request(
         cookies={"lti13_state": "known-state"},
         form={"id_token": "tok", "state": "known-state"},
     )
-    db = MagicMock()
-    # No existing course, no existing user.
-    db.query.return_value.filter.return_value.first.side_effect = [None, None]
-    created_course = MagicMock(courseId="course-uuid-1")
-
-    def _refresh(obj):
-        if hasattr(obj, "courseId") and obj.courseId is None:
-            obj.courseId = created_course.courseId
-
-    db.refresh.side_effect = _refresh
+    user = MagicMock(userId="user-uuid-1")
 
     with (
         _known_state(),
         patch.object(settings, "LTI13_CLIENT_ID", "client-123"),
         patch.object(settings, "APP_BASE_URL", "https://app.example.com"),
-        patch.object(settings, "LTI13_SESSION_SECRET", "test-secret"),
         patch.object(lti13.lti13_service, "validate_id_token", return_value={}),
-        patch.object(
-            lti13.lti13_service,
-            "extract_user_info",
-            return_value={
-                "email": "new@example.com",
-                "name": "New Person",
-                "role": "student",
-                "course": "Course 101",
-            },
-        ),
+        patch.object(lti13.lti13_service, "extract_user_info", return_value=INFO),
+        patch.object(lti13, "_provision", return_value=user) as provision,
+        patch.object(lti13.lti13_service, "issue_login_code", return_value=("the-code", "the-binding")),
     ):
-        response = await lti13.lti13_launch(request=request, db=db)
+        response = await lti13.lti13_launch(request=request, db=MagicMock())
 
     assert response.status_code == 200
+    provision.assert_called_once()
     target = re.search(r'window\.location\.href = "([^"]+)"', response.body.decode()).group(1)
     url = urllib.parse.urlsplit(target)
-    # The session travels in the fragment, which no browser sends to a
-    # server: nothing in the query, so nothing in access logs or Referer.
+    # The code travels in the fragment, which no browser sends to a server:
+    # nothing in the query, so nothing in access logs or Referer.
     assert f"{url.scheme}://{url.netloc}" == "https://app.example.com"
     assert url.query == ""
-    handoff = urllib.parse.parse_qs(url.fragment)
-    # Only what the frontend reads; name and course come from /users/me.
-    assert set(handoff) == {"lti", "email", "role", "session_token"}
-    assert handoff["email"] == ["new@example.com"]
-    assert lti13.lti13_service.verify_session_token(handoff["session_token"][0], "test-secret") == "new@example.com"
-    assert db.add.call_count == 2  # course + user
+    assert urllib.parse.parse_qs(url.fragment) == {"lti": ["1"], "code": ["the-code"]}
+    cookies = response.headers.getlist("set-cookie")
+    binding = next(c for c in cookies if c.startswith("lti13_binding="))
+    assert binding.startswith("lti13_binding=the-binding;")
+    assert "HttpOnly" in binding and "SameSite=lax" in binding and "Path=/" in binding and "Domain" not in binding
+    # the used state cookie is cleared
+    assert any(c.startswith("lti13_state=") and "Max-Age=0" in c for c in cookies)
 
 
-async def test_lti13_launch_promotes_existing_user_and_updates_course():
+async def test_lti13_launch_checks_the_configured_deployment_id():
     request = _mock_request(
         cookies={"lti13_state": "known-state"},
         form={"id_token": "tok", "state": "known-state"},
     )
-    db = MagicMock()
-    existing_course = MagicMock(courseId="course-uuid-2")
-    existing_user = MagicMock(role=UserRole.STUDENT, courseId=None)
-    db.query.return_value.filter.return_value.first.side_effect = [
-        existing_course,
-        existing_user,
-    ]
 
     with (
         _known_state(),
         patch.object(settings, "LTI13_CLIENT_ID", "client-123"),
-        patch.object(settings, "LTI13_SESSION_SECRET", "test-secret"),
-        patch.object(lti13.lti13_service, "validate_id_token", return_value={}),
-        patch.object(
-            lti13.lti13_service,
-            "extract_user_info",
-            return_value={
-                "email": "existing@example.com",
-                "name": "Existing Person",
-                "role": "instructor",
-                "course": "Course 202",
-            },
-        ),
+        patch.object(settings, "LTI13_DEPLOYMENT_ID", "1"),
+        patch.object(lti13.lti13_service, "validate_id_token", side_effect=ValueError("Unexpected LTI deployment_id: '2'")) as validate,
+        pytest.raises(HTTPException) as exc_info,
     ):
-        response = await lti13.lti13_launch(request=request, db=db)
+        await lti13.lti13_launch(request=request, db=MagicMock())
 
-    assert response.status_code == 200
-    assert existing_user.role == UserRole.TEACHER
-    assert existing_user.courseId == "course-uuid-2"
+    assert exc_info.value.status_code == 403
+    assert validate.call_args.kwargs["deployment_id"] == "1"

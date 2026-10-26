@@ -88,12 +88,72 @@ def terminal_payload(
     return event_payload(event_type, deployment_id=deployment_id, task_id=task_id, fields=fields)
 
 
+# Names of the result contract (.github#15). The terraform/tf names are the
+# legacy ones; the neutral names are accepted everywhere but written nowhere
+# yet (phase 1 of the rename: readers first, writers once all readers run).
+RESULT_OUTPUTS = "outputs"
+RESULT_STATE = "state"
+LEGACY_RESULT_OUTPUTS = "terraform_outputs"
+LEGACY_RESULT_STATE = "tf_state"
+# Key of a deployment's variable values inside ``deployments.userInputVar``
+# (and the job's ``user_vars``); the first one present wins.
+USER_INPUT_VARIABLES_KEYS = ("variables", "terraform")
+# Output that maps a team to its endpoint(s); ``my-access`` reads either.
+OUTPUT_TEAM_ENDPOINTS = "team_endpoints"
+LEGACY_OUTPUT_TEAM_ENDPOINTS = "team_vms"
+
+
+def result_outputs(document: dict[str, Any]) -> Any:
+    """The outputs of a result document, under the new or the legacy name."""
+    return document[RESULT_OUTPUTS] if RESULT_OUTPUTS in document else document.get(LEGACY_RESULT_OUTPUTS)
+
+
+def result_state(document: dict[str, Any]) -> Any:
+    """The state of a result document, under the new or the legacy name."""
+    return document[RESULT_STATE] if RESULT_STATE in document else document.get(LEGACY_RESULT_STATE)
+
+
+def user_input_variables(user_input: Any) -> dict[str, Any]:
+    """The variable block of a ``userInputVar`` / ``user_vars`` mapping, or ``{}``."""
+    if isinstance(user_input, dict):
+        for key in USER_INPUT_VARIABLES_KEYS:
+            block = user_input.get(key)
+            if isinstance(block, dict):
+                return block
+    return {}
+
+
+def team_endpoints_output(outputs: dict[str, Any] | None) -> dict[str, Any]:
+    """The team-endpoint output of ``outputs`` (``{"<name>": {"value": ...}}``), or ``{}``."""
+    for name in (OUTPUT_TEAM_ENDPOINTS, LEGACY_OUTPUT_TEAM_ENDPOINTS):
+        bag = (outputs or {}).get(name)
+        if isinstance(bag, dict) and isinstance(bag.get("value"), dict):
+            return bag["value"]
+    return {}
+
+
 def seal_results(cipher: Cipher, *, terraform_outputs: Any, tf_state: str | None) -> bytes:
-    """Fernet token over the task's outputs and state (``tasks.outputs_enc``)."""
-    document = {"terraform_outputs": terraform_outputs, "tf_state": tf_state}
+    """Fernet token over the task's outputs and state (``tasks.outputs_enc``).
+
+    Still written under the legacy names, so that a reader of the previous
+    release opens it.
+    """
+    document = {LEGACY_RESULT_OUTPUTS: terraform_outputs, LEGACY_RESULT_STATE: tf_state}
     return cipher.encrypt(json.dumps(document, default=str).encode("utf-8"))
 
 
 def open_results(cipher: Cipher, token: bytes) -> dict[str, Any]:
-    """Inverse of :func:`seal_results`: ``{"terraform_outputs": ..., "tf_state": ...}``."""
-    return json.loads(cipher.decrypt(bytes(token)).decode("utf-8"))
+    """Inverse of :func:`seal_results`.
+
+    Reads both name generations. The result carries the legacy keys
+    ``terraform_outputs`` / ``tf_state`` and the neutral ``outputs`` /
+    ``state``, all of them always present.
+    """
+    document = json.loads(cipher.decrypt(bytes(token)).decode("utf-8"))
+    outputs, state = result_outputs(document), result_state(document)
+    return {
+        LEGACY_RESULT_OUTPUTS: outputs,
+        LEGACY_RESULT_STATE: state,
+        RESULT_OUTPUTS: outputs,
+        RESULT_STATE: state,
+    }

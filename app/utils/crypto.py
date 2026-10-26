@@ -1,13 +1,12 @@
-"""Symmetric encryption for at-rest credentials, Celery-envelope payloads and task results.
+"""Symmetric encryption for task results.
 
 Two Fernet keys, both shared between the backend and the worker:
 
-- `CREDENTIAL_ENCRYPTION_KEY`: the backend encrypts OpenStack credentials
-  when storing them in Postgres and forwards the ciphertext (base64) through
-  Celery, with the state token; the VM executor decrypts in-process.
+- `CREDENTIAL_ENCRYPTION_KEY`: seals task results when no results key is
+  set, and opens results sealed with it earlier.
 - `RESULTS_ENCRYPTION_KEY`: workers seal a task's results with it
-  (``tasks.outputs_enc``), the pod deployer having no other key. Without it
-  the credential key seals them, as before; results sealed with either open.
+  (``tasks.outputs_enc``). Without it the credential key seals them, as
+  before; results sealed with either open.
 
 Plaintext never leaves either container's memory.
 """

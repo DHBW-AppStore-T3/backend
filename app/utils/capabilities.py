@@ -26,10 +26,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.crud import app_version_approvals as crud_approvals
-from app.crud import openstack_credentials as crud_openstack_credentials
 from app.models import (
-    RUNTIME_K8S,
-    RUNTIME_VM,
     App,
     Course,
     CourseTeacher,
@@ -188,6 +185,22 @@ def ensure_deploy(user: User) -> None:
         raise _forbidden("role_required", [r.value for r in STAFF_ROLES])
 
 
+def can_deploy_app(user: User, app: App) -> bool:
+    """Start (or resume) a deployment of ``app``: not while an admin has
+    deactivated it (``hidden_by_admin``), except as an admin.
+
+    Deactivating makes the app private, and private apps skip the approval
+    gate, so without this check the owner could keep deploying an app an
+    admin took down, at any commit (review S7).
+    """
+    return _is_admin(user) or not getattr(app, "hidden_by_admin", False)
+
+
+def ensure_deploy_app(user: User, app: App) -> None:
+    if not can_deploy_app(user, app):
+        raise _forbidden("app_deactivated")
+
+
 def can_view_deployment_member(user: User, dep: Deployment, db: Session) -> bool:
     """Member-view access to a deployment.
 
@@ -213,25 +226,10 @@ def ensure_view_deployment_member(user: User, dep: Deployment, db: Session) -> N
         raise _forbidden("deployment_view_forbidden")
 
 
-def is_project_peer(user: User, dep: Deployment, db: Session) -> bool:
-    """Whether ``user`` holds an own verified credential for the VM deployment's project.
-
-    dhbw-appstore's peer model: whoever can reach the OpenStack project the
-    deployment lives in can see and run it anyway, so the app does not
-    pretend otherwise. Project ids come from Keystone tokens only
-    (``crud.openstack_credentials``), so this cannot be claimed.
-    """
-    project_id = getattr(dep, "os_project_id", None)
-    if not project_id:
-        return False
-    return crud_openstack_credentials.holds_project(db, user.userId, project_id)
-
-
 def can_view_deployment_owner(user: User, dep: Deployment, db: Session) -> bool:
-    """Owner-view access — tasks, logs, terraform state, destroy.
+    """Owner-view access — tasks, logs, outputs, destroy.
 
-    Read access is granted to the deployment owner, its project peers
-    (:func:`is_project_peer`), admins, and course-teachers of the owner's
+    Read access is granted to the deployment owner, admins, and course-teachers of the owner's
     course (inspect only) when the owner is a student. Operate rights are
     separate — see :func:`can_operate_deployment`.
 
@@ -244,8 +242,6 @@ def can_view_deployment_owner(user: User, dep: Deployment, db: Session) -> bool:
     if user.role == UserRole.ADMIN:
         return True
     if str(dep.userId) == str(user.userId):
-        return True
-    if is_project_peer(user, dep, db):
         return True
 
     # Course-teacher inspect right applies only to teachers; other
@@ -267,17 +263,8 @@ def ensure_view_deployment_owner(user: User, dep: Deployment, db: Session) -> No
 
 
 def can_operate_deployment(user: User, dep: Deployment, db: Session) -> bool:
-    """Pause / Resume / Destroy / Redeploy / Cancel.
-
-    VM deployments: the owner or a project peer. Every action runs with the
-    caller's own credential for the deployment's project, never with the
-    owner's, so admins are read-only there unless they hold a credential
-    for the project themselves (dhbw-appstore's model). Pod deployments
-    need no credential: the owner or an admin.
-    """
-    if getattr(dep, "runtime", RUNTIME_VM) == RUNTIME_K8S:
-        return _is_owner(user, dep.userId) or _is_admin(user)
-    return _is_owner(user, dep.userId) or is_project_peer(user, dep, db)
+    """Pause / Resume / Destroy / Redeploy / Cancel: the owner or an admin."""
+    return _is_owner(user, dep.userId) or _is_admin(user)
 
 
 def ensure_operate_deployment(user: User, dep: Deployment, db: Session) -> None:
@@ -428,6 +415,8 @@ __all__ = [
     # Deployments
     "can_deploy",
     "ensure_deploy",
+    "can_deploy_app",
+    "ensure_deploy_app",
     "can_view_deployment",
     "ensure_view_deployment",
     "can_view_deployment_member",
