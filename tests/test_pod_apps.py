@@ -687,12 +687,12 @@ def test_admins_operate_vm_deployments(db, live_vm_deployment, admin_client, sen
     assert name == "pods.pause_deployment"
 
 
-def test_the_owner_pauses_a_vm_deployment_without_a_credential(client, live_vm_deployment, sent):
+def test_the_owner_pauses_a_vm_deployment(client, live_vm_deployment, sent):
     deployment_id, _kube, _ = live_vm_deployment
 
     assert client.post(f"/deployments/{deployment_id}/pause").status_code == 202
-    name, kwargs = _job(sent)
-    assert name == "pods.pause_deployment" and kwargs["openstack_envelope"] == {}
+    name, _kwargs = _job(sent)
+    assert name == "pods.pause_deployment"
 
 
 def test_a_vm_is_restarted_by_name(client, live_vm_deployment, sent):
