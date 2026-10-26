@@ -307,6 +307,37 @@ jobs:
   # Runs in parallel with lint/test-unit. Findings appear in the
   # GitHub Security tab via SARIF upload. Whitelist false positives
   # in `.trivyignore` (with a comment explaining why).
+  # The validator of app-registry (scripts/validate_appstore_yaml.py, which every
+  # app's CI runs) must give the same verdict as app/k8s/spec.py. app-registry
+  # checks that weekly; here a change to the contract shows its drift in its own
+  # pull request. Not in the needs of the build: it informs, it does not block.
+  contract-drift:
+    name: "🔗 App contract vs app-registry validator"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Checkout app-registry
+        uses: actions/checkout@v4
+        with:
+          repository: DHBW-AppStore-T3/app-registry
+          path: app-registry
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Same verdict as the validator
+        working-directory: app-registry
+        env:
+          BACKEND_SPEC_PY: ${{ github.workspace }}/app/k8s/spec.py
+        run: |
+          pip install --quiet pyyaml jsonschema pydantic
+          python -m unittest discover -s tests -p "test_contract_drift.py" -v
+
   security:
     name: "🔒 Security"
     runs-on: ubuntu-latest
