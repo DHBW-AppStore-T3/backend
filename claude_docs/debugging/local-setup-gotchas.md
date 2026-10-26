@@ -9,4 +9,5 @@
 - App-Repositories klont/liest das Backend anonym von `github.com` (`APP_GIT_ALLOWED_HOSTS`); es gibt keinen Git-Token.
 - Security-Scan: `pip-audit` und Trivy laufen in CI (`.github/workflows/ci.yml`); Ausnahmen für Trivy stehen in `.trivyignore`.
 - `Dockerfile.dev` installiert mit `poetry.lock`: der Dev-Container hat dieselben Paketversionen wie CI und Image. Nach Änderungen an `poetry.lock` `make dev-build`.
-- Die Umgebung des Dev-Containers verfälscht Tests, und `tests/test_migrations.py` ändert das Passwort der Rolle `appstore_worker`: Tests nur über `make test-backend` (in `deployment/`) oder das Rezept im `README.md`, sonst meldet sich der Dev-Worker nicht mehr an (Deployments bleiben `pending`; Abhilfe: `make migrate-dev`).
+- Die Umgebung des Dev-Containers verfälscht Tests. Tests nur über `make test-backend` (in `deployment/`) oder das Rezept im `README.md`.
+- `tests/test_migrations.py` ändert das Passwort der clusterweiten Rolle `appstore_worker`: neue Verbindungen des Dev-Workers scheitern, Deployments bleiben `pending`. Abhilfe: `make migrate-dev`.

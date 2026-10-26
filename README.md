@@ -50,10 +50,10 @@ Zwei Fallen im Dev-Container:
 1. Integrationstests leeren die Tabellen der Datenbank, auf die sie zeigen (`TRUNCATE`). Ohne `TEST_DATABASE_URL` ist das die Dev-Datenbank.
 2. Die Umgebung des Containers (`LTI13_SESSION_SECRET`, `KEYCLOAK_*` …) schlägt in die Tests durch; ein einfaches `poetry run pytest` im Container liefert Fehlschläge. Die Tests brauchen die Umgebung von CI: nur `DATABASE_URL`, `CREDENTIAL_ENCRYPTION_KEY`, `DISABLE_BACKGROUND_TASKS`.
 
-In `deployment/` erledigt das `make test-backend` (und `make test-backend-cov`): legt `backend_test` an, läuft mit der Umgebung von CI und stellt danach das Login der Rolle `appstore_worker` wieder her. Das ist nötig, weil `tests/test_migrations.py` das Passwort dieser clusterweiten Rolle setzt und der Dev-Worker sich sonst nicht mehr anmelden kann. Der Befehl dahinter:
+In `deployment/` erledigt das `make test-backend` (und `make test-backend-cov`): legt `backend_test` beim ersten Lauf an, läuft mit der Umgebung von CI und stellt danach das Login der Rolle `appstore_worker` wieder her. Das ist nötig, weil `tests/test_migrations.py` das Passwort dieser clusterweiten Rolle setzt und neue Verbindungen des Dev-Workers sonst scheitern. Der Befehl dahinter:
 
 ```bash
-docker compose -f docker-compose.dev.yml exec -T postgres psql -U postgres -c "CREATE DATABASE backend_test"
+docker compose -f docker-compose.dev.yml exec -T postgres psql -U postgres -c "CREATE DATABASE backend_test"   # nur beim ersten Mal
 docker compose -f docker-compose.dev.yml exec -T backend env -i HOME=/root \
   PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin \
   DATABASE_URL=postgresql://postgres:postgres@postgres:5432/backend_test \
