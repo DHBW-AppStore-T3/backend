@@ -24,7 +24,7 @@ SHARED = {
     "k8s/render.py": "f2b9e9e8075dbe8c450faf854073a86d83a68835a11ebfcfb7c6b8307f2f40e0",
     "k8s/spec.py": "d1c05b57aca2641806af3fe393e95a587319da44ec8099567b594dfd636901bc",
     "pgq.py": "57f323480984fbad424662810cfec1ebc39256fa2ec7b77680863b1f416b62e4",
-    "task_contract.py": "4c77d4e3d5e986ab61bf3eb497a34f34c27c97881522660d2871b1faf58a7ad1",
+    "task_contract.py": "009fa263871d74a0cf020033f13d81543e971b278d4a80ba3d35b8983940afd4",
 }
 
 

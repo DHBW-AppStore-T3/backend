@@ -26,6 +26,7 @@ from fastapi import HTTPException, status
 
 from app.services import malware_scan
 from app.services.upload_validation import UploadRejected, inspect_upload
+from app.task_contract import USER_INPUT_VARIABLES_KEYS, user_input_variables
 from app.utils import upload_mac
 from app.utils.filenames import safe_filename
 
@@ -104,7 +105,10 @@ def attach_files_to_user_input(
     we get here, so we only catch what gets past it.
     """
     base = dict(user_input_var or {})
-    base.setdefault("terraform", {})
+    # The variable block is "terraform" (legacy) or "variables"; keep the
+    # name the caller used, "terraform" if it sent neither.
+    block_key = "variables" if isinstance(base.get("variables"), dict) else "terraform"
+    base.setdefault(block_key, {})
 
     if not files:
         return base
@@ -124,7 +128,7 @@ def attach_files_to_user_input(
                 scoped_file_vars.add(vdef["name"])
 
     total_bytes = 0
-    terraform_block = dict(base.get("terraform") or {})
+    terraform_block = dict(base.get(block_key) or {})
 
     for var_name, slot_map in files.items():
         if var_name in terraform_block:
@@ -284,7 +288,7 @@ def attach_files_to_user_input(
         else:
             terraform_block[var_name] = encoded_slots
 
-    base["terraform"] = terraform_block
+    base[block_key] = terraform_block
     return base
 
 
@@ -370,8 +374,8 @@ def validate_scoped_user_input(
         return isinstance(val, (list, dict)) and len(val) == 0
 
     for source_key in ("terraform",):
-        block = user_input_var.get(source_key)
-        if not isinstance(block, dict):
+        block = user_input_variables(user_input_var)
+        if not block:
             continue
         for vdef in variable_definitions:
             if vdef.get("source") != source_key:
@@ -498,25 +502,26 @@ def strip_file_vars_from_user_input(user_input_var: dict | None) -> dict | None:
     if not isinstance(user_input_var, dict):
         return user_input_var
 
-    out = {k: v for k, v in user_input_var.items() if k != "terraform"}
-    tf_block = user_input_var.get("terraform")
-    if not isinstance(tf_block, dict):
-        if "terraform" in user_input_var:
-            out["terraform"] = tf_block
-        return out
+    out = {k: v for k, v in user_input_var.items() if k not in USER_INPUT_VARIABLES_KEYS}
+    for block_key in USER_INPUT_VARIABLES_KEYS:
+        tf_block = user_input_var.get(block_key)
+        if not isinstance(tf_block, dict):
+            if block_key in user_input_var:
+                out[block_key] = tf_block
+            continue
 
-    stripped_tf: dict = {}
-    for var_name, value in tf_block.items():
-        if looks_like_file_var(value):
-            stripped_tf[var_name] = _file_var_metadata_only(value)
-        elif _looks_like_scoped_file_var(value):
-            # scope=team|user: {slot: {"uploaded": {name, content_b64, ...}}}
-            stripped_tf[var_name] = {
-                slot: _file_var_metadata_only(inner) for slot, inner in value.items()
-            }
-        else:
-            stripped_tf[var_name] = value
-    out["terraform"] = stripped_tf
+        stripped_tf: dict = {}
+        for var_name, value in tf_block.items():
+            if looks_like_file_var(value):
+                stripped_tf[var_name] = _file_var_metadata_only(value)
+            elif _looks_like_scoped_file_var(value):
+                # scope=team|user: {slot: {"uploaded": {name, content_b64, ...}}}
+                stripped_tf[var_name] = {
+                    slot: _file_var_metadata_only(inner) for slot, inner in value.items()
+                }
+            else:
+                stripped_tf[var_name] = value
+        out[block_key] = stripped_tf
     return out
 
 
