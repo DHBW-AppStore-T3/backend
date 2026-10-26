@@ -491,3 +491,55 @@ def test_strip_covers_team_and_user_scoped_file_vars():
     for entry in (out["f"]["Team-1"]["uploaded"], out["g"]["all"]):
         assert "content_b64" not in entry and "mac" not in entry
         assert entry["name"] == "x.pdf"
+
+
+@pytest.mark.unit
+def test_is_stored_file_var_knows_both_shapes():
+    from app.services.deployment_input import is_stored_file_var
+
+    slot = {"name": "x.pdf", "content_b64": "QQ==", "size": 1, "content_type": "application/pdf"}
+    assert is_stored_file_var({"all": dict(slot)})
+    assert is_stored_file_var({"Team-1": {"uploaded": dict(slot)}})
+    assert not is_stored_file_var({"Team-1": {"other": 1}})
+    assert not is_stored_file_var({})
+    assert not is_stored_file_var("x")
+
+
+@pytest.mark.integration
+def test_download_endpoint_serves_team_scoped_files(client, db, mock_user, patched_celery):
+    app = _ensure_app(db, mock_user)
+    payload_bytes = b"team file\n"
+    create = client.post(
+        "/deployments/",
+        json={
+            "name": "team-scoped-download",
+            "appId": str(app.appId),
+            "releaseTag": "v1",
+            "teams": _teams(mock_user),
+            "files": {
+                "task_pdf": {
+                    "all": {
+                        "name": "t.txt",
+                        "content_b64": _b64(payload_bytes),
+                        "size": len(payload_bytes),
+                        "content_type": "text/plain",
+                    }
+                }
+            },
+        },
+    ).json()
+    deployment_id = create["deploymentId"]
+
+    # Rewrite the stored variable into the scope=team|user shape.
+    from app.models import Deployment
+
+    row = db.query(Deployment).filter(Deployment.deploymentId == deployment_id).one()
+    stored = json.loads(row.userInputVar)
+    block_key = next(k for k in ("variables", "terraform") if k in stored)
+    stored[block_key]["task_pdf"] = {"Team-1": {"uploaded": stored[block_key]["task_pdf"]["all"]}}
+    row.userInputVar = json.dumps(stored)
+    db.commit()
+
+    response = client.get(f"/deployments/{deployment_id}/files/task_pdf/Team-1")
+    assert response.status_code == 200
+    assert response.content == payload_bytes

@@ -66,8 +66,8 @@ from app.services import (
 )
 from app.services.deployment_input import (
     attach_files_to_user_input,
+    is_stored_file_var,
     log_rejected_upload,
-    looks_like_file_var,
     parse_and_strip_user_input,
     validate_scoped_user_input,
 )
@@ -962,7 +962,7 @@ def _dispatch_lifecycle_task(
             if isinstance(block, dict):
                 user_vars = {
                     **user_vars,
-                    block_key: {k: v for k, v in block.items() if not looks_like_file_var(v)},
+                    block_key: {k: v for k, v in block.items() if not is_stored_file_var(v)},
                 }
 
     teams_dict: dict = {}
@@ -1355,7 +1355,7 @@ def download_deployment_file(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No files")
 
     var_value = user_input_variables(user_input).get(var_name)
-    if not looks_like_file_var(var_value):
+    if not is_stored_file_var(var_value):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No uploaded file under variable '{var_name}'",
