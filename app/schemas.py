@@ -342,6 +342,8 @@ class MyAccessResponse(BaseModel):
     """
 
     user_accounts: dict[str, dict[str, Any]] = {}
+    team_endpoints: dict[str, dict[str, Any]] = {}
+    # Legacy alias of ``team_endpoints`` (same value) until the frontend reads the new name.
     team_vms: dict[str, dict[str, Any]] = {}
 
     model_config = ConfigDict(from_attributes=True)
