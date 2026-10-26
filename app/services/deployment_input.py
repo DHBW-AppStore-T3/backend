@@ -584,6 +584,12 @@ def _looks_like_scoped_file_var(value) -> bool:
     )
 
 
+def is_stored_file_var(value) -> bool:
+    """A stored file variable in either shape: flat (``scope=all``) or wrapped per slot
+    (``scope=team|user``, ``{slot: {"uploaded": {...}}}``)."""
+    return looks_like_file_var(value) or _looks_like_scoped_file_var(value)
+
+
 def _file_var_metadata_only(value: dict) -> dict:
     """Return a copy of a file-shape variable with the ``content_b64``
     payload stripped. Metadata fields (name, size, content_type)
