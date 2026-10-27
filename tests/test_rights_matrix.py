@@ -111,7 +111,9 @@ def test_teachers_no_longer_open_every_deployment(db):
     assert _as(owner).get(f"/deployments/{dep.deploymentId}").status_code == 200
 
 
-def test_course_teacher_inspects_student_deployments_but_not_colleagues(db):
+def test_course_teacher_inspects_no_deployment_at_all(db):
+    """The inspect right of course-teachers is gone: only teachers and
+    admins deploy, so it covered nothing, and nothing led to a deployment."""
     course_teacher = _user(db, UserRole.TEACHER)
     course = _course(db, teachers=[course_teacher])
     student = _user(db, UserRole.STUDENT, course=course)
@@ -125,9 +127,10 @@ def test_course_teacher_inspects_student_deployments_but_not_colleagues(db):
         deps[owner.userId] = dep.deploymentId
 
     client = _as(course_teacher)
-    assert client.get(f"/deployments/{deps[student.userId]}").status_code == 200
-    assert client.get(f"/deployments/{deps[colleague.userId]}").status_code == 403
-    assert client.get(f"/tasks/deployment/{deps[colleague.userId]}").status_code == 403
+    for owner in (student, colleague):
+        assert client.get(f"/deployments/{deps[owner.userId]}").status_code == 403
+        assert client.get(f"/deployments/{deps[owner.userId]}/resources").status_code == 403
+        assert client.get(f"/tasks/deployment/{deps[owner.userId]}").status_code == 403
 
 
 def test_course_roster_reads_are_for_staff_only(db):

@@ -90,8 +90,7 @@ def has_deployment_access(deployment: Deployment, user: User, db: Session) -> bo
       - user appears in UserToDeployment for this deployment
 
     Teachers no longer read every deployment (.github#7 F, security review
-    H-1); a course-teacher's inspect right is the owner view in
-    :mod:`app.utils.capabilities`.
+    H-1); the owner view is in :mod:`app.utils.capabilities`.
     """
     if user.role == UserRole.ADMIN:
         return True

@@ -218,8 +218,8 @@ def get_deployment(
     if not deployment:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deployment not found")
 
-    # Member view or owner view (a course-teacher inspecting a student's
-    # deployment); 403 otherwise. No blanket teacher access (.github#7 F).
+    # Member view or owner view (owner, admin); 403 otherwise. No blanket
+    # teacher access (.github#7 F).
     ensure_view_deployment(current_user, deployment, db)
 
     # Get latest task
@@ -244,9 +244,7 @@ def get_deployment(
     # Get teams with members. The owner view sees every team and
     # every member. The member view only sees their own team(s) so
     # they can't browse who else has access to the deployment.
-    # ``can_view_deployment_owner`` widens "owner view" to course-teachers
-    # of the deployment-owner's course, so they get the full roster + logs
-    # + outputs alongside owners and admins.
+    # The owner view (owner, admin) gets the full roster + logs + outputs.
     is_owner_view = can_view_deployment_owner(current_user, deployment, db)
     teams_data = crud_deployments.get_deployment_teams_with_members(db, deployment_id)
     is_member = any(
@@ -602,9 +600,7 @@ def delete_deployment(
         )
 
     # Destructive operation — uses the operate gate, which is
-    # owner-or-admin only. Course-teachers explicitly do NOT get
-    # delete/destroy rights on deployments in their courses; they only
-    # get inspect (logs, infra).
+    # owner-or-admin only.
     ensure_operate_deployment(current_user, deployment, db)
 
     # Per-deployment advisory lock — serialises against any concurrent
@@ -1007,9 +1003,7 @@ def list_deployment_resources(
 ):
     """The workloads of a pod deployment, read live from its namespace.
 
-    Inspect-only view: owner, admin, or a course-teacher of the
-    deployment-owner's course. Course-teachers explicitly do NOT have
-    operate rights; this endpoint is read-only.
+    Owner view (owner, admin); this endpoint is read-only.
     """
     deployment = crud_deployments.get_deployment(db, deployment_id)
     if not deployment:
@@ -1339,11 +1333,8 @@ def download_deployment_file(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Deployment not found",
         )
-    # Inspect-only view, gated through capabilities so course-teachers
-    # can download the same wizard-uploaded files they can already see
-    # referenced in the inspect view (logs / detail). Owners + admins
-    # keep their access. The list/detail strip-pass already hid the
-    # base64 payload from plain members, so this endpoint stays
+    # Owner view (owner, admin). The list/detail strip-pass already hid
+    # the base64 payload from plain members, so this endpoint stays
     # restricted to the owner-view set.
     ensure_view_deployment_owner(current_user, deployment, db)
 
@@ -1440,6 +1431,49 @@ def get_my_access(
 
 
 # ----------------------------------------------------------------
+# REVEAL A MEMBER'S ACCESS CREDENTIALS (owner / admin support)
+# ----------------------------------------------------------------
+@router.get("/{deployment_id}/members/{user_id}/access", response_model=MyAccessResponse)
+def get_member_access(
+    deployment_id: UUID,
+    user_id: UUID,
+    response: Response,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_keycloak),
+):
+    """Return ONE member's access credentials, e.g. to answer their question.
+
+    The only path that hands a member's credentials to somebody else: the
+    owner view's outputs stay redacted (.github#7 E) and ``my-access``
+    returns the caller's own entry only. Gated by the operate right
+    (owner or admin), not the wider owner view, and one member per call:
+    the credentials leave the server when somebody asks for them, not
+    with every detail response. Same entry as the member's own
+    ``my-access``, matched exactly by ``services.access`` (.github#7 H).
+
+    Never cached and never logged. Empty maps when the user is in none of
+    the deployment's teams or there is no entry for them.
+    """
+    deployment = crud_deployments.get_deployment(db, deployment_id)
+    if not deployment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Deployment not found",
+        )
+    ensure_operate_deployment(current_user, deployment, db)
+
+    response.headers["Cache-Control"] = "no-store"
+    result = access.get_user_access(db, deployment_id, user_id)
+    if result is None:
+        return MyAccessResponse()
+    return MyAccessResponse(
+        user_accounts=result.get("user_accounts", {}),
+        team_endpoints=result.get("team_vms", {}),
+        team_vms=result.get("team_vms", {}),
+    )
+
+
+# ----------------------------------------------------------------
 # LIVE STREAM — Server-Sent Events for progress + log tail
 # ----------------------------------------------------------------
 #
@@ -1483,10 +1517,9 @@ async def stream_deployment_events(
     deployment = crud_deployments.get_deployment(db, deployment_id)
     if not deployment:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deployment not found")
-    # Inspect-only view via capabilities. The live stream surfaces
-    # task-log lines (raw worker stdout); course-teachers of the
-    # deployment-owner's course are in the inspect set, owners and admins keep their access,
-    # and plain members still see metadata only.
+    # Owner view via capabilities. The live stream surfaces task-log
+    # lines (raw worker stdout); owners and admins see them, plain
+    # members metadata only.
     ensure_view_deployment_owner(current_user, deployment, db)
 
     latest_task = crud_deployments.get_latest_task(db, deployment_id)

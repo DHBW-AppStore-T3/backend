@@ -255,18 +255,15 @@ class TestCanViewDeploymentMember:
 
 
 class TestCanViewDeploymentOwner:
-    """Phase 3: owner-view = owner OR admin OR course-teacher of the
-    deployment-owner's course. The plain staff bypass is gone."""
+    """Owner-view = owner OR admin, the same people who may operate. Neither
+    the plain staff bypass nor the course-teacher inspect right exists."""
 
     @pytest.mark.parametrize(
         ("role", "is_owner", "expected"),
         [
             (UserRole.STUDENT, True, True),
             (UserRole.STUDENT, False, False),
-            # Phase 3 — teacher without course-teacher rows on the
-            # deployment-owner's course: rejected. Course-teacher
-            # access is exercised in ``test_course_teacher_can_view``
-            # below.
+            (UserRole.TEACHER, True, True),
             (UserRole.TEACHER, False, False),
             (UserRole.ADMIN, False, True),
         ],
@@ -274,9 +271,6 @@ class TestCanViewDeploymentOwner:
     def test_matrix(self, role, is_owner, expected, monkeypatch):
         owner_id = uuid.uuid4()
         actor = _user(role, user_id=owner_id if is_owner else None)
-        # Build a deployment whose ``.user`` carries a courseId that
-        # is_course_teacher_id will NOT find a row for (so the teacher
-        # branch falls through to False).
         dep = SimpleNamespace(
             deploymentId=uuid.uuid4(),
             userId=owner_id,
@@ -286,26 +280,12 @@ class TestCanViewDeploymentOwner:
         db.query.return_value.filter.return_value.first.return_value = None
         assert caps.can_view_deployment_owner(actor, dep, db) is expected
 
-    def test_course_teacher_can_view_owner_view(self, teacher):
-        # Phase 3 — a teacher who IS a course-teacher of the
-        # deployment-owner's course gets the owner view (inspect).
-        course_id = uuid.uuid4()
-        dep = SimpleNamespace(
-            deploymentId=uuid.uuid4(),
-            userId=uuid.uuid4(),
-            user=SimpleNamespace(courseId=course_id, role=UserRole.STUDENT),
-        )
-        db = MagicMock()
-        # First filter().first() call returns a truthy row → match.
-        db.query.return_value.filter.return_value.first.return_value = (
-            SimpleNamespace(courseId=course_id, userId=teacher.userId)
-        )
-        assert caps.can_view_deployment_owner(teacher, dep, db) is True
-
-    @pytest.mark.parametrize("owner_role", [UserRole.TEACHER, UserRole.ADMIN])
-    def test_course_teacher_cannot_view_staff_deployments(self, teacher, owner_role):
-        # .github#7 F: putting a colleague into one's own course must not
-        # open their deployments' logs and files.
+    @pytest.mark.parametrize("owner_role", [UserRole.STUDENT, UserRole.TEACHER, UserRole.ADMIN])
+    def test_course_teacher_has_no_inspect_right(self, teacher, owner_role):
+        # Course-teachers used to inspect their students' deployments; the
+        # right is gone (only teachers and admins deploy). Even a matching
+        # course_teachers row opens nothing, and putting a colleague into
+        # one's own course never opened their logs and files (.github#7 F).
         course_id = uuid.uuid4()
         dep = SimpleNamespace(
             deploymentId=uuid.uuid4(),
@@ -420,21 +400,6 @@ class TestIsCourseTeacher:
         db = MagicMock()
         db.query.return_value.filter.return_value.first.return_value = None
         assert caps.is_course_teacher(teacher, course, db) is False
-
-
-class TestGetMyCourseTeacherIds:
-    def test_returns_empty_for_non_teacher(self, student, admin, db_mock):
-        assert caps.get_my_course_teacher_ids(student, db_mock) == set()
-        assert caps.get_my_course_teacher_ids(admin, db_mock) == set()
-
-    def test_teacher_collects_course_ids(self, teacher):
-        cid1, cid2 = uuid.uuid4(), uuid.uuid4()
-        db = MagicMock()
-        db.query.return_value.filter.return_value.all.return_value = [
-            (cid1,),
-            (cid2,),
-        ]
-        assert caps.get_my_course_teacher_ids(teacher, db) == {cid1, cid2}
 
 
 @pytest.mark.parametrize(
