@@ -149,6 +149,24 @@ def test_render_vm_namespace_is_privileged():
     assert ns["metadata"]["labels"]["appstore.dhbw/vm-namespace"] == "true"
 
 
+def test_render_vm_windows_guest_has_hyperv_enlightenments_and_clock():
+    """A bare `hyperv: {}` without a clock locked Windows up in its clock interrupt after 20-30 minutes."""
+    _, objs, _ = _build_vm()
+    domain = of_kind(objs, "VirtualMachine")[0]["spec"]["template"]["spec"]["domain"]
+    hyperv = domain["features"]["hyperv"]
+    for feature in (
+        "relaxed", "vapic", "spinlocks", "vpindex", "runtime", "synic", "synictimer", "frequencies", "reset",
+        "tlbflush", "ipi",
+    ):
+        assert feature in hyperv, feature
+    assert hyperv["spinlocks"] == {"spinlocks": 8191}
+    timer = domain["clock"]["timer"]
+    assert timer["hyperv"] == {}
+    assert timer["hpet"] == {"present": False}
+    assert timer["rtc"] == {"tickPolicy": "catchup"}
+    assert timer["pit"] == {"tickPolicy": "delay"}
+
+
 def test_render_vm_pvc_uses_cinder_and_clones_image():
     _, objs, _ = _build_vm()
     pvcs = of_kind(objs, "PersistentVolumeClaim")
