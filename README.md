@@ -1,6 +1,6 @@
 # Backend
 
-FastAPI-API des AppStore. Validiert Keycloak-Tokens, hält alle Daten in PostgreSQL, legt Deployment-Aufträge als Tasks an und reicht sie über die Postgres-Queue `pgq` an die Worker weiter. Live-Status per Server-Sent Events.
+FastAPI-API des AppStore. Validiert Keycloak-Tokens, hält alle Daten in PostgreSQL, legt Deployment-Aufträge als Tasks an; die Task-Zeile ist der Queue-Eintrag, den der Worker holt (`tasks.job`, `NOTIFY task_queued`). Live-Status per Server-Sent Events.
 
 Zustand: Branch `dev` (Staging). `main` ist Produktion und hinkt `dev` bis zur nächsten Promotion hinterher.
 
@@ -76,7 +76,6 @@ Ergebnis mit dem Stand `dev`: 996 Tests bestanden.
 |---|---|---|
 | `APP_ENV` | `development` erlaubt `X-Dev-User`, Docs unter `/docs`, `http`-Cookies | `production` |
 | `DATABASE_URL` | Anwendungs-Postgres | – |
-| `CELERY_BROKER_URL` | leer: `pgq+` + `DATABASE_URL` | leer |
 | `CREDENTIAL_ENCRYPTION_KEY` | Fernet-Schlüssel; versiegelt Task-Ergebnisse, solange `RESULTS_ENCRYPTION_KEY` fehlt, und öffnet früher damit versiegelte | – |
 | `RESULTS_ENCRYPTION_KEY` | Fernet-Schlüssel der Task-Ergebnisse, gleich im Worker; leer: Credential-Schlüssel; in Produktion ungleich diesem | leer |
 | `WORKER_DB_PASSWORD` | Passwort der Rolle `appstore_worker` (nur für `python -m app.worker_db_role`) | leer |
@@ -102,8 +101,6 @@ app/
 ├── database.py        Engine, Session
 ├── models.py          ORM
 ├── schemas.py         Pydantic
-├── celery_app.py      Producer; Routing pods.* → Queue pods
-├── pgq.py             Kombu-Transport auf Postgres (identisch im Worker)
 ├── task_contract.py   Event-/Ergebnis-Vertrag API ↔ Worker (identisch im Worker)
 ├── cli.py             python -m app.cli seed
 ├── k8s/               appstore.yaml-Spec, Renderer, Kube-Client, FakeKube
@@ -112,7 +109,7 @@ app/
     seal_legacy_results.py, backfill_approval_commits.py   (Betriebsbefehle, `python -m app.<name>`)
 ```
 
-`app/pgq.py` und `app/task_contract.py` sind byte-gleich mit dem Worker-Repo; `tests/unit/test_shared_files.py` prüft den Hash.
+`app/task_contract.py` und `app/k8s/` sind byte-gleich mit dem Worker-Repo; `tests/unit/test_shared_files.py` prüft den Hash.
 
 ### Endpunkte
 
@@ -136,7 +133,7 @@ Gruppen mit Prefix (`main.py`). Den vollständigen Vertrag liefert `make openapi
 
 | Datei | Zweck |
 |---|---|
-| `task_service` | Task-Zeile in der Transaktion anlegen, nach Commit in `celery_queue` senden, geparkte Nachrichten freigeben |
+| `task_service` | Task mit Job und Argumenten in der Transaktion anlegen, `NOTIFY task_queued` mit dem Commit |
 | `task_events` | eine LISTEN-Verbindung je Prozess, Backfill für SSE (`Last-Event-ID`) |
 | `task_finalizer` | Folgearbeit genau einmal (Soft-Delete nach Destroy) |
 | `task_results` | versiegelte Outputs/State lesen |

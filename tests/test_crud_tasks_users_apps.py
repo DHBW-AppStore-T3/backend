@@ -122,7 +122,6 @@ def test_create_task_persists_fields(db):
 
     payload = {
         "deploymentId": dep.deploymentId,
-        "celeryTaskId": "celery-abc",
         "type": TaskType.DEPLOY,
         "status": TaskStatus.PENDING,
         "logs": "boot",
@@ -133,7 +132,6 @@ def test_create_task_persists_fields(db):
 
     assert created.taskId is not None
     assert created.deploymentId == dep.deploymentId
-    assert created.celeryTaskId == "celery-abc"
     assert created.type == TaskType.DEPLOY
     assert created.status == TaskStatus.PENDING
     assert created.current_phase == "init"
@@ -147,8 +145,8 @@ def test_get_task_returns_none_for_unknown_id(db):
 
 
 @pytest.mark.integration
-def test_get_tasks_filters_by_deployment_celery_and_status(db):
-    """get_tasks filtert nach deployment_id, celery_task_id und status."""
+def test_get_tasks_filters_by_deployment_and_status(db):
+    """get_tasks filtert nach deployment_id und status."""
     user = _make_user(db)
     app_row = _make_app(db, user_id=user.userId)
     dep_a = _make_deployment(db, user_id=user.userId, app_id=app_row.appId)
@@ -160,7 +158,6 @@ def test_get_tasks_filters_by_deployment_celery_and_status(db):
         db,
         {
             "deploymentId": dep_a.deploymentId,
-            "celeryTaskId": "cel-1",
             "type": TaskType.DEPLOY,
             "status": TaskStatus.FAILED,
         },
@@ -169,7 +166,6 @@ def test_get_tasks_filters_by_deployment_celery_and_status(db):
         db,
         {
             "deploymentId": dep_a.deploymentId,
-            "celeryTaskId": "cel-2",
             "type": TaskType.UPDATE,
             "status": TaskStatus.RUNNING,
         },
@@ -178,7 +174,6 @@ def test_get_tasks_filters_by_deployment_celery_and_status(db):
         db,
         {
             "deploymentId": dep_b.deploymentId,
-            "celeryTaskId": "cel-3",
             "type": TaskType.DESTROY,
             "status": TaskStatus.SUCCESS,
         },
@@ -192,13 +187,11 @@ def test_get_tasks_filters_by_deployment_celery_and_status(db):
     ids = {t.taskId for t in by_dep}
     assert ids == {t1.taskId, t2.taskId}
 
-    # celery_task_id filter.
-    by_celery = tasks_crud.get_tasks(db, celery_task_id="cel-3")
-    assert [t.taskId for t in by_celery] == [t3.taskId]
-
     # status filter.
     by_status = tasks_crud.get_tasks(db, status=TaskStatus.RUNNING)
     assert [t.taskId for t in by_status] == [t2.taskId]
+    by_status = tasks_crud.get_tasks(db, status=TaskStatus.SUCCESS)
+    assert [t.taskId for t in by_status] == [t3.taskId]
 
 
 @pytest.mark.integration
@@ -211,7 +204,6 @@ def test_update_task_accepts_dict_payload(db):
         db,
         {
             "deploymentId": dep.deploymentId,
-            "celeryTaskId": "cel-x",
             "type": TaskType.DEPLOY,
             "status": TaskStatus.PENDING,
         },
@@ -236,7 +228,6 @@ def test_update_task_accepts_pydantic_model(db):
         db,
         {
             "deploymentId": dep.deploymentId,
-            "celeryTaskId": "cel-y",
             "type": TaskType.DEPLOY,
             "status": TaskStatus.PENDING,
             "current_phase": "init",
@@ -269,7 +260,6 @@ def test_delete_task_true_then_false(db):
         db,
         {
             "deploymentId": dep.deploymentId,
-            "celeryTaskId": "cel-z",
             "type": TaskType.DEPLOY,
             "status": TaskStatus.PENDING,
         },

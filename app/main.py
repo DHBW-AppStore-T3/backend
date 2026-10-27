@@ -2,13 +2,11 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from uuid import UUID
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.database import SessionLocal
 from app.routers import (
     admin_apps,
     apps,
@@ -21,7 +19,6 @@ from app.routers import (
     teams,
     users,
 )
-from app.services import task_service
 from app.services.reconciler import run_reconciler
 from app.services.task_events import hub
 from app.utils.cross_site import CrossSiteWriteGuard
@@ -61,22 +58,12 @@ async def lifespan(app: FastAPI):
     # One LISTEN connection per process (.github#5): wakes the live
     # streams of this process, and the reconciler when a task ends.
     reconcile_now = asyncio.Event()
-
-    releases: set[asyncio.Task] = set()
-
-    def _released(task_id: str) -> None:
-        # A worker let go of a task: a destroy parked behind it may run.
-        task = asyncio.get_running_loop().create_task(asyncio.to_thread(_release_parked, task_id))
-        releases.add(task)
-        task.add_done_callback(_release_done(releases))
-
     hub.on_terminal = lambda _task_id: reconcile_now.set()
-    hub.on_released = _released
     hub.start()
     logger.info("Task event hub started")
 
-    # Reconciler: dead workers, lost dispatches, parked messages and the
-    # exactly-once follow-up of finished tasks (task_finalizer). Runs as
+    # Reconciler: dead workers and the exactly-once follow-up of finished
+    # tasks (task_finalizer). Runs as
     # an asyncio task so we can cancel it cleanly on shutdown.
     reconciler_task = asyncio.create_task(run_reconciler(reconcile_now))
     logger.info("Reconciler loop scheduled")
@@ -99,21 +86,6 @@ async def lifespan(app: FastAPI):
         logger.info("Shutdown complete")
 
 
-def _release_parked(task_id: str) -> None:
-    """Release the messages parked behind ``task_id`` (runs in a thread)."""
-    with SessionLocal() as db:
-        task_service.release_parked(db, UUID(task_id))
-
-
-def _release_done(releases: set):
-    def done(task: asyncio.Task) -> None:
-        releases.discard(task)
-        if not task.cancelled() and task.exception() is not None:
-            logger.error("Releasing parked tasks failed", exc_info=task.exception())
-
-    return done
-
-
 def docs_urls(cfg) -> dict:
     """Where the interactive docs and the schema are served: only in development.
 
@@ -131,7 +103,7 @@ def docs_urls(cfg) -> dict:
 # ----------------------------------------------------------------
 app = FastAPI(
     title="Backend API",
-    description="FastAPI Backend with Auth, Git & Celery Integration",
+    description="FastAPI Backend with Auth, Git & Kubernetes Integration",
     version="1.0.0",
     lifespan=lifespan,
     **docs_urls(settings),

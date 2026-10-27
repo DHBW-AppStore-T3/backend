@@ -60,13 +60,11 @@ def _make_task(
     *,
     type_=TaskType.DEPLOY,
     status=TaskStatus.SUCCESS,
-    celery_task_id="celery-task-1",
     created_at=None,
 ):
     t = Task(
         taskId=uuid.uuid4(),
         deploymentId=deployment_id,
-        celeryTaskId=celery_task_id,
         type=type_,
         status=status,
         created_at=created_at or datetime(2026, 1, 1, 12, 0, 0),
@@ -142,11 +140,7 @@ def test_get_task_by_id_owner_ok(client, db, mock_user):
     """Owner liest eine einzelne Task per ID."""
     app = _make_app(db, mock_user.userId)
     deployment = _make_deployment(db, mock_user.userId, app.appId)
-    task = _make_task(
-        db,
-        deployment.deploymentId,
-        celery_task_id="celery-by-id",
-    )
+    task = _make_task(db, deployment.deploymentId)
 
     response = client.get(f"/tasks/{task.taskId}")
 
@@ -154,7 +148,9 @@ def test_get_task_by_id_owner_ok(client, db, mock_user):
     body = response.json()
     assert body["taskId"] == str(task.taskId)
     assert body["deploymentId"] == str(deployment.deploymentId)
-    assert body["celeryTaskId"] == "celery-by-id"
+    assert body["type"] == "deploy"
+    # Nothing about the queue: the job and its arguments are the worker's.
+    assert "job" not in body and "job_kwargs" not in body and "celeryTaskId" not in body
 
 
 @pytest.mark.integration

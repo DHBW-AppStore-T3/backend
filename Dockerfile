@@ -39,6 +39,10 @@ COPY pyproject.toml poetry.lock* ./
 RUN poetry install --no-root --no-interaction --no-ansi --only main 2>/dev/null || \
     poetry install --no-root --no-interaction --no-ansi
 
+# The venv's own pip is not needed to run the service, and it bundles copies of
+# urllib3, msgpack and pkg_resources that Trivy reports (see the runtime stage).
+RUN .venv/bin/python -m pip uninstall -y pip
+
 # ----------------------------------------------------------------
 # Stage 2: Runtime - Production Image
 # ----------------------------------------------------------------
@@ -47,7 +51,7 @@ FROM python:3.11-slim
 # Metadata
 LABEL maintainer="your.email@example.com" \
       version="1.0.0" \
-      description="FastAPI Backend with Auth, Git & Celery"
+      description="FastAPI Backend with Auth, Git & Kubernetes"
 
 # Non-root user with a fixed UID: Kubernetes can only verify runAsNonRoot
 # for a numeric user (USER below), and git needs a passwd entry for it.
@@ -81,11 +85,12 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade base-image Python tooling (pip / setuptools / wheel) to pull
-# in security fixes that the upstream `python:3.11-slim` tag hasn't
-# picked up yet. Trivy scans these system site-packages — anything
-# HIGH/CRITICAL here blocks the push.
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+# No pip, setuptools or wheel in the base image's Python: the service runs
+# from /app/.venv and installs nothing at runtime. Trivy scans these system
+# site-packages too, and pip bundles its own urllib3, msgpack and
+# pkg_resources (pip/_vendor/bom.cdx.json); even the newest pip ships
+# versions with HIGH CVEs, so removing it is the fix, not an upgrade.
+RUN python -m pip uninstall -y pip setuptools wheel
 
 # Create application directory
 WORKDIR $APP_HOME

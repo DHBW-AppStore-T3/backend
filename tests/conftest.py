@@ -45,17 +45,12 @@ import warnings
 
 # IMPORTANT: this env-var must be set BEFORE ``app.main`` is imported.
 # ``lifespan`` reads it on every ``TestClient(app)`` enter to decide
-# whether to spawn the Celery event-listener thread and reconciler
-# task. Without this gate, each test-client context stacks up another
-# listener thread (daemon, never cleanly stopped) that holds DB +
-# broker connections — within a handful of tests the SQLAlchemy pool
-# is exhausted and the next legit query deadlocks. See ``app/main.py``
-# for the full rationale.
+# whether to start the task-event LISTEN hub and the reconciler task.
+# Without this gate, each test-client context stacks up another
+# listener (never cleanly stopped) that holds DB connections — within a
+# handful of tests the SQLAlchemy pool is exhausted and the next legit
+# query deadlocks. See ``app/main.py`` for the full rationale.
 os.environ.setdefault("DISABLE_BACKGROUND_TASKS", "1")
-# The broker is a table of the application database (pgq, .github#5);
-# tests that send for real must write into the test database.
-if os.getenv("TEST_DATABASE_URL"):
-    os.environ.setdefault("CELERY_BROKER_URL", "pgq+" + os.environ["TEST_DATABASE_URL"])
 # App repositories may only come from these hosts (.github#7 B); the tests'
 # fixtures use example.com and github.com.
 os.environ.setdefault("APP_GIT_ALLOWED_HOSTS", "github.com,example.com")
@@ -78,6 +73,7 @@ from app.database import Base, get_db
 from app.main import app
 from app.models import (  # noqa: F401  (importiert für seitliche Effekte / Metadata-Registrierung)
     App,
+    Task,
     User,
     UserRole,
 )
@@ -305,6 +301,42 @@ def fake_git(request, monkeypatch):
 # ----------------------------------------------------------------
 # DB-Session-Fixture — frische Session pro Test, immer geschlossen.
 # ----------------------------------------------------------------
+class QueuedJobs:
+    """The jobs the API queued during a test: ``(job, job_kwargs)`` of new task rows, oldest first.
+
+    Read in a session of its own, so the test's ``db`` session keeps its state.
+    """
+
+    def __init__(self) -> None:
+        self._seen: set = set()
+
+    def _rows(self):
+        with TestingSessionLocal() as session:
+            return (
+                session.query(Task.taskId, Task.job, Task.job_kwargs)
+                .filter(Task.job.isnot(None))
+                .order_by(Task.created_at)
+                .all()
+            )
+
+    def __call__(self) -> list[tuple]:
+        return [(job, kwargs) for task_id, job, kwargs in self._rows() if task_id not in self._seen]
+
+    def last(self) -> tuple:
+        jobs = self()
+        assert jobs, "nothing was queued"
+        return jobs[-1]
+
+    def reset(self) -> None:
+        """Forget what was queued so far."""
+        self._seen.update(task_id for task_id, _, _ in self._rows())
+
+
+@pytest.fixture
+def queued():
+    return QueuedJobs()
+
+
 @pytest.fixture
 def db():
     session = TestingSessionLocal()

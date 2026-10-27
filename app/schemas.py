@@ -426,7 +426,6 @@ class DeploymentResourceListResponse(BaseModel):
 # ----------------------------------------------------------------
 class TaskBase(BaseModel):
     deploymentId: UUID
-    celeryTaskId: str
     type: TaskType
     status: TaskStatus
     started_at: datetime | None = None
@@ -465,7 +464,6 @@ class TaskResponse(BaseModel):
 
     taskId: UUID
     deploymentId: UUID
-    celeryTaskId: str | None = None
     type: TaskType
     status: TaskStatus
     started_at: datetime | None = None

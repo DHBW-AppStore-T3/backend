@@ -104,12 +104,11 @@ jobs:
           # Runner-VM gibt es ohnehin nur diese eine DB. Lokal ist die
           # Trennung wichtig (Dev-DB vs. Wegwerf-Test-DB); in CI nicht.
           DATABASE_URL: "postgresql://test:test@localhost:5432/test"
-          # Lifespan-startup spawns a Celery event-listener + a
+          # Lifespan-startup spawns the task-event LISTEN hub + a
           # reconciler asyncio task on every ``TestClient(app)``
           # construct. Across hundreds of test-client contexts those
-          # daemons stack up, hold DB + broker connections, and
-          # eventually exhaust the SQLAlchemy pool / block on broker
-          # reads. This flag short-circuits the lifespan body in
+          # daemons stack up, hold DB connections, and eventually
+          # exhaust the SQLAlchemy pool. This flag short-circuits the lifespan body in
           # tests — production paths set neither var.
           DISABLE_BACKGROUND_TASKS: "1"
           CREDENTIAL_ENCRYPTION_KEY: "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U="
@@ -192,8 +191,8 @@ jobs:
           # ValidationError.
           DATABASE_URL: "postgresql://test:test@localhost:5432/test"
           # Required — see test-unit job for the full rationale.
-          # Without this, the FastAPI lifespan spawns a Celery
-          # listener thread on every TestClient(app) enter, stacks
+          # Without this, the FastAPI lifespan spawns the event hub
+          # and the reconciler on every TestClient(app) enter, stacks
           # up over hundreds of tests, and either hangs the runner
           # or OOM-kills it.
           DISABLE_BACKGROUND_TASKS: "1"

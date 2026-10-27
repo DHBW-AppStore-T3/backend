@@ -44,5 +44,5 @@ RUN mkdir -p /tmp/repos
 # Expose port
 EXPOSE 8000
 
-# Entrypoint für Backend: Standardmäßig FastAPI mit Hot Reload, alternativ Celery-Worker
+# Entrypoint für Backend: FastAPI mit Hot Reload
 CMD ["poetry", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

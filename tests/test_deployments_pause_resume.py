@@ -2,13 +2,12 @@
 
 These tests run against a real Postgres so the partial unique index
 on ``tasks(deploymentId) WHERE status IN ('PENDING','RUNNING')`` and
-the per-user advisory locks can fire. The Celery dispatch is patched
-to a no-op so RabbitMQ isn't required.
+the per-user advisory locks can fire. No worker runs: queued tasks are
+read back from the database (``queued``).
 """
 import json
 import uuid
 from datetime import datetime
-from unittest.mock import patch
 
 import pytest
 
@@ -28,7 +27,7 @@ def _make_deployment(
     latest_task_type: TaskType,
     latest_task_status: TaskStatus,
 ):
-    """Seed a pod deployment + app + one task on the user. Celery is patched out."""
+    """Seed a pod deployment + app + one task on the user."""
 
     app = App(
         appId=uuid.uuid4(),
@@ -66,25 +65,9 @@ def _make_deployment(
     return deployment
 
 
-@pytest.fixture
-def patched_celery():
-    """Replace Celery's ``send_task`` with a stub that returns a fake id.
-
-    The real path commits a task row before send_task runs, then stamps
-    the celery_task_id from the result. We only need a sentinel object
-    with an ``.id`` attribute.
-    """
-    class _FakeAsyncResult:
-        id = "fake-celery-task-id"
-
-    with patch("app.services.task_service.celery_app.send_task",
-               return_value=_FakeAsyncResult()) as m:
-        yield m
-
-
 @pytest.mark.integration
 def test_pause_dispatches_when_status_is_success(
-    client, db, mock_user, patched_celery,
+    client, db, mock_user, queued,
 ):
     deployment = _make_deployment(
         db, mock_user,
@@ -107,9 +90,8 @@ def test_pause_dispatches_when_status_is_success(
         .one()
     )
     assert task.status == TaskStatus.PENDING
-    assert task.celeryTaskId == "fake-celery-task-id"
-    patched_celery.assert_called_once()
-    assert patched_celery.call_args.args[0] == "pods.pause_deployment"
+    assert task.job == "pods.pause_deployment"
+    assert queued() == [("pods.pause_deployment", task.job_kwargs)]
 
 
 @pytest.mark.integration
@@ -130,7 +112,7 @@ def test_pause_dispatches_when_status_is_success(
     ],
 )
 def test_pause_rejected_when_not_success(
-    client, db, mock_user, patched_celery, task_type, task_status,
+    client, db, mock_user, queued, task_type, task_status,
 ):
     deployment = _make_deployment(
         db, mock_user,
@@ -142,12 +124,12 @@ def test_pause_rejected_when_not_success(
         f"Pause must be rejected when last task is "
         f"({task_type.value}, {task_status.value})"
     )
-    patched_celery.assert_not_called()
+    assert queued() == []
 
 
 @pytest.mark.integration
 def test_resume_dispatches_when_status_is_paused(
-    client, db, mock_user, patched_celery,
+    client, db, mock_user, queued,
 ):
     deployment = _make_deployment(
         db, mock_user,
@@ -168,12 +150,12 @@ def test_resume_dispatches_when_status_is_paused(
         .one()
     )
     assert task.status == TaskStatus.PENDING
-    assert patched_celery.call_args.args[0] == "pods.resume_deployment"
+    assert queued.last()[0] == "pods.resume_deployment"
 
 
 @pytest.mark.integration
 def test_resume_rejected_when_not_paused(
-    client, db, mock_user, patched_celery,
+    client, db, mock_user, queued,
 ):
     """A successful deploy is not a valid resume target — only paused is."""
     deployment = _make_deployment(
@@ -183,12 +165,12 @@ def test_resume_rejected_when_not_paused(
     )
     response = client.post(f"/deployments/{deployment.deploymentId}/resume")
     assert response.status_code == 409
-    patched_celery.assert_not_called()
+    assert queued() == []
 
 
 @pytest.mark.integration
 def test_destroy_allowed_from_paused(
-    client, db, mock_user, patched_celery,
+    client, db, mock_user, queued,
 ):
     """Paused deployments still hold OpenStack resources — Destroy works."""
     deployment = _make_deployment(
@@ -237,7 +219,7 @@ IN_FLIGHT_TASK_FIXTURES = [
     "task_type, task_status, expected_status_text", IN_FLIGHT_TASK_FIXTURES
 )
 def test_delete_rejected_while_action_in_flight(
-    client, db, mock_user, patched_celery, task_type, task_status, expected_status_text,
+    client, db, mock_user, queued, task_type, task_status, expected_status_text,
 ):
     """DELETE must 409 while *any* lifecycle task is in flight,
     regardless of which kind. The current_status string in the
@@ -255,7 +237,7 @@ def test_delete_rejected_while_action_in_flight(
     )
     body = response.json()
     assert expected_status_text in str(body.get("detail", ""))
-    patched_celery.assert_not_called()
+    assert queued() == []
 
 
 @pytest.mark.integration
@@ -263,7 +245,7 @@ def test_delete_rejected_while_action_in_flight(
     "task_type, task_status, expected_status_text", IN_FLIGHT_TASK_FIXTURES
 )
 def test_resume_rejected_while_action_in_flight(
-    client, db, mock_user, patched_celery, task_type, task_status, expected_status_text,
+    client, db, mock_user, queued, task_type, task_status, expected_status_text,
 ):
     """RESUME mirrors PAUSE — refused during any in-flight task."""
     deployment = _make_deployment(
@@ -273,11 +255,11 @@ def test_resume_rejected_while_action_in_flight(
     )
     response = client.post(f"/deployments/{deployment.deploymentId}/resume")
     assert response.status_code == 409
-    patched_celery.assert_not_called()
+    assert queued() == []
 
 
 @pytest.mark.integration
-def test_pause_failed_status_allows_retry(client, db, mock_user, patched_celery):
+def test_pause_failed_status_allows_retry(client, db, mock_user, queued):
     """A previously failed pause must still allow a fresh PAUSE
     attempt — the deployment itself is unaffected. Mirrors the
     lifecycle matrix entry for ``pause_failed``.
@@ -293,7 +275,7 @@ def test_pause_failed_status_allows_retry(client, db, mock_user, patched_celery)
 
 
 @pytest.mark.integration
-def test_destroy_allowed_from_pause_failed(client, db, mock_user, patched_celery):
+def test_destroy_allowed_from_pause_failed(client, db, mock_user, queued):
     """User can give up on a stuck pause and tear it down."""
     deployment = _make_deployment(
         db, mock_user,

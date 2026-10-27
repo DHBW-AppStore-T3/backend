@@ -55,7 +55,7 @@ def decrypt(token: bytes) -> str:
 
 
 def encrypt_b64(plaintext: str) -> str:
-    """Encrypt and base64-encode for JSON-safe transport (Celery args)."""
+    """Encrypt and base64-encode for JSON-safe transport."""
     return base64.b64encode(encrypt(plaintext)).decode("ascii")
 
 

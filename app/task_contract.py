@@ -1,4 +1,8 @@
-"""What the API and the worker agree on about a running task (.github#5).
+"""What the API and the worker agree on about a task (.github#5).
+
+Queue: a task row is its own queue entry. The API inserts it as PENDING
+with the job to run (``tasks.job``) and its arguments (``tasks.job_kwargs``);
+a worker claims the oldest one it may run, see ``worker/app/job_runtime.py``.
 
 Events: the worker appends ``task_events`` rows while a job runs; the API
 streams them as Server-Sent Events. The API writes a terminal event itself
@@ -7,8 +11,10 @@ names of the former Celery events, so the SSE event names and the frontend
 stay as they were.
 
 NOTIFY channels: ``task_events`` (trigger, one per event row),
-``task_cancel`` (API -> worker, payload: task id) and ``task_released``
-(worker -> API, payload: task id, once the worker let go of a task).
+``task_queued`` (API -> worker, a task was queued), ``task_cancel`` (API ->
+worker, payload: task id) and ``task_released`` (-> worker, payload: task
+id, once a task's lease is let go, by its worker or by the API's reaper; a
+task of the same deployment may run now).
 
 Results: the worker seals the OpenTofu/Terraform outputs and state with the
 shared Fernet key into ``tasks.outputs_enc``; plaintext results never leave
@@ -35,10 +41,11 @@ TERMINAL_EVENTS = frozenset({EVENT_SUCCEEDED, EVENT_FAILED, EVENT_REVOKED})
 # as a worker failure.
 FAILURE_KIND_WORKER = "worker_failure"
 FAILURE_KIND_WORKER_LOST = "worker_lost"
-FAILURE_KIND_INFRASTRUCTURE = "celery_infrastructure"
+FAILURE_KIND_INFRASTRUCTURE = "infrastructure"
 FAILURE_KIND_TIME_LIMIT = "time_limit"
 
 NOTIFY_TASK_EVENTS = "task_events"
+NOTIFY_TASK_QUEUED = "task_queued"
 NOTIFY_TASK_CANCEL = "task_cancel"
 NOTIFY_TASK_RELEASED = "task_released"
 

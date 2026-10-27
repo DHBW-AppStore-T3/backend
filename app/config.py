@@ -35,10 +35,6 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str
 
-    # Celery broker (.github#5): the ``pgq`` transport on our own Postgres.
-    # Empty means "the application database", i.e. ``pgq+`` + DATABASE_URL.
-    CELERY_BROKER_URL: str = ""
-
     # Password of the worker's database role ``appstore_worker``, set by
     # ``python -m app.worker_db_role`` after the migrations. Only the
     # deployment step that runs that command needs it.
@@ -201,14 +197,6 @@ class Settings(BaseSettings):
     def lti13_enabled(self) -> bool:
         """LTI launches and their session tokens are on once a real secret is set."""
         return bool(self.LTI13_SESSION_SECRET) and self.LTI13_SESSION_SECRET != "change-me-in-production"
-
-    @property
-    def celery_broker_url(self) -> str:
-        """Broker URL for Celery; defaults to the application database."""
-        if self.CELERY_BROKER_URL:
-            return self.CELERY_BROKER_URL
-        scheme, _, rest = self.DATABASE_URL.partition("://")
-        return f"pgq+{scheme.split('+', 1)[0]}://{rest}"
 
     class Config:
         env_file = ".env"

@@ -1,22 +1,15 @@
 """Background pass over the task queue (.github#5).
 
-The task row is the only truth about a task now: the worker writes status,
-logs and results straight into it, so there is no second state (Celery's
-result backend) to reconcile against. What is left to look after:
+The task row is the only truth about a task: it is the queue entry, and the
+worker writes status, logs and results straight into it, so there is no
+second state to reconcile against. What is left to look after:
 
 1. **Dead workers.** A RUNNING task whose lease ran out belongs to a worker
    that stopped renewing it (crashed, killed, cut off from the database).
    The task is failed as ``worker_lost`` with a terminal event, so open
    streams end. Nothing is retried: a half-applied deployment needs a
    person to look at it (destroy or deploy again from the UI).
-2. **Lost dispatches.** A PENDING task without a queue message, older than
-   ``DISPATCH_GRACE_SECONDS``: the API process died between committing the
-   row and sending it. The message arguments only ever existed in the
-   message, so the task cannot be re-sent; it is failed instead.
-3. **Parked messages** (destroy after cancel) whose blocking task is no
-   longer held by a worker but whose ``task_released`` notification was
-   missed, e.g. because the worker died.
-4. **Follow-up work** of finished tasks (``task_finalizer``), and once an
+2. **Follow-up work** of finished tasks (``task_finalizer``), and once an
    hour the retention of old task events.
 
 Every step is safe to run in several API processes at once (``SKIP LOCKED``
@@ -36,10 +29,9 @@ from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 from app.models import Task, TaskStatus
-from app.services import task_events, task_finalizer, task_service
+from app.services import task_events, task_finalizer
 from app.task_contract import (
     EVENT_FAILED,
-    FAILURE_KIND_INFRASTRUCTURE,
     FAILURE_KIND_WORKER_LOST,
     terminal_payload,
 )
@@ -48,8 +40,6 @@ from app.utils.time import utcnow
 logger = logging.getLogger(__name__)
 
 RECONCILE_INTERVAL_SECONDS = 15
-# A PENDING task gets this long to show up in the queue.
-DISPATCH_GRACE_SECONDS = 60
 # RUNNING tasks from before the queue migration have no lease; they are
 # considered lost once they ran longer than the worker's job limit.
 LEGACY_RUNNING_GRACE_SECONDS = 2 * 60 * 60
@@ -61,10 +51,6 @@ WORKER_LOST_MESSAGE = (
     "(abgestürzt oder neu gestartet). Der Auftrag wurde abgebrochen und wird "
     "nicht automatisch wiederholt. Bitte prüfen Sie den Zustand der Ressourcen "
     "und starten Sie die Aktion bei Bedarf erneut."
-)
-LOST_DISPATCH_MESSAGE = (
-    "Der Auftrag wurde nie an die Warteschlange übergeben (der API-Prozess "
-    "wurde währenddessen beendet). Bitte die Aktion erneut starten."
 )
 
 
@@ -110,27 +96,6 @@ def reap_expired_leases(db: Session) -> int:
     return len(tasks)
 
 
-def fail_lost_dispatches(db: Session) -> int:
-    """Fail PENDING tasks that never reached the queue. Returns how many."""
-    tasks = db.scalars(
-        select(Task)
-        .where(
-            Task.status == TaskStatus.PENDING,
-            text("tasks.created_at < timezone('UTC', now()) - make_interval(secs => :grace)").bindparams(
-                grace=DISPATCH_GRACE_SECONDS
-            ),
-            text('NOT EXISTS (SELECT 1 FROM celery_queue q WHERE q.task_id = tasks."taskId")'),
-        )
-        .with_for_update(skip_locked=True)
-        .limit(BATCH)
-    ).all()
-    for task in tasks:
-        logger.warning("Task %s: never reached the queue, failing it", task.taskId)
-        _fail(db, task, LOST_DISPATCH_MESSAGE, FAILURE_KIND_INFRASTRUCTURE)
-    db.commit()
-    return len(tasks)
-
-
 _state: dict[str, Any] = {"last_purge": 0.0}
 
 
@@ -138,8 +103,6 @@ def reconcile_once() -> None:
     """One full pass; each step in its own session so one failure does not stop the others."""
     steps = (
         ("reap expired leases", reap_expired_leases),
-        ("fail lost dispatches", fail_lost_dispatches),
-        ("release parked messages", task_service.release_parked),
         ("finalize finished tasks", task_finalizer.finalize_pending),
     )
     for name, step in steps:

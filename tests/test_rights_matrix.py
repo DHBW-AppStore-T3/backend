@@ -4,7 +4,6 @@ The capability functions have their own unit tests; these go through the
 HTTP routes, so a route that forgets its gate fails here.
 """
 import uuid
-from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -63,16 +62,15 @@ def test_students_register_no_apps(db):
     assert resp.json()["detail"]["code"] == "role_required"
 
 
-def test_students_do_not_deploy_even_their_own_private_app(db):
+def test_students_do_not_deploy_even_their_own_private_app(db, queued):
     student = _user(db, UserRole.STUDENT)
     app = create_app_in_db(db, student, is_private=True)
-    with patch("app.services.task_service.celery_app.send_task") as sent:
-        resp = _as(student).post("/deployments/", json={
-            "name": "x", "appId": str(app.appId), "releaseTag": "v1", "teams": [],
-        })
+    resp = _as(student).post("/deployments/", json={
+        "name": "x", "appId": str(app.appId), "releaseTag": "v1", "teams": [],
+    })
     assert resp.status_code == 403
     assert resp.json()["detail"]["code"] == "role_required"
-    sent.assert_not_called()
+    assert queued() == []
     assert db.query(Deployment).count() == 0
 
 

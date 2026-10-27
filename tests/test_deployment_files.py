@@ -2,12 +2,11 @@
 
 Covers the round-trip from POST /deployments (with ``files`` field)
 to GET detail (file bytes stripped) to GET /files/... (full payload
-returned to owner). Celery is patched out.
+returned to owner). No worker runs; the queued job is read back.
 """
 import base64
 import json
 import uuid
-from unittest.mock import patch
 
 import pytest
 
@@ -48,21 +47,9 @@ def _ensure_app(db, user) -> App:
     return app
 
 
-@pytest.fixture
-def patched_celery():
-    class _FakeAsyncResult:
-        id = "fake-celery-task-id"
-
-    with patch(
-        "app.services.task_service.celery_app.send_task",
-        return_value=_FakeAsyncResult(),
-    ) as m:
-        yield m
-
-
 @pytest.mark.integration
 def test_post_deployment_persists_files_under_terraform(
-    client, db, mock_user, patched_celery
+    client, db, mock_user, queued
 ):
     app = _ensure_app(db, mock_user)
 
@@ -109,7 +96,7 @@ def test_post_deployment_persists_files_under_terraform(
 
     # The job's keyword arguments carry the same dict — the worker sees
     # what's in the DB — and the commit the deployment is pinned to.
-    job_kwargs = patched_celery.call_args.kwargs["kwargs"]
+    _, job_kwargs = queued.last()
     user_vars_arg = job_kwargs["user_vars"]
     assert user_vars_arg["terraform"]["task_pdf"]["all"]["content_b64"] == _b64(pdf)
     assert job_kwargs["commit_sha"] == deployment.commit_sha
@@ -118,9 +105,9 @@ def test_post_deployment_persists_files_under_terraform(
 
 @pytest.mark.integration
 def test_post_deployment_413_when_single_file_too_large(
-    client, db, mock_user, patched_celery
+    client, db, mock_user, queued
 ):
-    """One file over 2 MB → 413, no row created, no celery dispatch."""
+    """One file over 2 MB → 413, no row created, nothing queued."""
     app = _ensure_app(db, mock_user)
 
     big = b"x" * (2 * 1024 * 1024 + 10)
@@ -144,7 +131,7 @@ def test_post_deployment_413_when_single_file_too_large(
     )
     assert response.status_code == 413
     assert response.json()["detail"]["reason"] == "file_too_large"
-    patched_celery.assert_not_called()
+    assert queued() == []
     # No deployment row should have been written.
     assert (
         db.query(Deployment)
@@ -155,7 +142,7 @@ def test_post_deployment_413_when_single_file_too_large(
 
 @pytest.mark.integration
 def test_post_deployment_422_on_invalid_base64(
-    client, db, mock_user, patched_celery
+    client, db, mock_user, queued
 ):
     app = _ensure_app(db, mock_user)
 
@@ -179,12 +166,12 @@ def test_post_deployment_422_on_invalid_base64(
     )
     assert response.status_code == 422
     assert response.json()["detail"]["reason"] == "file_b64_invalid"
-    patched_celery.assert_not_called()
+    assert queued() == []
 
 
 @pytest.mark.integration
 def test_detail_endpoint_strips_file_bytes(
-    client, db, mock_user, patched_celery
+    client, db, mock_user, queued
 ):
     app = _ensure_app(db, mock_user)
 
@@ -218,7 +205,7 @@ def test_detail_endpoint_strips_file_bytes(
 
 @pytest.mark.integration
 def test_download_endpoint_returns_owner_bytes(
-    client, db, mock_user, patched_celery
+    client, db, mock_user, queued
 ):
     app = _ensure_app(db, mock_user)
 
@@ -254,7 +241,7 @@ def test_download_endpoint_returns_owner_bytes(
 
 
 @pytest.mark.integration
-def test_upload_names_are_stored_without_paths_or_header_breakers(client, db, mock_user, patched_celery):
+def test_upload_names_are_stored_without_paths_or_header_breakers(client, db, mock_user, queued):
     app = _ensure_app(db, mock_user)
     payload_bytes = b"%PDF-1.4 x"
     create = client.post(
@@ -290,7 +277,7 @@ def test_upload_names_are_stored_without_paths_or_header_breakers(client, db, mo
 
 @pytest.mark.integration
 def test_download_endpoint_404_for_unknown_slot(
-    client, db, mock_user, patched_celery
+    client, db, mock_user, queued
 ):
     app = _ensure_app(db, mock_user)
 
@@ -328,7 +315,7 @@ def test_download_endpoint_404_for_unknown_slot(
 
 @pytest.mark.integration
 def test_download_endpoint_member_403(
-    client, db, mock_user, patched_celery, unauth_client
+    client, db, mock_user, queued, unauth_client
 ):
     """A team member with read-access to the deployment must NOT be
     able to fetch file bytes — only the owner-view does."""
@@ -394,7 +381,7 @@ def test_download_endpoint_member_403(
 
 @pytest.mark.integration
 def test_rejected_upload_is_logged_as_a_security_event(
-    client, db, mock_user, patched_celery, caplog
+    client, db, mock_user, queued, caplog
 ):
     app = _ensure_app(db, mock_user)
 
@@ -424,7 +411,7 @@ def test_rejected_upload_is_logged_as_a_security_event(
 
 @pytest.mark.integration
 def test_soft_delete_drops_the_uploaded_bytes_but_keeps_the_metadata(
-    client, db, mock_user, patched_celery
+    client, db, mock_user, queued
 ):
     from app.crud import deployments as crud_deployments
 
@@ -456,7 +443,7 @@ def test_soft_delete_drops_the_uploaded_bytes_but_keeps_the_metadata(
 
 
 @pytest.mark.integration
-def test_stored_file_carries_a_mac_the_worker_can_check(client, db, mock_user, patched_celery):
+def test_stored_file_carries_a_mac_the_worker_can_check(client, db, mock_user, queued):
     from app.utils import upload_mac
 
     app = _ensure_app(db, mock_user)
@@ -506,7 +493,7 @@ def test_is_stored_file_var_knows_both_shapes():
 
 
 @pytest.mark.integration
-def test_download_endpoint_serves_team_scoped_files(client, db, mock_user, patched_celery):
+def test_download_endpoint_serves_team_scoped_files(client, db, mock_user, queued):
     app = _ensure_app(db, mock_user)
     payload_bytes = b"team file\n"
     create = client.post(

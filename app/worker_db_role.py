@@ -1,8 +1,8 @@
 """Give the worker's database role its login: ``python -m app.worker_db_role``.
 
 Migration ``5e1f0c2a9b7d`` creates ``appstore_worker`` without a login and
-grants it only what the worker needs (the queue, appending task events, the
-result columns of ``tasks``). The deployment runs this command after
+grants it only what the worker needs (claiming queued tasks, appending task
+events, the result columns of ``tasks``). The deployment runs this command after
 ``alembic upgrade head``; it sets ``LOGIN`` and the password from
 ``WORKER_DB_PASSWORD``. Re-running it rotates the password.
 
@@ -21,7 +21,7 @@ import psycopg
 from psycopg import sql
 
 from app.config import settings
-from app.pgq import libpq_url
+from app.database import libpq_url
 
 ROLE = "appstore_worker"
 SCRAM_ITERATIONS = 4096

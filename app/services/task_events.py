@@ -9,9 +9,7 @@ any API replica can serve any stream and a reconnecting client resumes with
 the in-process pub/sub, which handled every event once per uvicorn worker
 and could only serve subscribers of its own process.
 
-The hub also reacts to ``task_released`` (a worker let go of a task, so a
-destroy parked behind it may run) and wakes the follow-up loop when a
-terminal event arrives.
+The hub also wakes the follow-up loop when a terminal event arrives.
 """
 from __future__ import annotations
 
@@ -28,12 +26,11 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.database import libpq_url
 from app.models import TaskEvent
-from app.pgq import libpq_url
 from app.task_contract import (
     EVENT_PROGRESS,
     NOTIFY_TASK_EVENTS,
-    NOTIFY_TASK_RELEASED,
     TERMINAL_EVENTS,
 )
 
@@ -95,8 +92,6 @@ class EventHub:
         self.listening = False
         #: Called (in the event loop) with the task id of each terminal event.
         self.on_terminal: Callable[[str], None] | None = None
-        #: Called (in the event loop) with the task id of each released task.
-        self.on_released: Callable[[str], None] | None = None
 
     # ------------------------------------------------------------------
     # Subscriptions (SSE endpoint)
@@ -147,8 +142,6 @@ class EventHub:
             self._wake(task_id)
             if event_type in TERMINAL_EVENTS and self.on_terminal is not None:
                 self.on_terminal(task_id)
-        elif channel == NOTIFY_TASK_RELEASED and self.on_released is not None:
-            self.on_released(payload)
 
     async def _run(self) -> None:
         backoff = 1.0
@@ -158,7 +151,6 @@ class EventHub:
                     libpq_url(settings.DATABASE_URL), autocommit=True, application_name="api-listen"
                 ) as conn:
                     await conn.execute(f"LISTEN {NOTIFY_TASK_EVENTS}")
-                    await conn.execute(f"LISTEN {NOTIFY_TASK_RELEASED}")
                     self.listening = True
                     backoff = 1.0
                     # Streams may have missed events while we were not
