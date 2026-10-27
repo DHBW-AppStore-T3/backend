@@ -1,7 +1,8 @@
 """Live status of pod deployments, read from the cluster (.github#4).
 
 The Infrastructure tab shows, for a deployment that runs as pods, one row per
-workload: ready, restarts, phase, URL and the last warning. Nothing is cached
+workload: ready, restarts, phase, URL and the last warning. A pod that runs but
+is not Ready is ``Starting`` or ``NotResponding`` (see ``_not_ready_phase``). Nothing is cached
 in the database; the namespace is the state. Ported from the pod MVP.
 """
 
@@ -11,10 +12,11 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.config import settings
-from app.k8s.kube import Kube, KubeApi, Snapshot
+from app.k8s.kube import EventInfo, Kube, KubeApi, PodInfo, Snapshot
 from app.k8s.render import DeploymentCtx
 
 logger = logging.getLogger(__name__)
@@ -101,7 +103,36 @@ def _setup_progress(client: Kube, namespace: str, pod: str) -> dict[str, Any] | 
     return parse_progress(log) if isinstance(log, str) else None
 
 
-def _phase(snap: Snapshot, workload: str, replicas: int) -> tuple[str, bool, int]:
+# Kubernetes sets Ready to false when a pod comes up; a later change means the
+# app had answered and stopped answering.
+_WAS_READY_SLACK = timedelta(seconds=10)
+# The phases of a pod whose container runs.
+_RUNNING_PHASES = ("Running", "Starting", "NotResponding")
+
+
+def _readiness_failure(event: EventInfo) -> bool:
+    return event.reason == "Unhealthy" and event.message.startswith("Readiness probe failed")
+
+
+def _not_ready_phase(pod: PodInfo, now: datetime) -> str:
+    """``Starting`` or ``NotResponding`` for a pod that runs but is not Ready.
+
+    The pod is starting until its app answered once, for at most
+    ``K8S_READY_TIMEOUT_SECONDS``. An app that answered and stopped, or never
+    answered in that time, does not respond. Without the times (fake cluster)
+    the pod counts as starting.
+    """
+    started, since = pod.started_at, pod.not_ready_since
+    if started is None:
+        return "Starting"
+    if since is not None and since > started + _WAS_READY_SLACK:
+        return "NotResponding"
+    if now - started > timedelta(seconds=settings.K8S_READY_TIMEOUT_SECONDS):
+        return "NotResponding"
+    return "Starting"
+
+
+def _phase(snap: Snapshot, workload: str, replicas: int, now: datetime) -> tuple[str, bool, int]:
     pods = [p for p in snap.pods if p.workload == workload]
     if replicas == 0 and not pods:
         return "Stopped", False, 0
@@ -110,6 +141,8 @@ def _phase(snap: Snapshot, workload: str, replicas: int) -> tuple[str, bool, int
     pod = pods[0]
     if pod.unschedulable:
         return "Unschedulable", False, pod.restarts
+    if pod.phase == "Running" and not pod.ready and not pod.waiting_reason:
+        return _not_ready_phase(pod, now), False, pod.restarts
     return pod.waiting_reason or pod.phase, pod.ready, pod.restarts
 
 
@@ -133,23 +166,32 @@ def workload_views(deployment_id, namespace: str) -> list[dict[str, Any]] | None
         return []
     dep = DeploymentCtx(id=str(deployment_id))
     domain = app_domain()
+    now = datetime.now(UTC)
     rows = []
     for index, s in enumerate(snap.statefulsets):
-        phase, ready, restarts = _phase(snap, s.name, s.replicas)
-        # Once the workload is ready, a warning from its start (a readiness probe that
-        # failed before the server listened) is history; the page says it started.
+        phase, ready, restarts = _phase(snap, s.name, s.replicas, now)
+        setup = None
+        if phase in _RUNNING_PHASES and index < _MAX_SETUP_WORKLOADS:
+            pod = next((p for p in snap.pods if p.workload == s.name), None)
+            setup = _setup_progress(client, namespace, pod.name) if pod is not None else None
+        if phase == "NotResponding" and setup is not None and setup["percent"] < 100:
+            # It reports its own setup: still starting, however long that takes.
+            phase = "Starting"
+        # Once the workload is ready, a warning from its start is history; the
+        # page says it started. While it starts, a readiness probe that fails
+        # because the server does not listen yet is expected, not news.
         event = (
             None
             if ready
             else next(
-                (f"{e.reason}: {e.message}" for e in reversed(snap.events) if s.name in e.object),
+                (
+                    f"{e.reason}: {e.message}"
+                    for e in reversed(snap.events)
+                    if s.name in e.object and not (phase == "Starting" and _readiness_failure(e))
+                ),
                 None,
             )
         )
-        setup = None
-        if phase == "Running" and index < _MAX_SETUP_WORKLOADS:
-            pod = next((p for p in snap.pods if p.workload == s.name), None)
-            setup = _setup_progress(client, namespace, pod.name) if pod is not None else None
         rows.append(
             {
                 "workload": s.name,

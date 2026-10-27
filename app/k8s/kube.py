@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from app.k8s.render import (
     DEPLOYMENT_LABEL,
@@ -27,6 +27,9 @@ from app.k8s.render import (
     WORKLOAD_LABEL,
     label_value,
 )
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 # Seconds a call to the API server may take to connect and to answer. The
 # client has no default, so a connection the network dropped without a reset
@@ -47,6 +50,12 @@ class PodInfo:
     unschedulable: bool = False
     # Changes when the pod is replaced; a StatefulSet reuses the name.
     uid: str = ""
+    # When a running container of the pod last started, and since when the pod
+    # is not Ready (the Ready condition's last change); None when unknown.
+    # Together they tell an app that is still starting from one that answered
+    # and stopped answering.
+    started_at: datetime | None = None
+    not_ready_since: datetime | None = None
 
 
 @dataclass
@@ -306,6 +315,9 @@ def _pod_info(p: Any) -> PodInfo:
     )
     for c in p.status.container_statuses or []:
         info.restarts += c.restart_count or 0
+        running = c.state.running if c.state else None
+        if running and running.started_at and (info.started_at is None or running.started_at > info.started_at):
+            info.started_at = running.started_at
         if c.state and c.state.waiting:
             info.waiting_reason = c.state.waiting.reason
             info.message = c.state.waiting.message
@@ -316,6 +328,8 @@ def _pod_info(p: Any) -> PodInfo:
         if cond.type == "PodScheduled" and cond.status == "False" and cond.reason == "Unschedulable":
             info.unschedulable = True
             info.message = cond.message
+        if cond.type == "Ready" and cond.status != "True":
+            info.not_ready_since = cond.last_transition_time
     return info
 
 

@@ -404,6 +404,9 @@ class PodWorkloadSchema(BaseModel):
     user_id: str | None = None
     ready: bool = False
     restarts: int = 0
+    # Kubernetes' pod phase or why a container waits (Pending, CrashLoopBackOff,
+    # ...), or Stopped / Unschedulable; a pod that runs but is not Ready is
+    # Starting or NotResponding (app.services.k8s_status).
     phase: str
     url: str | None = None
     lastEvent: str | None = None

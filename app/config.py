@@ -103,6 +103,10 @@ class Settings(BaseSettings):
     # Read the live status of pod deployments from the cluster (the API's
     # service account may read the dep-* namespaces, nothing else).
     K8S_STATUS_ENABLED: bool = False
+    # How long a pod may take to answer after it started, as long as a deploy
+    # waits for it (same value as the pod deployer's). The live view shows a
+    # pod that runs but has not answered after that as not responding.
+    K8S_READY_TIMEOUT_SECONDS: int = 600
     # App hosts are <workload>-<deployment>.<K8S_APP_DOMAIN or apps.<K8S_ZONE>>.
     K8S_ZONE: str = ""
     K8S_APP_DOMAIN: str = ""
