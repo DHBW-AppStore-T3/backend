@@ -28,6 +28,11 @@ from app.k8s.render import (
     label_value,
 )
 
+# Seconds a call to the API server may take to connect and to answer. The
+# client has no default, so a connection the network dropped without a reset
+# would block its caller for good: a job of the worker or a request of the API.
+REQUEST_TIMEOUT = (10, 60)
+
 
 @dataclass
 class PodInfo:
@@ -134,11 +139,17 @@ class KubeApi:
     def __init__(self) -> None:
         from kubernetes import client, config, dynamic
 
+        class ApiClient(client.ApiClient):
+            """Every request, typed or dynamic, goes through ``call_api``: it gets ``REQUEST_TIMEOUT``."""
+
+            def call_api(self, *args: Any, _request_timeout: Any = None, **kwargs: Any) -> Any:
+                return super().call_api(*args, _request_timeout=_request_timeout or REQUEST_TIMEOUT, **kwargs)
+
         try:
             config.load_incluster_config()
         except config.ConfigException:
             config.load_kube_config()
-        api = client.ApiClient()
+        api = ApiClient()
         # The generated client is untyped for mypy's purposes; keep it behind Any.
         self._dyn: Any = dynamic.DynamicClient(api)
         self._core: Any = client.CoreV1Api(api)

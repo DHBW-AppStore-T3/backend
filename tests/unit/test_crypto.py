@@ -24,7 +24,7 @@ def test_encrypt_decrypt_roundtrip_returns_original_plaintext() -> None:
 @pytest.mark.unit
 def test_encrypt_b64_produces_ascii_string_and_roundtrips() -> None:
     """encrypt_b64 erzeugt einen ASCII/base64-sicheren String, der wieder dekodierbar ist."""
-    plaintext = "celery-envelope-payload"
+    plaintext = "queue-envelope-payload"
     token_b64 = crypto.encrypt_b64(plaintext)
     assert isinstance(token_b64, str)
     # Muss reine ASCII sein und sich als base64 dekodieren lassen.

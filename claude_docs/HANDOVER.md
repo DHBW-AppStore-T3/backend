@@ -4,7 +4,7 @@ Lebendes Übergabedokument (Harness-Konzept: [HARNESS.md](https://github.com/DHB
 
 ## 1. Zustand
 
-- **Stack:** FastAPI, SQLAlchemy 2.0, Alembic, PostgreSQL 16, Celery als Producer über den Postgres-Transport `pgq`, PyJWT gegen Keycloak, Python 3.11.
+- **Stack:** FastAPI, SQLAlchemy 2.0, Alembic, PostgreSQL 16 (auch als Task-Queue: Tabelle `tasks`, LISTEN/NOTIFY), PyJWT gegen Keycloak, Python 3.11.
 - **Eine Worker-Queue:** `pods` (Kubernetes- und KubeVirt-Apps). Der OpenStack-VM-Pfad ist entfernt (.github#12).
 - **Live-Status:** SSE aus `task_events` (`LISTEN/NOTIFY`, `Last-Event-ID`).
 - **Alembic-Head:** `c5e7a9b1d3f5`, 28 Revisionen.
@@ -19,7 +19,7 @@ Lint (ruff, OpenAPI-Export als Artefakt) · Unit (`pytest -m unit`) · Integrati
 
 1. Tests brauchen `DISABLE_BACKGROUND_TASKS=1` (setzt `tests/conftest.py`).
 2. Jede Testdatei trägt `pytest.mark.unit` oder `pytest.mark.integration`, sonst bricht die Sammlung ab. `unit` = ohne DB, Ordner `tests/unit/`.
-3. `app/pgq.py` und `app/task_contract.py` sind byte-gleich mit dem Worker-Repo (`tests/unit/test_shared_files.py` prüft den Hash). Änderung immer in beiden Repos.
+3. `app/task_contract.py` und `app/k8s/` sind byte-gleich mit dem Worker-Repo (`tests/unit/test_shared_files.py` prüft den Hash). Änderung immer in beiden Repos.
 4. Tests laufen mit `APP_ENV=development`; Produktionsprüfungen der Settings testen eigene `Settings`-Objekte.
 5. `now()` ist in Postgres der Transaktionsbeginn; Sichtbarkeitstests in langlebigen Sessions vorher `rollback()`.
 6. `AppCreate`/`AppUpdate` enthalten weder `recommended` noch `deploy_version`; nur die Admin-Endpunkte setzen sie.

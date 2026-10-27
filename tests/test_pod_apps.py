@@ -6,7 +6,6 @@ import copy
 import json
 import uuid
 from datetime import datetime
-from unittest.mock import patch
 
 import pytest
 import yaml
@@ -69,18 +68,6 @@ SPEC = {
 }
 
 
-class _FakeAsyncResult:
-    id = "fake-celery-task-id"
-
-
-@pytest.fixture
-def sent():
-    with patch(
-        "app.services.task_service.celery_app.send_task", return_value=_FakeAsyncResult()
-    ) as m:
-        yield m
-
-
 @pytest.fixture
 def pod_repo(fake_git):
     """Every clone of an app commit holds ``appstore.yaml`` (pass a new spec to change it)."""
@@ -139,11 +126,6 @@ def _submit_and_approve(client, db, app, tag="v1.0"):
 
 def _team(name, *members):
     return {"name": name, "userIds": [str(m.userId) for m in members]}
-
-
-def _job(sent):
-    call = sent.call_args
-    return call.args[0], call.kwargs["kwargs"]
 
 
 # ----------------------------------------------------------------
@@ -269,7 +251,7 @@ def test_approving_checks_the_spec_is_the_submitted_one(
 # ----------------------------------------------------------------
 # deploying
 # ----------------------------------------------------------------
-def test_a_pod_app_deploys(client, db, mock_user, pod_repo, sent):
+def test_a_pod_app_deploys(client, db, mock_user, pod_repo, queued):
     alice, bob = _student(db, "alice"), _student(db, "bob")
     app = _app(db, mock_user)
     _submit_and_approve(client, db, app)
@@ -278,7 +260,7 @@ def test_a_pod_app_deploys(client, db, mock_user, pod_repo, sent):
 
     assert response.status_code == 201, response.text
     deployment_id = uuid.UUID(response.json()["deploymentId"])
-    name, kwargs = _job(sent)
+    name, kwargs = queued.last()
     assert name == "pods.deploy_application"
     assert "openstack_envelope" not in kwargs and "state_token_enc" not in kwargs
     assert kwargs["spec"]["workload"]["containers"][0]["image"].endswith(DIGEST)
@@ -305,7 +287,7 @@ KUBEVIRT_SPEC = {
 
 
 def test_a_kubevirt_app_is_submitted_deployed_and_kept_as_a_cluster_app(
-    client, db, mock_user, pod_repo, sent
+    client, db, mock_user, pod_repo, queued
 ):
     pod_repo(KUBEVIRT_SPEC)
     alice = _student(db, "alice")
@@ -318,7 +300,7 @@ def test_a_kubevirt_app_is_submitted_deployed_and_kept_as_a_cluster_app(
     assert (runtime["runtime"], runtime["scope"]) == ("kubevirt-vm", "user")
     assert submitted["runtime"] == "kubevirt-vm" and submitted["spec_sha256"]
     assert response.status_code == 201, response.text
-    name, kwargs = _job(sent)
+    name, kwargs = queued.last()
     assert name == "pods.deploy_vm_application"
     assert "openstack_envelope" not in kwargs and "state_token_enc" not in kwargs
     assert kwargs["spec"]["vm"]["imageRef"] == "windows11-matlab-golden"
@@ -358,7 +340,7 @@ def test_a_kubevirt_app_offers_vcpu_ram_and_network_to_the_wizard(client, db, mo
 
 
 def test_a_chosen_vm_size_and_network_reach_the_job_but_not_the_review(
-    client, db, mock_user, pod_repo, sent
+    client, db, mock_user, pod_repo, queued
 ):
     pod_repo(KUBEVIRT_CONFIGURABLE)
     app = _app(db, mock_user)
@@ -377,7 +359,7 @@ def test_a_chosen_vm_size_and_network_reach_the_job_but_not_the_review(
     response = client.post("/deployments/", json=body)
 
     assert response.status_code == 201, response.text
-    _, kwargs = _job(sent)
+    _, kwargs = queued.last()
     assert (kwargs["spec"]["vm"]["cpuCores"], kwargs["spec"]["vm"]["memoryGiB"]) == (6, 12)
     assert (kwargs["spec"]["egress"], kwargs["spec"]["podNetwork"]) == ("none", "namespace")
     db.expire_all()
@@ -387,7 +369,7 @@ def test_a_chosen_vm_size_and_network_reach_the_job_but_not_the_review(
     )
 
 
-def test_a_vm_size_outside_the_bounds_is_refused(client, db, mock_user, pod_repo, sent):
+def test_a_vm_size_outside_the_bounds_is_refused(client, db, mock_user, pod_repo, queued):
     pod_repo(KUBEVIRT_CONFIGURABLE)
     app = _app(db, mock_user)
     _submit_and_approve(client, db, app)
@@ -403,10 +385,10 @@ def test_a_vm_size_outside_the_bounds_is_refused(client, db, mock_user, pod_repo
 
     assert response.status_code == 422
     assert response.json()["detail"]["reason"] == "invalid_resources"
-    sent.assert_not_called()
+    assert queued() == []
 
 
-def test_a_changed_spec_after_approval_is_not_deployable(client, db, mock_user, pod_repo, sent):
+def test_a_changed_spec_after_approval_is_not_deployable(client, db, mock_user, pod_repo, queued):
     app = _app(db, mock_user)
     _submit_and_approve(client, db, app)
     changed = copy.deepcopy(SPEC)
@@ -417,7 +399,7 @@ def test_a_changed_spec_after_approval_is_not_deployable(client, db, mock_user, 
 
     assert response.status_code == 403
     assert response.json()["detail"]["code"] == "version_not_approved"
-    sent.assert_not_called()
+    assert queued() == []
 
 
 @pytest.mark.parametrize(
@@ -430,7 +412,7 @@ def test_a_changed_spec_after_approval_is_not_deployable(client, db, mock_user, 
         ),
     ],
 )
-def test_workloads_must_make_sense(client, db, mock_user, pod_repo, sent, teams, reason):
+def test_workloads_must_make_sense(client, db, mock_user, pod_repo, queued, teams, reason):
     pod_repo({**SPEC, "scope": "team"})
     app = _app(db, mock_user, is_private=True)
 
@@ -441,7 +423,7 @@ def test_workloads_must_make_sense(client, db, mock_user, pod_repo, sent, teams,
     assert db.query(Deployment).count() == 0
 
 
-def test_the_workload_limits(client, db, mock_user, pod_repo, sent, monkeypatch):
+def test_the_workload_limits(client, db, mock_user, pod_repo, queued, monkeypatch):
     from app.config import settings
 
     app = _app(db, mock_user, is_private=True)
@@ -466,7 +448,7 @@ def test_the_workload_limits(client, db, mock_user, pod_repo, sent, monkeypatch)
 
 
 def test_a_new_pod_deployment_never_gets_a_namespace_that_was_used(
-    client, db, mock_user, pod_repo, sent, monkeypatch
+    client, db, mock_user, pod_repo, queued, monkeypatch
 ):
     app = _app(db, mock_user, is_private=True)
     first = uuid.UUID(
@@ -488,7 +470,7 @@ def test_a_new_pod_deployment_never_gets_a_namespace_that_was_used(
 # lifecycle
 # ----------------------------------------------------------------
 @pytest.fixture
-def live_pod_deployment(client, db, mock_user, pod_repo, sent):
+def live_pod_deployment(client, db, mock_user, pod_repo, queued):
     """A deployed pod app with one team of two (Anna, Ben) and its namespace in a FakeKube."""
     anna, ben = _student(db, "anna"), _student(db, "ben")
     app = _app(db, mock_user, is_private=True)
@@ -497,7 +479,7 @@ def live_pod_deployment(client, db, mock_user, pod_repo, sent):
     )
     db.query(Task).update({"status": TaskStatus.SUCCESS})
     db.commit()
-    sent.reset_mock()
+    queued.reset()
 
     kube = FakeKube(ready_after_polls=0)
     spec = parse_spec(SPEC)
@@ -516,18 +498,18 @@ def live_pod_deployment(client, db, mock_user, pod_repo, sent):
     k8s_status.set_kube_factory(None)
 
 
-def test_pause_resume_destroy_dispatch_pod_jobs(client, db, live_pod_deployment, sent):
+def test_pause_resume_destroy_dispatch_pod_jobs(client, db, live_pod_deployment, queued):
     deployment_id, _kube, _ = live_pod_deployment
 
     response = client.post(f"/deployments/{deployment_id}/pause")
 
     assert response.status_code == 202, response.text
-    name, kwargs = _job(sent)
+    name, kwargs = queued.last()
     assert name == "pods.pause_deployment"
     assert "openstack_envelope" not in kwargs and "state_token_enc" not in kwargs
 
 
-def test_admins_operate_pod_deployments(db, live_pod_deployment, admin_client, sent):
+def test_admins_operate_pod_deployments(db, live_pod_deployment, admin_client, queued):
     deployment_id, _kube, _ = live_pod_deployment
     assert admin_client.post(f"/deployments/{deployment_id}/pause").status_code == 202
 
@@ -542,7 +524,7 @@ def _deactivate(db, app):
     db.commit()
 
 
-def test_the_owner_cannot_deploy_an_app_an_admin_deactivated(client, db, mock_user, pod_repo, sent):
+def test_the_owner_cannot_deploy_an_app_an_admin_deactivated(client, db, mock_user, pod_repo, queued):
     alice = _student(db, "alice")
     app = _app(db, mock_user)
     _submit_and_approve(client, db, app)
@@ -553,10 +535,10 @@ def test_the_owner_cannot_deploy_an_app_an_admin_deactivated(client, db, mock_us
     assert response.status_code == 403
     assert response.json()["detail"]["code"] == "app_deactivated"
     assert db.query(Deployment).count() == 0
-    sent.assert_not_called()
+    assert queued() == []
 
 
-def test_an_admin_can_still_deploy_a_deactivated_app(admin_client, db, mock_user, pod_repo, sent):
+def test_an_admin_can_still_deploy_a_deactivated_app(admin_client, db, mock_user, pod_repo, queued):
     alice = _student(db, "alice")
     app = _app(db, mock_user)
     _deactivate(db, app)
@@ -567,20 +549,20 @@ def test_an_admin_can_still_deploy_a_deactivated_app(admin_client, db, mock_user
 
 
 def test_a_paused_deployment_of_a_deactivated_app_cannot_be_resumed(
-    client, db, live_pod_deployment, sent
+    client, db, live_pod_deployment, queued
 ):
     deployment_id, _kube, _ = live_pod_deployment
     assert client.post(f"/deployments/{deployment_id}/pause").status_code == 202
     db.query(Task).update({"status": TaskStatus.SUCCESS})
     db.commit()
     _deactivate(db, db.get(Deployment, deployment_id).app)
-    sent.reset_mock()
+    queued.reset()
 
     response = client.post(f"/deployments/{deployment_id}/resume")
 
     assert response.status_code == 403
     assert response.json()["detail"]["code"] == "app_deactivated"
-    sent.assert_not_called()
+    assert queued() == []
 
 
 def test_resources_of_a_pod_deployment_list_its_workloads(client, live_pod_deployment, monkeypatch):
@@ -625,13 +607,13 @@ def test_a_namespace_of_another_deployment_shows_nothing(client, db, live_pod_de
 @pytest.mark.parametrize(
     ("action", "address"), [("restart", "team-1-ben"), ("reset", "reset:team-1-ben")]
 )
-def test_restart_and_reset_of_one_workload(client, live_pod_deployment, sent, action, address):
+def test_restart_and_reset_of_one_workload(client, live_pod_deployment, queued, action, address):
     deployment_id, _kube, _ = live_pod_deployment
 
     response = client.post(f"/deployments/{deployment_id}/workloads/team-1-ben/{action}")
 
     assert response.status_code == 202, response.text
-    name, kwargs = _job(sent)
+    name, kwargs = queued.last()
     assert name == "pods.redeploy_resource" and kwargs["resource_address"] == address
 
 
@@ -639,18 +621,18 @@ def test_restart_and_reset_of_one_workload(client, live_pod_deployment, sent, ac
     ("workload", "code"), [("unknown-one", 404), ("Team_1", 422), ("a;b", 422), ("-x", 422)]
 )
 def test_restart_refuses_unknown_or_malformed_workloads(
-    client, live_pod_deployment, sent, workload, code
+    client, live_pod_deployment, queued, workload, code
 ):
     deployment_id, _kube, _ = live_pod_deployment
     assert (
         client.post(f"/deployments/{deployment_id}/workloads/{workload}/restart").status_code
         == code
     )
-    sent.assert_not_called()
+    assert queued() == []
 
 
 @pytest.fixture
-def live_vm_deployment(client, db, mock_user, pod_repo, sent):
+def live_vm_deployment(client, db, mock_user, pod_repo, queued):
     """A deployed kubevirt-vm app with one person (Anna) and its namespace in a FakeKube."""
     pod_repo(KUBEVIRT_SPEC)
     anna = _student(db, "anna")
@@ -661,7 +643,7 @@ def live_vm_deployment(client, db, mock_user, pod_repo, sent):
     )
     db.query(Task).update({"status": TaskStatus.SUCCESS})
     db.commit()
-    sent.reset_mock()
+    queued.reset()
 
     kube = FakeKube(ready_after_polls=0)
     spec = parse_spec(KUBEVIRT_SPEC)
@@ -677,36 +659,36 @@ def live_vm_deployment(client, db, mock_user, pod_repo, sent):
     k8s_status.set_kube_factory(None)
 
 
-def test_admins_operate_vm_deployments(db, live_vm_deployment, admin_client, sent):
+def test_admins_operate_vm_deployments(db, live_vm_deployment, admin_client, queued):
     deployment_id, _kube, _ = live_vm_deployment
 
     response = admin_client.post(f"/deployments/{deployment_id}/pause")
 
     assert response.status_code == 202, response.text
-    name, _kwargs = _job(sent)
+    name, _kwargs = queued.last()
     assert name == "pods.pause_deployment"
 
 
-def test_the_owner_pauses_a_vm_deployment(client, live_vm_deployment, sent):
+def test_the_owner_pauses_a_vm_deployment(client, live_vm_deployment, queued):
     deployment_id, _kube, _ = live_vm_deployment
 
     assert client.post(f"/deployments/{deployment_id}/pause").status_code == 202
-    name, _kwargs = _job(sent)
+    name, _kwargs = queued.last()
     assert name == "pods.pause_deployment"
 
 
-def test_a_vm_is_restarted_by_name(client, live_vm_deployment, sent):
+def test_a_vm_is_restarted_by_name(client, live_vm_deployment, queued):
     deployment_id, kube, _ = live_vm_deployment
     (vm,) = [v.name for v in kube.snapshot(f"dep-{deployment_id.hex[:8]}").vmis]
 
     response = client.post(f"/deployments/{deployment_id}/workloads/{vm}/restart")
 
     assert response.status_code == 202, response.text
-    name, kwargs = _job(sent)
+    name, kwargs = queued.last()
     assert name == "pods.redeploy_resource" and kwargs["resource_address"] == vm
 
 
-def test_a_vm_cannot_be_reset(client, live_vm_deployment, sent):
+def test_a_vm_cannot_be_reset(client, live_vm_deployment, queued):
     deployment_id, kube, _ = live_vm_deployment
     (vm,) = [v.name for v in kube.snapshot(f"dep-{deployment_id.hex[:8]}").vmis]
 
@@ -714,10 +696,10 @@ def test_a_vm_cannot_be_reset(client, live_vm_deployment, sent):
 
     assert response.status_code == 422, response.text
     assert response.json()["detail"]["reason"] == "reset_not_supported"
-    sent.assert_not_called()
+    assert queued() == []
 
 
-def test_a_pod_workload_can_still_be_reset(client, live_pod_deployment, sent):
+def test_a_pod_workload_can_still_be_reset(client, live_pod_deployment, queued):
     deployment_id, _kube, _ = live_pod_deployment
     assert client.post(f"/deployments/{deployment_id}/workloads/team-1-ben/reset").status_code == 202
 
@@ -730,7 +712,7 @@ def test_the_vm_resource_endpoints_are_gone(client, live_pod_deployment):
     assert client.post(f"/deployments/{deployment_id}/resources/x.y/redeploy").status_code in (404, 405)
 
 
-def test_deleting_a_row_of_the_removed_vm_path_just_hides_it(client, db, mock_user, pod_repo, sent):
+def test_deleting_a_row_of_the_removed_vm_path_just_hides_it(client, db, mock_user, pod_repo, queued):
     app = _app(db, mock_user, is_private=True)
     row = Deployment(name="old", appId=app.appId, userId=mock_user.userId, runtime="openstack-vm", releaseTag="v1")
     db.add(row)
@@ -741,15 +723,15 @@ def test_deleting_a_row_of_the_removed_vm_path_just_hides_it(client, db, mock_us
     assert response.status_code == 204, response.text
     db.expire_all()
     assert db.get(Deployment, row.deploymentId).deleted_at is not None
-    sent.assert_not_called()
+    assert queued() == []
 
 
-def test_cancel_ends_the_deploy_and_queues_the_cleanup(client, db, mock_user, pod_repo, sent):
+def test_cancel_ends_the_deploy_and_queues_the_cleanup(client, db, mock_user, pod_repo, queued):
     app = _app(db, mock_user, is_private=True)
     deployment_id = uuid.UUID(
         _deploy(client, app, teams=[_team("T", _student(db, "a"))]).json()["deploymentId"]
     )
-    sent.reset_mock()
+    queued.reset()
 
     response = client.post(f"/deployments/{deployment_id}/cancel")
 
@@ -758,12 +740,12 @@ def test_cancel_ends_the_deploy_and_queues_the_cleanup(client, db, mock_user, po
     tasks = {t.type: t for t in db.query(Task).filter(Task.deploymentId == deployment_id)}
     assert tasks[TaskType.DEPLOY].status == TaskStatus.CANCELLED
     assert tasks[TaskType.DESTROY].status == TaskStatus.PENDING
-    name, kwargs = _job(sent)
+    name, kwargs = queued.last()
     assert name == "pods.destroy_deployment" and "sweep_build_artifacts" not in kwargs
 
 
 def test_deleting_a_cancelled_pod_deployment_still_destroys_its_namespace(
-    client, db, mock_user, pod_repo, sent
+    client, db, mock_user, pod_repo, queued
 ):
     app = _app(db, mock_user, is_private=True)
     deployment_id = uuid.UUID(
@@ -771,12 +753,12 @@ def test_deleting_a_cancelled_pod_deployment_still_destroys_its_namespace(
     )
     db.query(Task).update({"status": TaskStatus.CANCELLED})
     db.commit()
-    sent.reset_mock()
+    queued.reset()
 
     response = client.delete(f"/deployments/{deployment_id}")
 
     assert response.status_code == 202, response.text
-    assert _job(sent)[0] == "pods.destroy_deployment"
+    assert queued.last()[0] == "pods.destroy_deployment"
     assert db.get(Deployment, deployment_id).deleted_at is None
 
 
@@ -1071,7 +1053,7 @@ def _zip(size: int) -> bytes:
 
 
 def test_team_files_of_a_pod_app_are_refused_beyond_the_secret_limit(
-    client, db, mock_user, pod_repo, sent
+    client, db, mock_user, pod_repo, queued
 ):
     spec = {
         **SPEC,
@@ -1106,10 +1088,10 @@ def test_team_files_of_a_pod_app_are_refused_beyond_the_secret_limit(
 
     assert response.status_code == 413
     assert response.json()["detail"]["reason"] == "deployment_files_too_large"
-    sent.assert_not_called()
+    assert queued() == []
 
 
-def test_team_files_of_a_pod_app_reach_the_job(client, db, mock_user, pod_repo, sent):
+def test_team_files_of_a_pod_app_reach_the_job(client, db, mock_user, pod_repo, queued):
     spec = {
         **SPEC,
         "scope": "team",
@@ -1137,7 +1119,7 @@ def test_team_files_of_a_pod_app_reach_the_job(client, db, mock_user, pod_repo, 
     response = client.post("/deployments/", json=body)
 
     assert response.status_code == 201, response.text
-    stored = _job(sent)[1]["user_vars"]["terraform"]["assignment"]["T"]
+    stored = queued.last()[1]["user_vars"]["terraform"]["assignment"]["T"]
     entry = stored.get("uploaded", stored)
     assert entry["name"] == "a.zip"  # no directories in a stored name
 
@@ -1145,7 +1127,7 @@ def test_team_files_of_a_pod_app_reach_the_job(client, db, mock_user, pod_repo, 
 # ----------------------------------------------------------------
 # what the detail tells the UI
 # ----------------------------------------------------------------
-def test_the_detail_carries_permissions_and_allowed_actions(client, db, mock_user, pod_repo, sent):
+def test_the_detail_carries_permissions_and_allowed_actions(client, db, mock_user, pod_repo, queued):
     alice = _student(db, "alice")
     app = _app(db, mock_user, is_private=True)
     deployment_id = _deploy(client, app, teams=[_team("T", alice)]).json()["deploymentId"]
@@ -1202,7 +1184,7 @@ def test_the_runtime_offers_the_resource_choices(client, db, mock_user, pod_repo
     ]
 
 
-def test_a_chosen_size_reaches_the_job_but_not_the_review(client, db, mock_user, pod_repo, sent):
+def test_a_chosen_size_reaches_the_job_but_not_the_review(client, db, mock_user, pod_repo, queued):
     pod_repo(_tunable_spec())
     alice = _student(db, "alice")
     app = _app(db, mock_user)
@@ -1213,11 +1195,11 @@ def test_a_chosen_size_reaches_the_job_but_not_the_review(client, db, mock_user,
     )
 
     assert response.status_code == 201, response.text
-    _, kwargs = _job(sent)
+    _, kwargs = queued.last()
     assert kwargs["spec"]["workload"]["containers"][0]["resources"] == {"cpu": "2", "memory": "3Gi"}
 
 
-def test_a_size_outside_the_bounds_is_refused(client, db, mock_user, pod_repo, sent):
+def test_a_size_outside_the_bounds_is_refused(client, db, mock_user, pod_repo, queued):
     pod_repo(_tunable_spec())
     alice = _student(db, "alice")
     app = _app(db, mock_user)
@@ -1227,10 +1209,10 @@ def test_a_size_outside_the_bounds_is_refused(client, db, mock_user, pod_repo, s
 
     assert response.status_code == 422
     assert response.json()["detail"]["reason"] == "invalid_resources"
-    sent.assert_not_called()
+    assert queued() == []
 
 
-def test_an_app_without_bounds_ignores_no_choice(client, db, mock_user, pod_repo, sent):
+def test_an_app_without_bounds_ignores_no_choice(client, db, mock_user, pod_repo, queued):
     alice = _student(db, "alice")
     app = _app(db, mock_user)
     _submit_and_approve(client, db, app)
@@ -1358,7 +1340,7 @@ def test_the_runtime_offers_no_network_choice_without_user_choices(client, db, m
     )
 
 
-def test_a_chosen_network_reaches_the_job(client, db, mock_user, pod_repo, sent):
+def test_a_chosen_network_reaches_the_job(client, db, mock_user, pod_repo, queued):
     pod_repo(_networked_spec(internet=True, podNetwork=True))
     alice = _student(db, "alice")
     app = _app(db, mock_user)
@@ -1369,11 +1351,11 @@ def test_a_chosen_network_reaches_the_job(client, db, mock_user, pod_repo, sent)
     )
 
     assert response.status_code == 201, response.text
-    _, kwargs = _job(sent)
+    _, kwargs = queued.last()
     assert kwargs["spec"]["egress"] == "internet" and kwargs["spec"]["podNetwork"] == "namespace"
 
 
-def test_a_network_choice_without_release_is_refused(client, db, mock_user, pod_repo, sent):
+def test_a_network_choice_without_release_is_refused(client, db, mock_user, pod_repo, queued):
     pod_repo(_networked_spec(podNetwork=True))
     alice = _student(db, "alice")
     app = _app(db, mock_user)
@@ -1385,10 +1367,10 @@ def test_a_network_choice_without_release_is_refused(client, db, mock_user, pod_
     detail = response.json()["detail"]
     assert detail["reason"] == "invalid_network"
     assert detail["errors"][0]["loc"] == "network.internet"
-    sent.assert_not_called()
+    assert queued() == []
 
 
-def test_a_non_boolean_network_choice_is_refused(client, db, mock_user, pod_repo, sent):
+def test_a_non_boolean_network_choice_is_refused(client, db, mock_user, pod_repo, queued):
     pod_repo(_networked_spec(internet=True))
     alice = _student(db, "alice")
     app = _app(db, mock_user)
@@ -1410,7 +1392,7 @@ def _body(app, network, teams):
 
 
 def test_the_job_payload_of_an_old_style_spec_has_no_pod_network_key(
-    client, db, mock_user, pod_repo, sent
+    client, db, mock_user, pod_repo, queued
 ):
     # A worker that predates podNetwork forbids unknown keys.
     pod_repo(SPEC)
@@ -1421,12 +1403,12 @@ def test_the_job_payload_of_an_old_style_spec_has_no_pod_network_key(
     assert (
         client.post("/deployments/", json=_body(app, None, [_team("T", alice)])).status_code == 201
     )
-    _, kwargs = _job(sent)
+    _, kwargs = queued.last()
     assert "podNetwork" not in kwargs["spec"] and "userChoices" not in kwargs["spec"]
 
 
 def test_the_job_payload_carries_pod_network_when_the_author_sets_it(
-    client, db, mock_user, pod_repo, sent
+    client, db, mock_user, pod_repo, queued
 ):
     pod_repo({**copy.deepcopy(SPEC), "podNetwork": "namespace"})
     alice = _student(db, "alice")
@@ -1436,11 +1418,11 @@ def test_the_job_payload_carries_pod_network_when_the_author_sets_it(
     assert (
         client.post("/deployments/", json=_body(app, None, [_team("T", alice)])).status_code == 201
     )
-    assert _job(sent)[1]["spec"]["podNetwork"] == "namespace"
+    assert queued.last()[1]["spec"]["podNetwork"] == "namespace"
 
 
 def test_a_network_choice_keeps_the_approved_hash_and_is_stored(
-    client, db, mock_user, pod_repo, sent
+    client, db, mock_user, pod_repo, queued
 ):
     pod_repo(_networked_spec(podNetwork=True))
     alice = _student(db, "alice")
@@ -1451,7 +1433,7 @@ def test_a_network_choice_keeps_the_approved_hash_and_is_stored(
     response = _deploy_with_network(client, app, {"podNetwork": True}, [_team("T", alice)])
 
     assert response.status_code == 201, response.text
-    _, kwargs = _job(sent)
+    _, kwargs = queued.last()
     assert kwargs["spec"]["podNetwork"] == "namespace"
     db.expire_all()
     assert db.query(AppVersionApproval).filter_by(appId=app.appId).one().spec_sha256 == before
@@ -1463,7 +1445,7 @@ def test_a_network_choice_keeps_the_approved_hash_and_is_stored(
 
 
 def test_a_network_choice_for_an_app_without_user_choices_is_refused(
-    client, db, mock_user, pod_repo, sent
+    client, db, mock_user, pod_repo, queued
 ):
     pod_repo(SPEC)
     alice = _student(db, "alice")
@@ -1475,11 +1457,11 @@ def test_a_network_choice_for_an_app_without_user_choices_is_refused(
     assert response.status_code == 422
     assert response.json()["detail"]["reason"] == "invalid_network"
     assert response.json()["detail"]["errors"][0]["loc"] == "network.internet"
-    sent.assert_not_called()
+    assert queued() == []
 
 
 def test_valid_resources_do_not_save_an_invalid_network_choice(
-    client, db, mock_user, pod_repo, sent
+    client, db, mock_user, pod_repo, queued
 ):
     spec = _tunable_spec()
     spec["userChoices"] = {"podNetwork": True}
@@ -1498,4 +1480,4 @@ def test_valid_resources_do_not_save_an_invalid_network_choice(
     response = client.post("/deployments/", json=body)
 
     assert response.status_code == 422 and response.json()["detail"]["reason"] == "invalid_network"
-    sent.assert_not_called()
+    assert queued() == []

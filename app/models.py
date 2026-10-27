@@ -2,6 +2,7 @@ import enum
 import uuid
 
 from sqlalchemy import (
+    DDL,
     BigInteger,
     Boolean,
     Column,
@@ -15,6 +16,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -268,7 +270,6 @@ class Task(Base):
         nullable=False,
         index=True,
     )
-    celeryTaskId = Column(String, nullable=True)
     type = Column(Enum(TaskType), nullable=False)
     status = Column(Enum(TaskStatus), default=TaskStatus.PENDING)
     started_at = Column(DateTime, nullable=True)
@@ -283,8 +284,15 @@ class Task(Base):
     progress_pct = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=utcnow)
 
-    # Queue columns (.github#5). Unlike the columns above these are
-    # timezone-aware and are compared with ``now()`` in SQL.
+    # Queue columns (.github#5): the task row is the queue entry.
+    # The registered job the worker runs (``worker/app/job_runtime.py``)
+    # and its keyword arguments. The arguments may hold uploaded files: the
+    # trigger ``tasks_drop_job_kwargs`` (below) drops them the moment the
+    # task leaves PENDING.
+    job = Column(String, nullable=True)
+    job_kwargs = Column(JSONB, nullable=True)
+    # Unlike the columns above these are timezone-aware and are compared
+    # with ``now()`` in SQL.
     # The worker process running the task and how long its lease lasts;
     # the worker renews it while the job runs. A RUNNING task with an
     # expired lease belongs to a worker that died (reconciler: worker_lost).
@@ -302,7 +310,7 @@ class Task(Base):
 
     __table_args__ = (
         # At most one PENDING/RUNNING task per deployment: the database
-        # backstop of ``task_service.prepare_task_in_tx``. The enum stores
+        # backstop of ``task_service.enqueue_task_in_tx``. The enum stores
         # member names, hence the upper-case literals.
         Index(
             "uq_tasks_active_per_deployment",
@@ -316,42 +324,40 @@ class Task(Base):
     deployment = relationship("Deployment", back_populates="tasks")
 
 
+# The trigger of migration f8b0c2d4e6a8, also for the schema ``create_all``
+# builds (tests): a task's job arguments are dropped the moment it leaves
+# PENDING, whoever changes its status (the worker's claim included).
+event.listen(
+    Task.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE OR REPLACE FUNCTION tasks_drop_job_kwargs() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            NEW.job_kwargs := NULL;
+            RETURN NEW;
+        END
+        $$
+        """
+    ),
+)
+event.listen(
+    Task.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER tasks_drop_job_kwargs BEFORE UPDATE OF status ON tasks
+            FOR EACH ROW WHEN (NEW.status <> 'PENDING' AND NEW.job_kwargs IS NOT NULL)
+            EXECUTE FUNCTION tasks_drop_job_kwargs()
+        """
+    ),
+)
+
+
 # ----------------------------------------------------------------
-# QUEUE MODELS (.github#5)
+# TASK EVENTS (.github#5)
 # ----------------------------------------------------------------
-# Celery's broker table, written and read by the ``pgq`` transport
-# (``app/pgq.py``). Declared here so migrations and ``alembic check``
-# cover it; application code goes through Celery, not this model.
-class CeleryQueueMessage(Base):
-    __tablename__ = "celery_queue"
-
-    id = Column(BigInteger, Identity(always=False), primary_key=True)
-    queue = Column(Text, nullable=False)
-    payload = Column(JSONB, nullable=False)  # Kombu message (Celery protocol 2)
-    task_id = Column(UUID(as_uuid=True), nullable=True)  # = tasks.taskId
-    # Parked until this task's worker let go of it (destroy after cancel).
-    after_task = Column(UUID(as_uuid=True), nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
-    visible_after = Column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
-    claimed_by = Column(Text, nullable=True)
-    delivery_count = Column(Integer, nullable=False, server_default=text("0"))
-
-    __table_args__ = (
-        Index("ix_celery_queue_ready", "queue", "visible_after", "id"),
-        Index(
-            "uq_celery_queue_task_id",
-            "task_id",
-            unique=True,
-            postgresql_where=text("task_id IS NOT NULL"),
-        ),
-        Index(
-            "ix_celery_queue_after_task",
-            "after_task",
-            postgresql_where=text("after_task IS NOT NULL"),
-        ),
-    )
-
-
 # Progress, log and terminal events of a task, appended by the worker
 # (and by the API for cancel / worker_lost). The row id is the SSE event
 # id. A trigger (migration 5e1f0c2a9b7d) sends ``NOTIFY task_events``.

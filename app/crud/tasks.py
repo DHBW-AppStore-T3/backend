@@ -16,15 +16,12 @@ def get_tasks(
     skip: int = 0,
     limit: int = 100,
     deployment_id: UUID | None = None,
-    celery_task_id: str | None = None,
     status: TaskStatus | None = None
 ) -> list[Task]:
     """Get tasks with optional filters"""
     query = db.query(Task)
     if deployment_id:
         query = query.filter(Task.deploymentId == deployment_id)
-    if celery_task_id:
-        query = query.filter(Task.celeryTaskId == celery_task_id)
     if status:
         query = query.filter(Task.status == status)
     return query.offset(skip).limit(limit).all()

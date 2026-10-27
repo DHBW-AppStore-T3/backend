@@ -47,7 +47,7 @@ FROM python:3.11-slim
 # Metadata
 LABEL maintainer="your.email@example.com" \
       version="1.0.0" \
-      description="FastAPI Backend with Auth, Git & Celery"
+      description="FastAPI Backend with Auth, Git & Kubernetes"
 
 # Non-root user with a fixed UID: Kubernetes can only verify runAsNonRoot
 # for a numeric user (USER below), and git needs a passwd entry for it.

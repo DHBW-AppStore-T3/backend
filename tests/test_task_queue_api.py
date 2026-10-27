@@ -1,10 +1,11 @@
-"""Dispatch, cancel, live stream, follow-up and reconciler on the Postgres queue (.github#5).
+"""Queueing, cancel, live stream, follow-up and reconciler on the Postgres queue (.github#5).
 
-Integration tests against the test database with the real ``pgq``
-transport (no Celery mock): the queue message, the parking of the destroy
-behind a cancelled job, the SSE stream with ``Last-Event-ID``, the
-exactly-once follow-up and the reconciler's treatment of dead workers and
-lost dispatches.
+Integration tests against the test database: the task row with its job and
+the ``task_queued`` wake-up, the destroy queued with a cancel, the SSE stream
+with ``Last-Event-ID``, the exactly-once follow-up and the reconciler's
+treatment of dead workers; the job arguments are dropped when a task leaves
+PENDING. Which task a worker may claim is tested in the worker
+(``tests/test_job_runtime.py``).
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from app.database import libpq_url
 from app.models import (
     App,
     Deployment,
@@ -28,8 +30,7 @@ from app.models import (
     TaskStatus,
     TaskType,
 )
-from app.pgq import libpq_url
-from app.services import reconciler, task_finalizer, task_service
+from app.services import reconciler, task_finalizer
 from app.task_contract import (
     EVENT_FAILED,
     EVENT_LOG,
@@ -38,6 +39,7 @@ from app.task_contract import (
     EVENT_SUCCEEDED,
     FAILURE_KIND_WORKER_LOST,
     NOTIFY_TASK_CANCEL,
+    NOTIFY_TASK_QUEUED,
     seal_results,
     terminal_payload,
 )
@@ -67,21 +69,11 @@ def _seed(db, user, *, task_type=TaskType.DEPLOY, task_status=TaskStatus.SUCCESS
     db.flush()
     task_id = uuid.uuid4()
     task_fields.setdefault("created_at", datetime.utcnow())
-    task = Task(taskId=task_id, celeryTaskId=str(task_id), deploymentId=deployment.deploymentId, type=task_type,
-                status=task_status, **task_fields)
+    task = Task(taskId=task_id, deploymentId=deployment.deploymentId, type=task_type, status=task_status,
+                **task_fields)
     db.add(task)
     db.commit()
     return deployment, task
-
-
-def _queue_rows(db):
-    # now() is the start of the current transaction: end the test's
-    # long-running one so "visible" means visible right now.
-    db.rollback()
-    return db.execute(text(
-        "SELECT task_id, after_task, visible_after <= now() AS visible, claimed_by, payload"
-        " FROM celery_queue ORDER BY id"
-    )).mappings().all()
 
 
 def _events(db, task_id):
@@ -90,19 +82,23 @@ def _events(db, task_id):
 
 
 # ----------------------------------------------------------------
-# Dispatch
+# Queueing
 # ----------------------------------------------------------------
-def test_dispatch_puts_one_message_keyed_by_the_task_id(client, db, mock_user):
+def test_a_task_is_queued_with_its_job_and_wakes_the_workers(client, db, mock_user):
     deployment, _ = _seed(db, mock_user)
-    response = client.post(f"/deployments/{deployment.deploymentId}/pause")
-    assert response.status_code == 202
+    with psycopg.connect(libpq_url(_TEST_DB_URL), autocommit=True) as listener:
+        listener.execute(f"LISTEN {NOTIFY_TASK_QUEUED}")
+        response = client.post(f"/deployments/{deployment.deploymentId}/pause")
+        assert response.status_code == 202
+        notified = list(listener.notifies(timeout=2, stop_after=1))
+    assert len(notified) == 1
     task_id = uuid.UUID(response.json()["task_id"])
 
-    (row,) = _queue_rows(db)
-    assert row["task_id"] == task_id and row["visible"] and row["after_task"] is None
-    assert row["payload"]["headers"]["task"] == "pods.pause_deployment"
+    db.expire_all()
     task = db.get(Task, task_id)
-    assert task.status == TaskStatus.PENDING and task.celeryTaskId == str(task_id)
+    assert task.status == TaskStatus.PENDING and task.lease_until is None
+    assert task.job == "pods.pause_deployment"
+    assert task.job_kwargs["deployment_id"] == str(deployment.deploymentId)
 
 
 def test_second_active_task_is_refused_by_the_database(db, mock_user):
@@ -117,8 +113,8 @@ def test_second_active_task_is_refused_by_the_database(db, mock_user):
 # Cancel
 # ----------------------------------------------------------------
 def test_cancel_before_a_worker_claimed_the_job(client, db, mock_user):
-    deployment, task = _seed(db, mock_user, task_status=TaskStatus.PENDING)
-    task_service.dispatch_to_celery(db, task, "pods.deploy_application", {"deployment_id": str(deployment.deploymentId)})
+    deployment, task = _seed(db, mock_user, task_status=TaskStatus.PENDING, job="pods.deploy_application",
+                             job_kwargs={"deployment_id": "x", "user_vars": {"files": "..."}})
 
     response = client.post(f"/deployments/{deployment.deploymentId}/cancel")
     assert response.status_code == 202
@@ -126,22 +122,19 @@ def test_cancel_before_a_worker_claimed_the_job(client, db, mock_user):
 
     db.expire_all()
     cancelled = db.get(Task, task.taskId)
+    # No longer PENDING, so no worker claims it; its arguments are gone.
     assert cancelled.status == TaskStatus.CANCELLED and cancelled.cancel_requested_at is not None
+    assert cancelled.job_kwargs is None
     assert [e.type for e in _events(db, task.taskId)] == [EVENT_REVOKED]
-    # The deploy never reaches a worker; the destroy runs right away.
-    (row,) = _queue_rows(db)
-    assert row["task_id"] == destroy_id and row["visible"] and row["after_task"] is None
-    assert row["payload"]["headers"]["task"] == "pods.destroy_deployment"
+    destroy = db.get(Task, destroy_id)
+    assert destroy.status == TaskStatus.PENDING and destroy.job == "pods.destroy_deployment"
 
 
-def test_cancel_while_a_worker_runs_the_job_parks_the_destroy(client, db, mock_user):
+def test_cancel_while_a_worker_runs_the_job(client, db, mock_user):
     deployment, task = _seed(
-        db, mock_user, task_status=TaskStatus.RUNNING,
-        claimed_by="worker-1:42", lease_until=datetime.now(UTC) + timedelta(minutes=2),
+        db, mock_user, task_status=TaskStatus.RUNNING, job="pods.deploy_application",
+        claimed_by="worker-1:42:ab", lease_until=datetime.now(UTC) + timedelta(minutes=2),
     )
-    task_service.dispatch_to_celery(db, task, "pods.deploy_application", {"deployment_id": str(deployment.deploymentId)})
-    db.execute(text("UPDATE celery_queue SET claimed_by = 'worker-1', visible_after = now() + interval '5 min'"))
-    db.commit()
 
     with psycopg.connect(libpq_url(_TEST_DB_URL), autocommit=True) as listener:
         listener.execute(f"LISTEN {NOTIFY_TASK_CANCEL}")
@@ -151,19 +144,14 @@ def test_cancel_while_a_worker_runs_the_job_parks_the_destroy(client, db, mock_u
     assert notified == [str(task.taskId)]
     destroy_id = uuid.UUID(response.json()["task_id"])
 
-    rows = {row["task_id"]: row for row in _queue_rows(db)}
-    assert rows[task.taskId]["claimed_by"] == "worker-1"  # still the worker's
-    parked = rows[destroy_id]
-    assert parked["after_task"] == task.taskId and not parked["visible"]
-
-    # Still held: nothing to release.
-    assert task_service.release_parked(db, task.taskId) == 0
-    # The worker lets go of the cancelled job.
-    db.execute(text('UPDATE tasks SET lease_until = NULL WHERE "taskId" = :id'), {"id": task.taskId})
-    db.commit()
-    assert task_service.release_parked(db, task.taskId) == 1
-    rows = {row["task_id"]: row for row in _queue_rows(db)}
-    assert rows[destroy_id]["visible"] and rows[destroy_id]["after_task"] is None
+    db.expire_all()
+    cancelled = db.get(Task, task.taskId)
+    assert cancelled.status == TaskStatus.CANCELLED and cancelled.cancel_requested_at is not None
+    # Still the worker's until it lets go; the destroy waits for that (no worker
+    # claims a task of a deployment another task holds a lease on).
+    assert cancelled.claimed_by == "worker-1:42:ab" and cancelled.lease_until is not None
+    destroy = db.get(Task, destroy_id)
+    assert destroy.status == TaskStatus.PENDING and destroy.job == "pods.destroy_deployment"
 
 
 # ----------------------------------------------------------------
@@ -346,39 +334,24 @@ def test_reconciler_fails_a_task_whose_worker_died(db, mock_user):
     assert alive_row.status == TaskStatus.RUNNING and _events(db, alive.taskId) == []
 
 
-def test_reconciler_fails_lost_dispatches_but_not_queued_or_fresh_ones(db, mock_user):
-    old = datetime.utcnow() - timedelta(minutes=5)
-    _, lost = _seed(db, mock_user, task_status=TaskStatus.PENDING, created_at=old)
-    queued_dep, queued = _seed(db, mock_user, task_status=TaskStatus.PENDING, created_at=old)
-    task_service.dispatch_to_celery(db, queued, "pods.deploy_application", {"deployment_id": str(queued_dep.deploymentId)})
-    _, fresh = _seed(db, mock_user, task_status=TaskStatus.PENDING)
-
-    reconciler.reconcile_once()
-
+# ----------------------------------------------------------------
+# Job arguments
+# ----------------------------------------------------------------
+@pytest.mark.parametrize("status", [TaskStatus.RUNNING, TaskStatus.CANCELLED, TaskStatus.FAILED])
+def test_the_job_arguments_are_dropped_when_a_task_leaves_pending(db, mock_user, status):
+    """The trigger: the worker reads them in its claim; they may hold uploaded files and addresses."""
+    args = {"deployment_id": "x", "teams": {"A": [{"email": "a@example.org"}]}}
+    _, task = _seed(db, mock_user, task_status=TaskStatus.PENDING, job="pods.deploy_application", job_kwargs=args)
+    db.execute(text('UPDATE tasks SET progress_pct = 1 WHERE "taskId" = :id'), {"id": task.taskId})
+    db.commit()
     db.expire_all()
-    assert db.get(Task, lost.taskId).status == TaskStatus.FAILED
-    assert db.get(Task, queued.taskId).status == TaskStatus.PENDING
-    assert db.get(Task, fresh.taskId).status == TaskStatus.PENDING
+    assert db.get(Task, task.taskId).job_kwargs == args  # still PENDING
 
-
-def test_reconciler_releases_a_destroy_parked_behind_a_dead_worker(db, mock_user):
-    deployment, cancelled = _seed(db, mock_user, task_status=TaskStatus.CANCELLED, claimed_by="w:1",
-                                  lease_until=datetime.now(UTC) + timedelta(minutes=1))
-    destroy = Task(taskId=uuid.uuid4(), deploymentId=deployment.deploymentId, type=TaskType.DESTROY,
-                   status=TaskStatus.PENDING)
-    db.add(destroy)
+    db.execute(text('UPDATE tasks SET status = :s WHERE "taskId" = :id'), {"s": status.name, "id": task.taskId})
     db.commit()
-    task_service.dispatch_to_celery(db, destroy, "pods.destroy_deployment", {}, after_task_id=cancelled.taskId)
-    assert not _queue_rows(db)[0]["visible"]
-
-    reconciler.reconcile_once()
-    assert not _queue_rows(db)[0]["visible"]  # lease still valid
-
-    db.execute(text("UPDATE tasks SET lease_until = now() - interval '1 second' WHERE \"taskId\" = :id"),
-               {"id": cancelled.taskId})
-    db.commit()
-    reconciler.reconcile_once()
-    assert _queue_rows(db)[0]["visible"]
+    db.expire_all()
+    row = db.get(Task, task.taskId)
+    assert row.job_kwargs is None and row.job == "pods.deploy_application"
 
 
 # ----------------------------------------------------------------

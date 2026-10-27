@@ -9,7 +9,7 @@ the API and the worker would fetch from wherever it points, internal
 addresses included.
 
 This file exists identically in ``backend`` and ``worker``; a test in both
-repositories pins its hash (as for ``pgq.py``).
+repositories pins its hash (as for ``task_contract.py``).
 """
 
 from __future__ import annotations

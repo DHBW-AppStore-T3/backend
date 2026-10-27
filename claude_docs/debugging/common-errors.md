@@ -7,7 +7,7 @@
 | API zeigt keine Outputs eines Tasks | Worker und API haben verschiedene `RESULTS_ENCRYPTION_KEY` | gleichen Schlüssel setzen (leer: beide fallen auf den Credential-Schlüssel zurück; `CREDENTIAL_ENCRYPTION_KEY` muss dann gleich sein) |
 | Task bleibt PENDING | Worker läuft nicht, falsche Queue, oder Rolle `appstore_worker` ohne Login | `make dev-logs-worker`; `make migrate-dev` (setzt das Login und startet den Worker neu) |
 | Task `failed` mit `worker_lost` | Lease abgelaufen, Worker gestorben | Destroy oder erneuter Deploy aus der UI; es gibt keinen automatischen Neustart |
-| Task `failed`, `celery_infrastructure` | Nachricht ging nach dem Commit verloren (Dispatch) | erneut deployen |
+| Task `failed`, `infrastructure` | Der Worker kennt den Job nicht (API und Worker nicht im Takt) | beide auf denselben Stand bringen, erneut deployen |
 | 401 `Dev user '…' not found` | `X-Dev-User` ohne Seed-User | `make seed-dev` |
 | 401 trotz gültigem Login | `iss`/`azp`/`aud` passen nicht | `KEYCLOAK_ISSUER` (öffentliche URL), `OIDC_ALLOWED_CLIENTS`, `OIDC_AUDIENCE` prüfen |
 | 503 bei jeder Anfrage mit Token | Keycloak nicht erreichbar (`KEYCLOAK_SERVER_URL`) | Keycloak-Logs, `make health` |

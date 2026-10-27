@@ -523,19 +523,15 @@ def create_deployment(
     # The job carries the validated spec.
     extra = {"spec": loaded_spec.payload(), "owner": str(current_user.userId)}
 
-    # Insert PENDING task row in the SAME transaction as the deployment,
-    # commit atomically (deployment + teams + user_to_deployments + task),
-    # then dispatch to Celery outside the locked TX. On a send failure the
-    # task row is flipped to FAILED and we surface 503 — the deployment
-    # row stays, but the user sees an obvious failure instead of an
-    # eternal PENDING.
-    _commit_and_dispatch(
+    # Queue the PENDING task in the SAME transaction as the deployment and
+    # commit atomically (deployment + teams + user_to_deployments + task);
+    # the commit wakes the workers.
+    _enqueue_and_commit(
         db,
         deployment_id=db_deployment.deploymentId,
         task_type=TaskType.DEPLOY,
-        celery_task_name=_task_name(db_deployment.runtime, TaskType.DEPLOY),
-        celery_kwargs=_job_kwargs(db_deployment, user_vars, teams_dict, **extra),
-        dispatch_error_label="Could not dispatch deployment task — please retry",
+        job=_task_name(db_deployment.runtime, TaskType.DEPLOY),
+        job_kwargs=_job_kwargs(db_deployment, user_vars, teams_dict, **extra),
         rollback_on_conflict=True,
     )
 
@@ -606,7 +602,7 @@ def delete_deployment(
     # Per-deployment advisory lock — serialises against any concurrent
     # POST /pause, /resume or DELETE on the same deployment so the
     # ``current_status`` read below and the eventual
-    # ``prepare_task_in_tx`` insert see a consistent picture. Without
+    # ``enqueue_task_in_tx`` insert see a consistent picture. Without
     # this, two concurrent destroys could both pass the in-flight check
     # and one would crash on the partial unique index.
     crud_locks.acquire_deployment_xact_lock(db, deployment_id)
@@ -642,11 +638,10 @@ def delete_deployment(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-# The job each (runtime, task type) runs, all on the ``pods`` queue (the pod
-# deployer, no OpenTofu, no root); see ``app.celery_app``. Historic naming: the
-# ``pods.*`` tasks and queue came first and now also serve kubevirt-vm
-# deployments (``pods.deploy_vm_application``). Deployed workers and queued
-# tasks use these names, so they are not renamed.
+# The job each (runtime, task type) runs (``tasks.job``; the pod deployer, no
+# OpenTofu, no root). Historic naming: the ``pods.*`` jobs came first and now
+# also serve kubevirt-vm deployments (``pods.deploy_vm_application``). Queued
+# tasks carry these names, so they are not renamed.
 _TASK_NAMES = {
     (RUNTIME_K8S, TaskType.DEPLOY): "pods.deploy_application",
     (RUNTIME_K8S, TaskType.DESTROY): "pods.destroy_deployment",
@@ -835,38 +830,32 @@ def _job_kwargs(deployment, user_vars: dict, teams: dict, **extra) -> dict:
     }
 
 
-def _commit_and_dispatch(
+def _enqueue_and_commit(
     db: Session,
     *,
     deployment_id,
     task_type: TaskType,
-    celery_task_name: str,
-    celery_kwargs: dict,
-    dispatch_error_label: str,
+    job: str,
+    job_kwargs: dict,
     rollback_on_conflict: bool,
-    after_task_id=None,
 ):
-    """Insert the PENDING task in-TX, commit, then dispatch to Celery.
+    """Queue the PENDING task in-TX and commit it with everything else.
 
-    Shared tail of the create and lifecycle dispatch paths:
+    Shared tail of the create and lifecycle paths:
 
-    * ``prepare_task_in_tx`` → ``HTTPException(409)`` on an active task
+    * ``enqueue_task_in_tx`` → ``HTTPException(409)`` on an active task
       (the create path additionally rolls back its pending insert);
-    * ``commit`` + ``refresh`` the task row;
-    * ``dispatch_to_celery`` → ``HTTPException(503, dispatch_error_label)``
-      on a Celery send failure (the task row is flipped to FAILED inside
-      ``dispatch_to_celery`` in a fresh TX).
+    * ``commit`` (which wakes the workers) + ``refresh`` the task row.
 
-    ``after_task_id`` parks the message until that task's worker has let
-    go of it (cancel → destroy).
-
-    Returns the committed, dispatched ``Task``.
+    Returns the committed ``Task``.
     """
     try:
-        task = task_service_module.prepare_task_in_tx(
+        task = task_service_module.enqueue_task_in_tx(
             db,
             deployment_id=deployment_id,
             task_type=task_type,
+            job=job,
+            job_kwargs=job_kwargs,
         )
     except task_service_module.ActiveTaskExistsError:
         if rollback_on_conflict:
@@ -877,20 +866,7 @@ def _commit_and_dispatch(
         )
     db.commit()
     db.refresh(task)
-
-    try:
-        task, _celery_id = task_service_module.dispatch_to_celery(
-            db,
-            task=task,
-            celery_task_name=celery_task_name,
-            celery_kwargs=celery_kwargs,
-            after_task_id=after_task_id,
-        )
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=dispatch_error_label,
-        )
+    logger.info("Task %s queued (%s)", task.taskId, job)
     return task
 
 
@@ -916,18 +892,13 @@ def _dispatch_lifecycle_task(
     task_type: TaskType,
     response_status: str,
     extra_kwargs: dict | None = None,
-    after_task_id=None,
 ):
     """Enqueue any post-deploy lifecycle worker task for a deployment.
 
     Used by destroy, pause, resume, and per-workload redeploy — all four
     follow the same pattern: load user inputs, gather team membership,
-    atomically insert a
-    PENDING task row, commit, then ``send_task`` outside the locked
-    TX. On a Celery send failure the task row flips to FAILED in a
-    fresh TX (handled inside ``dispatch_to_celery``) and we surface a
-    503 so the user sees an obvious failure instead of a permanent
-    in-flight status.
+    queue the PENDING task and commit it together with whatever the
+    caller changed in the same transaction (cancel: the cancelled task).
 
     Args:
         task_type:           the ``TaskType`` enum value that drives both
@@ -941,8 +912,6 @@ def _dispatch_lifecycle_task(
         extra_kwargs:        task-specific keyword arguments on top of the
                              common payload (``_job_kwargs``), e.g. the
                              ``resource_address`` of a redeploy.
-        after_task_id:       park the task until that task's worker let
-                             go of it (destroy after cancel).
     """
     try:
         user_vars = json.loads(deployment.userInputVar) if deployment.userInputVar else {}
@@ -950,7 +919,7 @@ def _dispatch_lifecycle_task(
         user_vars = {}
 
     # Belt + braces: destroy, pause and resume do not need the uploaded file
-    # contents; keep them out of the job message. Redeploy and deploy do
+    # contents; keep them out of the job's arguments. Redeploy and deploy do
     # (a reset recreates the files of the workload).
     if task_type in (TaskType.DESTROY, TaskType.PAUSE, TaskType.RESUME):
         for block_key in USER_INPUT_VARIABLES_KEYS:
@@ -972,15 +941,13 @@ def _dispatch_lifecycle_task(
             teams_dict[team.name] = [_member_entry(m) for m in members]
 
 
-    task = _commit_and_dispatch(
+    task = _enqueue_and_commit(
         db,
         deployment_id=deployment.deploymentId,
         task_type=task_type,
-        celery_task_name=_task_name(deployment.runtime, task_type),
-        celery_kwargs=_job_kwargs(deployment, user_vars, teams_dict, **(extra_kwargs or {})),
-        dispatch_error_label=f"Could not dispatch {task_type.value} task — please retry",
+        job=_task_name(deployment.runtime, task_type),
+        job_kwargs=_job_kwargs(deployment, user_vars, teams_dict, **(extra_kwargs or {})),
         rollback_on_conflict=False,
-        after_task_id=after_task_id,
     )
 
     return JSONResponse(
@@ -1117,18 +1084,18 @@ def reset_workload(
 #
 # The only action permitted while a worker task is still in flight.
 # Cancel is not "forget about it" - it is stop-and-clean, in this order,
-# all in one transaction (.github#5, no Celery revoke any more):
+# all in one transaction (.github#5):
 #
 #   1. Mark the in-flight task CANCELLED with ``cancel_requested_at`` and a
 #      terminal ``task-revoked`` event, so open streams end and the
-#      partial unique index admits the destroy task inserted below.
-#   2. A queue message no worker has claimed yet is deleted: the job never
-#      starts. Otherwise ``NOTIFY task_cancel`` reaches the worker running
-#      it, which lets go of it.
-#   3. Dispatch a destroy, which removes the namespace with everything the
-#      deploy created. While a worker still holds the cancelled job the
-#      destroy is parked behind it, so the two never run on the same
-#      deployment at once (security review A-5, race 2).
+#      partial unique index admits the destroy task inserted below. A task
+#      no worker has claimed yet is never claimed now (only PENDING ones
+#      are; its job arguments are dropped with the status change); a
+#      running one gets ``NOTIFY task_cancel``, and its worker lets go of it.
+#   2. Queue a destroy, which removes the namespace with everything the
+#      deploy created. No worker starts it while a worker still holds the
+#      cancelled job, so the two never run on the same deployment at once
+#      (security review A-5, race 2).
 @router.post("/{deployment_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
 def cancel_deployment(
     deployment_id: UUID,
@@ -1158,7 +1125,6 @@ def cancel_deployment(
         lifecycle_service.DeploymentAction.CANCEL,
     )
 
-    blocking_task_id = None
     in_flight = crud_deployments.get_latest_task(db, deployment_id)
     if in_flight is not None and in_flight.status in (
         TaskStatus.PENDING,
@@ -1167,13 +1133,6 @@ def cancel_deployment(
         in_flight.status = TaskStatus.CANCELLED
         in_flight.cancel_requested_at = datetime.now(UTC)
         in_flight.finished_at = utcnow()
-        unclaimed = db.execute(
-            text("DELETE FROM celery_queue WHERE task_id = :id AND claimed_by IS NULL"),
-            {"id": in_flight.taskId},
-        ).rowcount
-        if not unclaimed:
-            # A worker has (or had) the job: the destroy waits for it.
-            blocking_task_id = in_flight.taskId
         task_events.add_event(
             db,
             in_flight.taskId,
@@ -1201,7 +1160,6 @@ def cancel_deployment(
         current_user,
         task_type=TaskType.DESTROY,
         response_status="destroying",
-        after_task_id=blocking_task_id,
     )
 
 
@@ -1232,7 +1190,7 @@ def pause_deployment(
     # Hold the per-deployment advisory lock across the status check
     # AND the task insert so a parallel POST /pause can't sneak past
     # ``ensure_action_allowed`` between our read and the
-    # ``prepare_task_in_tx`` flush.
+    # ``enqueue_task_in_tx`` flush.
     crud_locks.acquire_deployment_xact_lock(db, deployment_id)
     lifecycle_service.ensure_action_allowed(
         db,

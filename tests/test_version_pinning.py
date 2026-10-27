@@ -8,7 +8,6 @@ app's variable declarations (an unreadable repository fails the request).
 import json
 import uuid
 from datetime import datetime
-from unittest.mock import patch
 
 import pytest
 
@@ -27,16 +26,6 @@ from tests.conftest import (
 )
 
 pytestmark = pytest.mark.integration
-
-
-class _FakeAsyncResult:
-    id = "fake-celery-id"
-
-
-@pytest.fixture
-def sent():
-    with patch("app.services.task_service.celery_app.send_task", return_value=_FakeAsyncResult()) as m:
-        yield m
 
 
 def _deploy(client, app, user, tag="v1.0.0"):
@@ -113,7 +102,7 @@ def test_registration_stores_the_normalised_url(client):
 # ----------------------------------------------------------------
 # Deploy
 # ----------------------------------------------------------------
-def test_deploy_of_an_approved_commit_pins_it(client, db, mock_user, mock_admin, sent, fake_git):
+def test_deploy_of_an_approved_commit_pins_it(client, db, mock_user, mock_admin, queued, fake_git):
     app = create_app_in_db(db, mock_admin)
     approve_version_in_db(db, app, "v1.0.0")
 
@@ -121,10 +110,10 @@ def test_deploy_of_an_approved_commit_pins_it(client, db, mock_user, mock_admin,
 
     assert resp.status_code == 201, resp.text
     assert resp.json()["commit_sha"] == FakeGitRemote.sha_for("v1.0.0")
-    assert sent.call_args.kwargs["kwargs"]["commit_sha"] == FakeGitRemote.sha_for("v1.0.0")
+    assert queued.last()[1]["commit_sha"] == FakeGitRemote.sha_for("v1.0.0")
 
 
-def test_deploy_refuses_an_unapproved_version_of_a_public_app(client, db, mock_user, mock_admin, sent):
+def test_deploy_refuses_an_unapproved_version_of_a_public_app(client, db, mock_user, mock_admin, queued):
     app = create_app_in_db(db, mock_admin)
     approve_version_in_db(db, app, "v1.0.0")
 
@@ -132,10 +121,10 @@ def test_deploy_refuses_an_unapproved_version_of_a_public_app(client, db, mock_u
 
     assert resp.status_code == 403
     assert resp.json()["detail"]["code"] == "version_not_approved"
-    sent.assert_not_called()
+    assert queued() == []
 
 
-def test_deploy_refuses_a_tag_moved_after_approval(client, db, mock_user, mock_admin, sent, fake_git):
+def test_deploy_refuses_a_tag_moved_after_approval(client, db, mock_user, mock_admin, queued, fake_git):
     app = create_app_in_db(db, mock_admin)
     approve_version_in_db(db, app, "v1.0.0")
     fake_git.move("v1.0.0")
@@ -147,13 +136,13 @@ def test_deploy_refuses_a_tag_moved_after_approval(client, db, mock_user, mock_a
     assert db.query(Deployment).count() == 0
 
 
-def test_deploy_needs_a_version(client, db, mock_user, sent):
+def test_deploy_needs_a_version(client, db, mock_user, queued):
     app = create_app_in_db(db, mock_user, is_private=True)
     resp = client.post("/deployments/", json={"name": "x", "appId": str(app.appId), "teams": []})
     assert resp.status_code == 422
 
 
-def test_owner_deploys_any_tag_of_a_private_app_pinned(client, db, mock_user, sent, fake_git):
+def test_owner_deploys_any_tag_of_a_private_app_pinned(client, db, mock_user, queued, fake_git):
     app = create_app_in_db(db, mock_user, is_private=True)
 
     resp = _deploy(client, app, mock_user, tag="feature-x")
@@ -162,7 +151,7 @@ def test_owner_deploys_any_tag_of_a_private_app_pinned(client, db, mock_user, se
     assert resp.json()["commit_sha"] == FakeGitRemote.sha_for("feature-x")
 
 
-def test_deploy_fails_closed_without_the_repository(client, db, mock_user, sent, fake_git):
+def test_deploy_fails_closed_without_the_repository(client, db, mock_user, queued, fake_git):
     app = create_app_in_db(db, mock_user, is_private=True)
     fake_git.readable = False
 
@@ -170,10 +159,10 @@ def test_deploy_fails_closed_without_the_repository(client, db, mock_user, sent,
 
     assert resp.status_code == 502
     assert db.query(Deployment).count() == 0
-    sent.assert_not_called()
+    assert queued() == []
 
 
-def test_deploy_of_an_unknown_tag_is_404(client, db, mock_user, sent, fake_git):
+def test_deploy_of_an_unknown_tag_is_404(client, db, mock_user, queued, fake_git):
     app = create_app_in_db(db, mock_user, is_private=True)
     fake_git.any_tag = False
 
@@ -200,7 +189,7 @@ def _deployment(db, user, app, *, commit_sha):
     return dep
 
 
-def test_lifecycle_jobs_carry_the_pinned_commit_even_if_the_tag_moved(client, db, mock_user, sent, fake_git):
+def test_lifecycle_jobs_carry_the_pinned_commit_even_if_the_tag_moved(client, db, mock_user, queued, fake_git):
     app = create_app_in_db(db, mock_user, is_private=True)
     pinned = FakeGitRemote.sha_for("v1.0.0")
     dep = _deployment(db, mock_user, app, commit_sha=pinned)
@@ -209,4 +198,4 @@ def test_lifecycle_jobs_carry_the_pinned_commit_even_if_the_tag_moved(client, db
     resp = client.post(f"/deployments/{dep.deploymentId}/pause")
 
     assert resp.status_code == 202, resp.text
-    assert sent.call_args.kwargs["kwargs"]["commit_sha"] == pinned
+    assert queued.last()[1]["commit_sha"] == pinned

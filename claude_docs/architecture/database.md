@@ -14,7 +14,6 @@ PostgreSQL 16, SQLAlchemy 2.0, Alembic. 28 Revisionen in `alembic/versions/`, He
 | `deployments` | `releaseTag`, `commit_sha`, `runtime`, `k8s_namespace` (`dep-<8 hex>`, eindeutig), `k8s_workloads`, `userInputVar`, `deleted_at` |
 | `user_to_deployments` | Zugang je Mitglied |
 | `tasks` | Auftrag und einzige Wahrheit über seinen Zustand: Typ (deploy, update, destroy, pause, resume, redeploy), Status (pending, running, success, failed, cancelled), `logs`, `outputs_enc` (Fernet über Outputs und State), `claimed_by`, `lease_until`, `cancel_requested_at`, `finalized_at`, `current_phase`, `progress_pct`; höchstens ein PENDING/RUNNING-Task je Deployment (`uq_tasks_active_per_deployment`) |
-| `celery_queue` | Queue des Transports `pgq`; `after_task` parkt einen Destroy hinter einem abgebrochenen Job |
 | `task_events` | Live-Events; Trigger `task_events_notify` sendet `NOTIFY task_events`; 7 Tage nach Task-Ende gelöscht |
 | `lti_nonces`, `lti_login_codes` | LTI-Start |
 
@@ -24,7 +23,7 @@ Soft-Delete: Apps und Deployments tragen `deleted_at`; Standardabfragen blenden 
 
 ## Rolle `appstore_worker`
 
-Die Worker verbinden sich als `appstore_worker`: Rechte nur auf `celery_queue`, INSERT in `task_events`, die Ergebnis-Spalten von `tasks`. Kein Zugriff auf `users`, `apps` oder Zugangsdaten.
+Die Worker verbinden sich als `appstore_worker`: Rechte: Tasks holen (`job`, `job_kwargs` nur lesen), INSERT in `task_events`, die Ergebnis-Spalten von `tasks`. Kein Zugriff auf `users`, `apps` oder Zugangsdaten.
 Das Login setzt `python -m app.worker_db_role` (liest `WORKER_DB_PASSWORD`); lokal erledigt das `make migrate-dev`. In Kubernetes ist die Rolle eine CloudNativePG-Managed-Role, das Kommando entfällt.
 
 ## Migrationen

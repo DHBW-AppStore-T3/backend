@@ -14,14 +14,14 @@ FastAPI-App `app/main.py`, Poetry, Python 3.11. Vollständige Modul- und Endpunk
 
 | Komponente | Rolle |
 |---|---|
-| PostgreSQL | Daten, Queue (`celery_queue`), Task-Events |
+| PostgreSQL | Daten, Queue (die Tabelle `tasks`), Task-Events |
 | Keycloak | Anmeldung; das Backend prüft nur Access-Tokens (siehe `auth.md`) |
 | Worker (`pod-deployer`) | führt die Jobs der Queue `pods` aus: Kubernetes- und KubeVirt-Apps |
 | Kubernetes-API | nur lesend (Live-Status, Orphan-Check) |
 | ClamAV | optional, Virenscan der Uploads |
 | Moodle | LTI-1.3-Start (`/lti13/*`) |
 
-Kein RabbitMQ, kein Redis, kein Celery-Result-Backend, kein SMTP-Versand.
+Kein RabbitMQ, kein Redis, kein Celery, kein SMTP-Versand.
 
 ## Runtimes einer App-Version
 
@@ -39,14 +39,14 @@ Spec-Validierung gegen `APP_IMAGE_REGISTRY_ALLOWLIST`, `APP_MAX_*`, `APP_VM_IMAG
 ## Ablauf: App deployen
 
 1. `POST /deployments/` prüft Rolle, Freigabe, Eingaben; legt `Deployment` und `Task` (PENDING) in einer Transaktion an (`task_service.prepare_task_in_tx`, höchstens ein PENDING/RUNNING-Task je Deployment, Unique-Index `uq_tasks_active_per_deployment`).
-2. Nach dem Commit sendet `task_service` die Celery-Nachricht in `celery_queue` (Task-ID = `taskId`; Routing `pods.*` → `pods`).
+2. `task_service` legt die Task mit `job` und `job_kwargs` in derselben Transaktion an; der Commit sendet `NOTIFY task_queued`, ein Worker holt sie (`FOR UPDATE SKIP LOCKED`).
 3. Der Worker holt sie (`SKIP LOCKED`), hält eine Lease auf der Task-Zeile, schreibt Fortschritt und Logzeilen in `task_events`, am Ende Status, Transkript und versiegelte Ergebnisse (`tasks.outputs_enc`) in die Task-Zeile.
 4. Trigger `task_events_notify` sendet `NOTIFY task_events`; jeder API-Prozess streamt die Events per `GET /deployments/{id}/stream` (SSE, `id:` = Event-ID, `Last-Event-ID` zum Fortsetzen).
 5. Bei einem Terminal-Event weckt der Hub den Reconciler; `task_finalizer` erledigt die Folgearbeit genau einmal (Soft-Delete nach Destroy).
 
-Abbrechen: `POST /deployments/{id}/cancel` setzt `cancel_requested_at` und sendet `NOTIFY task_cancel`; ein anschließender Destroy wird in `celery_queue.after_task` geparkt und nach der Freigabe (`task_released`) ausgeführt.
+Abbrechen: `POST /deployments/{id}/cancel` setzt `cancel_requested_at` und sendet `NOTIFY task_cancel`; der anschließende Destroy wartet, bis der Worker den abgebrochenen Job losgelassen hat (`NOTIFY task_released`).
 
-Fehlerarten (`failure_kind`): `worker_failure`, `worker_lost`, `celery_infrastructure`, `time_limit` (`task_contract.py`).
+Fehlerarten (`failure_kind`): `worker_failure`, `worker_lost`, `infrastructure`, `time_limit` (`task_contract.py`).
 
 ## Freigabe-Workflow
 
