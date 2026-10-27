@@ -833,7 +833,36 @@ def _vm_workload_objects(
                             "inputs": [{"name": "tablet", "type": "tablet", "bus": "usb"}],
                             "tpm": {},
                         },
-                        "features": {"hyperv": {}, "acpi": {}},
+                        # What KubeVirt's Windows guide asks for (the node offers all of it: hyperv.node.kubevirt.io/*
+                        # labels; KubeVirt schedules the VM only where they exist). With a bare `hyperv: {}` and no clock,
+                        # Windows 11 on the (nested) KVM node locked up after 20-30 minutes: all vCPUs spun in the clock
+                        # interrupt (timer vector in service, IPIs undeliverable), the guest clock stopped, the agent
+                        # went silent.
+                        "features": {
+                            "acpi": {},
+                            "hyperv": {
+                                "relaxed": {},
+                                "vapic": {},
+                                "spinlocks": {"spinlocks": 8191},
+                                "vpindex": {},
+                                "runtime": {},
+                                "synic": {},
+                                "synictimer": {"enabled": True},
+                                "frequencies": {},
+                                "reset": {},
+                                "tlbflush": {},
+                                "ipi": {},
+                            },
+                        },
+                        "clock": {
+                            "utc": {},
+                            "timer": {
+                                "hyperv": {},
+                                "rtc": {"tickPolicy": "catchup"},
+                                "pit": {"tickPolicy": "delay"},
+                                "hpet": {"present": False},
+                            },
+                        },
                         "firmware": {"bootloader": {"efi": {"secureBoot": False}}},
                     },
                     "networks": [{"name": "default", "pod": {}}],
