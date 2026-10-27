@@ -3,8 +3,8 @@
 Every request is decided by the rights on the team's deployment, never by
 role alone (security review H-1, M-2):
 
-- read a team: the owner view of its deployment (owner, admin,
-  course-teacher of a student owner), or membership in that team;
+- read a team: the owner view of its deployment (owner, admin), or
+  membership in that team;
 - list teams: one deployment at a time (``deployment_id``), filtered the
   same way;
 - create, rename, delete a team or change its members: the operate right

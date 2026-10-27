@@ -363,8 +363,6 @@ def test_dashboard_stats_student_does_not_leak_other_data(
     assert body["deployments"] < 5, (
         "student must only see own/team/direct deployments — no global count"
     )
-    # Phase 3 — course-teacher scope is irrelevant for students.
-    assert body["courseScopeDeployments"] == 0
 
 
 # ---------------------------------------------------------------------------

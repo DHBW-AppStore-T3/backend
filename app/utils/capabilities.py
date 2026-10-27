@@ -229,32 +229,16 @@ def ensure_view_deployment_member(user: User, dep: Deployment, db: Session) -> N
 def can_view_deployment_owner(user: User, dep: Deployment, db: Session) -> bool:
     """Owner-view access — tasks, logs, outputs, destroy.
 
-    Read access is granted to the deployment owner, admins, and course-teachers of the owner's
-    course (inspect only) when the owner is a student. Operate rights are
-    separate — see :func:`can_operate_deployment`.
+    The deployment owner and admins, the same people who may operate it
+    (:func:`can_operate_deployment`).
 
-    The course-teacher right never covers another teacher's or an admin's
-    deployment (.github#7 F, security review H-1): a teacher who manages a
-    course must not read a colleague's logs and files by putting them into
-    that course. Since only teachers and admins deploy, this leaves the
-    right for student deployments from before.
+    Course-teachers had an inspect right on their students' deployments.
+    It is gone: only teachers and admins deploy (.github#7 F.4), so it
+    covered no deployment any more, and no list or page led to one. If
+    teachers are to supervise student deployments again, that wants its
+    own endpoint and tests.
     """
-    if user.role == UserRole.ADMIN:
-        return True
-    if str(dep.userId) == str(user.userId):
-        return True
-
-    # Course-teacher inspect right applies only to teachers; other
-    # roles are rejected by the role gate in ``is_course_teacher_id``.
-    if user.role != UserRole.TEACHER:
-        return False
-    owner = getattr(dep, "user", None)
-    if owner is None or getattr(owner, "role", None) != UserRole.STUDENT:
-        return False
-    owner_course_id = getattr(owner, "courseId", None)
-    if owner_course_id is None:
-        return False
-    return is_course_teacher_id(user, owner_course_id, db)
+    return user.role == UserRole.ADMIN or str(dep.userId) == str(user.userId)
 
 
 def ensure_view_deployment_owner(user: User, dep: Deployment, db: Session) -> None:
@@ -302,24 +286,6 @@ def is_course_teacher_id(user: User, course_id: UUID, db: Session) -> bool:
         .first()
     )
     return row is not None
-
-
-def get_my_course_teacher_ids(user: User, db: Session) -> set[UUID]:
-    """Load the set of course IDs ``user`` is a designated teacher of.
-
-    Returns the empty set for non-teacher roles. Intended to be called
-    once per request and threaded into list-shaping helpers to avoid an
-    ``is_course_teacher`` query per row (N+1); currently the data source
-    for the ``?scope=course`` filter on the deployments list.
-    """
-    if user.role != UserRole.TEACHER:
-        return set()
-    rows = (
-        db.query(CourseTeacher.courseId)
-        .filter(CourseTeacher.userId == user.userId)
-        .all()
-    )
-    return {row[0] for row in rows}
 
 
 def can_view_course_detail(user: User) -> bool:
@@ -428,7 +394,6 @@ __all__ = [
     # Courses
     "is_course_teacher",
     "is_course_teacher_id",
-    "get_my_course_teacher_ids",
     "can_view_course_detail",
     "ensure_view_course_detail",
     "can_edit_course",
