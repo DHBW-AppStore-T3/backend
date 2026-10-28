@@ -19,11 +19,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import logging
+from collections.abc import Callable
 
 from fastapi import HTTPException, status
 
+from app.config import settings
 from app.services import malware_scan
 from app.services.upload_validation import UploadRejected, inspect_upload
 from app.task_contract import USER_INPUT_VARIABLES_KEYS, user_input_variables
@@ -50,7 +53,7 @@ _MAX_FILE_BYTES_PER_DEPLOYMENT = 10 * 1024 * 1024
 _UPLOAD_REJECTION_REASONS = frozenset({
     "file_var_collision", "file_var_empty", "file_extension_rejected", "file_b64_invalid",
     "file_size_mismatch", "file_too_large", "deployment_files_too_large", "file_content_rejected",
-    "upload_scan_unavailable",
+    "upload_scan_unavailable", "owner_storage_quota_exceeded", "upload_storage_full",
 })
 
 
@@ -71,10 +74,69 @@ def log_rejected_upload(user_id, exc: HTTPException) -> None:
     )
 
 
+def log_accepted_uploads(user_id, deployment_id, accepted: list[dict]) -> None:
+    """One structured line per stored file: who put which bytes into which deployment.
+
+    ``upload_accepted user=<id> deployment=<id> variable=<name> slot=<slot> size=<bytes> sha256=<hex>``.
+    The hash identifies the content without keeping it, so that a file that turns out to be
+    harmful can be traced to the account and the deployments that took it. Like the refused
+    ones, only fixed codes and the names the platform chose go in, never the client's file name.
+    """
+    for entry in accepted:
+        logger.info(
+            "upload_accepted user=%s deployment=%s variable=%s slot=%s size=%d sha256=%s",
+            user_id, deployment_id, json.dumps(str(entry["variable"])), json.dumps(str(entry["slot"])),
+            entry["size"], entry["sha256"],
+        )
+
+
+def check_upload_quota(
+    files: dict | None,
+    owner_stored: Callable[[], int],
+    total_stored: Callable[[], int],
+) -> None:
+    """Refuse an upload that would take more database space than the owner or the platform may use.
+
+    ``owner_stored`` / ``total_stored`` give the bytes already stored (called only when the request
+    carries files and a limit is set). The size counted for the new files is their base64 length,
+    which is what ends up in the row. Runs before anything is decoded or scanned.
+    """
+    if not files:
+        return
+    per_owner = settings.MAX_STORED_INPUT_BYTES_PER_OWNER
+    overall = settings.MAX_STORED_INPUT_BYTES_TOTAL
+    if per_owner <= 0 and overall <= 0:
+        return
+    incoming = sum(
+        len(upload.content_b64)
+        for slot_map in files.values()
+        if isinstance(slot_map, dict)
+        for upload in slot_map.values()
+    )
+    if per_owner > 0:
+        used = owner_stored()
+        if used + incoming > per_owner:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail={
+                    "reason": "owner_storage_quota_exceeded",
+                    "limit_bytes": per_owner,
+                    "used_bytes": used,
+                    "needed_bytes": incoming,
+                },
+            )
+    if overall > 0 and total_stored() + incoming > overall:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"reason": "upload_storage_full"},
+        )
+
+
 def attach_files_to_user_input(
     user_input_var: dict | None,
     files: dict | None,
     variable_definitions: list[dict] | None = None,
+    accepted: list[dict] | None = None,
 ) -> dict:
     """Validate and merge wizard-uploaded files into ``userInputVar``.
 
@@ -98,6 +160,9 @@ def attach_files_to_user_input(
         (lowercased, after the last dot) must be in the allowed list.
         Defense-in-depth: the wizard's ``accept`` attribute already
         filters in the picker, but a hand-crafted POST could bypass it.
+
+    ``accepted``, if given, receives one ``{variable, slot, size, sha256}`` per stored file,
+    for :func:`log_accepted_uploads`.
 
     Raises ``HTTPException(413)`` for size violations and
     ``HTTPException(422)`` for malformed payload — Pydantic already
@@ -265,6 +330,15 @@ def attach_files_to_user_input(
                     detail={"reason": "upload_scan_unavailable", "message": str(failed)},
                 )
 
+            if accepted is not None:
+                accepted.append(
+                    {
+                        "variable": var_name,
+                        "slot": slot_key,
+                        "size": len(decoded),
+                        "sha256": hashlib.sha256(decoded).hexdigest(),
+                    }
+                )
             stored_name = safe_filename(upload.name)
             encoded_slots[slot_key] = {
                 # Stored as a plain file name: apps write it to disk and the

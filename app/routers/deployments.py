@@ -66,7 +66,9 @@ from app.services import (
 )
 from app.services.deployment_input import (
     attach_files_to_user_input,
+    check_upload_quota,
     is_stored_file_var,
+    log_accepted_uploads,
     log_rejected_upload,
     parse_and_strip_user_input,
     validate_scoped_user_input,
@@ -445,11 +447,19 @@ def create_deployment(
     # the row never enters the DB. When variable definitions are
     # available, the helper also enforces the app author's declared
     # ``fileExtensions`` filter on each upload name.
+    accepted_uploads: list[dict] = []
     try:
+        # Space first (the file bytes are in the request already, but not yet decoded or scanned).
+        check_upload_quota(
+            deployment.files,
+            lambda: crud_deployments.stored_input_bytes(db, current_user.userId),
+            lambda: crud_deployments.stored_input_bytes(db),
+        )
         deployment.userInputVar = attach_files_to_user_input(
             deployment.userInputVar,
             deployment.files,
             variable_definitions or None,
+            accepted_uploads,
         )
     except HTTPException as exc:
         log_rejected_upload(current_user.userId, exc)
@@ -536,6 +546,7 @@ def create_deployment(
     )
 
     db.refresh(db_deployment)
+    log_accepted_uploads(current_user.userId, db_deployment.deploymentId, accepted_uploads)
 
     status_value = crud_deployments.get_deployment_status(db, db_deployment.deploymentId)
     created_at = crud_deployments.get_deployment_created_at(db, db_deployment.deploymentId)
