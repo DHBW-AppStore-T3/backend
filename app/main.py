@@ -21,6 +21,7 @@ from app.routers import (
 )
 from app.services.reconciler import run_reconciler
 from app.services.task_events import hub
+from app.utils.body_limit import BodySizeLimit
 from app.utils.cross_site import CrossSiteWriteGuard
 
 logger = logging.getLogger(__name__)
@@ -119,6 +120,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ----------------------------------------------------------------
+# REQUEST BODY SIZE
+# ----------------------------------------------------------------
+# A body is parsed before login and rate limit are looked at: cap it here.
+app.add_middleware(BodySizeLimit, max_bytes=settings.MAX_REQUEST_BODY_BYTES)
 
 # ----------------------------------------------------------------
 # CROSS-SITE WRITES

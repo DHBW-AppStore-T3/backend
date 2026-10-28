@@ -469,6 +469,19 @@ def count_live_workloads(db: Session, user_id: UUID) -> int:
     return int(total or 0)
 
 
+def stored_input_bytes(db: Session, user_id: UUID | None = None) -> int:
+    """Bytes that the deployments' ``userInputVar`` take in the database (all rows, or one owner's).
+
+    That is where uploaded files live (as base64); ``pg_column_size`` is what the value takes on
+    disk and does not read it, so this stays cheap with large rows. A soft-deleted deployment has
+    its files stripped and counts for what is left.
+    """
+    query = db.query(func.coalesce(func.sum(func.pg_column_size(Deployment.userInputVar)), 0))
+    if user_id is not None:
+        query = query.filter(Deployment.userId == user_id)
+    return int(query.scalar() or 0)
+
+
 def create_deployment(
     db: Session,
     deployment: DeploymentCreate,

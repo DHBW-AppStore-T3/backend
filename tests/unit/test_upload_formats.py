@@ -9,6 +9,7 @@ import socketserver
 import struct
 import threading
 import zlib
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -156,9 +157,15 @@ def test_jpeg_gif_and_webp_must_be_whole():
 class _FakeClamd(socketserver.BaseRequestHandler):
     reply = b"stream: OK\0"
     received: list[bytes] = []
+    # What the daemon says to zVERSION (the fixture sets a database built just now).
+    version = b""
 
     def handle(self):
-        assert self.request.recv(10) == b"zINSTREAM\0"
+        command = self.request.recv(10)
+        if command == b"zVERSION\0":
+            self.request.sendall(type(self).version)
+            return
+        assert command == b"zINSTREAM\0"
         data = b""
         while True:
             header = b""
@@ -175,12 +182,20 @@ class _FakeClamd(socketserver.BaseRequestHandler):
         self.request.sendall(type(self).reply)
 
 
+def version_reply(age_days: float) -> bytes:
+    """What clamd answers to zVERSION with a database built ``age_days`` ago."""
+    built = datetime.now(UTC) - timedelta(days=age_days)
+    return f"ClamAV 1.4.3/28166/{built.strftime('%a %b %d %H:%M:%S %Y')}\0".encode()
+
+
 @pytest.fixture
 def clamd():
     server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _FakeClamd)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     _FakeClamd.reply, _FakeClamd.received = b"stream: OK\0", []
+    _FakeClamd.version = version_reply(0)
+    malware_scan._db_age_cache.clear()
     old = (settings.CLAMD_HOST, settings.CLAMD_PORT)
     settings.CLAMD_HOST, settings.CLAMD_PORT = "127.0.0.1", server.server_address[1]
     yield _FakeClamd

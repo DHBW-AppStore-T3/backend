@@ -46,6 +46,22 @@ class Settings(BaseSettings):
     CLAMD_HOST: str = ""
     CLAMD_PORT: int = 3310
     CLAMD_TIMEOUT: float = 20.0
+    # The signature database of the daemon is checked before each scan (cached for a few
+    # minutes). Older than the first number of days: a warning is logged; older than the
+    # second: the upload is refused (503) like with an unreachable daemon, so a scanner whose
+    # updates silently stopped does not wave files through. 0: do not check that limit.
+    CLAMD_WARN_DB_AGE_DAYS: int = 3
+    CLAMD_MAX_DB_AGE_DAYS: int = 7
+
+    # Largest request body the API reads (``app/utils/body_limit.py``): 10 MiB of files are
+    # 13.4 MiB as base64 in JSON, and the frontend's nginx allows 16 MiB as well. 0: no limit.
+    MAX_REQUEST_BODY_BYTES: int = 16 * 1024 * 1024
+    # What uploaded files may take in the database (bytes of ``deployments.userInputVar`` as
+    # stored, i.e. base64): per owner across their deployments, and for everybody together. A
+    # compromised teacher account must not be able to fill the database volume. A deployment
+    # that is deleted gives its files back. 0: no limit.
+    MAX_STORED_INPUT_BYTES_PER_OWNER: int = 256 * 1024 * 1024
+    MAX_STORED_INPUT_BYTES_TOTAL: int = 1024 * 1024 * 1024
 
     # Git: app repositories are public and read anonymously (.github#7 B).
     # Apps may only be registered from these hosts (comma-separated, exact
