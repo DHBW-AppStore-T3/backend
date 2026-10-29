@@ -318,6 +318,50 @@ def test_render_vm_internet_and_pod_network_follow_the_spec():
     assert "10.0.0.0/8" in internet["except"]
 
 
+def _policy(objects, name):
+    return next(o for o in _by_kind(objects, "NetworkPolicy") if o["metadata"]["name"] == name)["spec"]
+
+
+def test_a_closed_vm_namespace_resolves_names_for_the_proxy_only():
+    # The proxy looks up kubernetes.default.svc; the guest has nothing to resolve (and DNS would be a way out).
+    assert _policy(_vm_objects(), "allow-dns")["podSelector"] == {"matchLabels": {"appstore.dhbw/role": "vnc-proxy"}}
+    for opened in ({"egress": "internet"}, {"podNetwork": "namespace"}):
+        assert _policy(_vm_objects({**VALID_VM_SPEC, **opened}), "allow-dns")["podSelector"] == {}
+
+
+def test_a_vm_reaches_the_internet_over_web_ports_and_its_clock_only():
+    spec = {**VALID_VM_SPEC, "egress": "internet"}
+    ports = _policy(_vm_objects(spec), "allow-egress-internet")["egress"][0]["ports"]
+    assert ports == [
+        {"protocol": "TCP", "port": 80},
+        {"protocol": "TCP", "port": 443},
+        {"protocol": "UDP", "port": 123},
+    ]
+
+
+def test_the_proxy_reaches_only_the_kubernetes_api_when_its_addresses_are_known():
+    peers = lambda objects: _policy(objects, "allow-vnc-proxy-to-apiserver")["egress"][0]["to"]  # noqa: E731
+    assert peers(_vm_objects()) == [{"ipBlock": {"cidr": "0.0.0.0/0"}}, {"ipBlock": {"cidr": "::/0"}}]
+    known = RenderSettings(zone="z", kube_api_cidrs=("fd00:43::1/128", "10.43.0.1/32"))
+    assert peers(_vm_objects(settings=known)) == [
+        {"ipBlock": {"cidr": "fd00:43::1/128"}},
+        {"ipBlock": {"cidr": "10.43.0.1/32"}},
+    ]
+
+
+def test_vms_that_may_talk_are_found_by_name_and_as_a_group():
+    objects = _vm_objects({**VALID_VM_SPEC, "podNetwork": "namespace"})
+    services = {o["metadata"]["name"]: o["spec"] for o in _by_kind(objects, "Service")}
+    vm_services = {n: s for n, s in services.items() if n not in ("peers",) and not n.endswith("-novnc")}
+    assert vm_services and all(s["clusterIP"] == "None" for s in vm_services.values())
+    assert all(s["selector"]["appstore.dhbw/role"] == "vm" for s in vm_services.values())
+    assert services["peers"]["selector"] == {
+        "appstore.dhbw/deployment-id": DEP.id,
+        "appstore.dhbw/role": "vm",
+    }  # the proxies are not peers
+    assert "peers" not in {o["metadata"]["name"] for o in _by_kind(_vm_objects(), "Service")}
+
+
 def test_the_vm_image_namespace_must_be_one_the_platform_allows():
     spec = copy.deepcopy(VALID_VM_SPEC)
     spec["vm"]["imageNamespace"] = "kube-system"
