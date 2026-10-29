@@ -288,8 +288,7 @@ jobs:
           path: coverage-html
           retention-days: 14
 
-      - name: Test Coverage Gate (enforce on main)
-        if: github.ref == 'refs/heads/main' || github.base_ref == 'main'
+      - name: Test Coverage Gate
         run: |
           MIN_COVERAGE=70.0
           PCT=$(python -c "import json; print(round(json.load(open('coverage-html/coverage.json'))['totals']['percent_covered'], 1))")
