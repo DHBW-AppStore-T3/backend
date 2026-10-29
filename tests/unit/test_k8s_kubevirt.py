@@ -555,3 +555,69 @@ def test_the_proxy_image_is_configurable_and_defaults_to_latest():
     image = lambda objs: of_kind(objs, "Deployment")[0]["spec"]["template"]["spec"]["containers"][0]["image"]  # noqa: E731
     assert image(default) == "ghcr.io/dhbw-appstore-t3/novnc-proxy:latest"
     assert image(pinned) == "ghcr.io/x/novnc@sha256:abc"
+
+
+# ── the rules of a VM spec that rejected nothing in the tests so far ──────────────────────────────────
+
+
+def _vm_spec(**vm_changes):
+    data = copy.deepcopy(VALID_VM_SPEC)
+    data["vm"].update(vm_changes)
+    return data
+
+
+VM_BOUNDS = {"cpuCores": {"min": 2, "max": 8}, "memoryGiB": {"min": 4, "max": 16}}
+
+
+def _vm_errors(data):
+    with pytest.raises(SpecValidationError) as exc:
+        parse_spec(data)
+    return [e["msg"] for e in exc.value.errors]
+
+
+@pytest.mark.parametrize(
+    "vm_changes, message",
+    [
+        ({"imageNamespace": "Bad_Namespace"}, "invalid imageNamespace"),
+        (
+            {"bounds": {**VM_BOUNDS, "memoryGiB": {"min": 2, "max": 4}}},
+            "memoryGiB (the default) must lie within",
+        ),
+        (
+            {"bounds": {**VM_BOUNDS, "cpuCores": {"min": 2, "max": 32}}},
+            "bounds exceed the VM limits",
+        ),
+        (
+            {"bounds": {**VM_BOUNDS, "memoryGiB": {"min": 1, "max": 16}}},
+            "bounds exceed the VM limits",
+        ),
+        ({"bounds": {**VM_BOUNDS, "cpuCores": {"min": 8, "max": 2}}}, "min must not exceed max"),
+    ],
+    ids=[
+        "image namespace that is no name",
+        "default memory outside its bounds",
+        "more cores than the platform grants",
+        "less memory than the platform needs",
+        "bounds the wrong way round",
+    ],
+)
+def test_a_vm_spec_that_breaks_a_rule_is_rejected_with_that_rule(vm_changes, message):
+    messages = _vm_errors(_vm_spec(**vm_changes))
+
+    assert any(message in text for text in messages), messages
+
+
+def test_vm_bounds_inside_the_platform_limits_are_accepted():
+    spec = parse_spec(_vm_spec(bounds=VM_BOUNDS))
+
+    assert spec.vm.bounds.cpu_cores.max == 8 and spec.vm.bounds.memory_gib.min == 4
+
+
+def test_render_vm_refuses_a_pod_spec_and_a_deployment_without_workloads():
+    pod_spec = parse_spec(VALID)
+    with pytest.raises(ValueError, match="only supports runtime 'kubevirt-vm'"):
+        render_vm(pod_spec, DEP, TEAMS, SETTINGS, {"team-a-alice": "pw"})
+
+    vm_spec = parse_spec(VALID_VM_SPEC)
+    with pytest.raises(ValueError, match="no workloads: teams are empty"):
+        render_vm(vm_spec, DEP, [], SETTINGS, {})

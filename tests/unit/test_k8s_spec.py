@@ -502,3 +502,145 @@ def test_a_setting_that_is_always_on_cannot_be_switched_off():
     with pytest.raises(SpecValidationError) as exc:
         apply_network_overrides(spec, {"internet": False})
     assert [(e["loc"], e["msg"]) for e in exc.value.errors] == [("network.internet", "this setting cannot be changed")]
+
+# The rules that reject a malformed appstore.yaml. The spec comes from an app author (a teacher account that
+# may be compromised) and is validated again by the worker before anything is created; each rule below is
+# one a regression could drop silently.
+# ----------------------------------------------------------------
+
+
+def _first_container(data):
+    return data["workload"]["containers"][0]
+
+
+def _second_container(data):
+    second = copy.deepcopy(_first_container(data))
+    del second["expose"]  # only one container may be exposed
+    return second
+
+
+MALFORMED = {
+    "memory is no quantity": (
+        lambda d: _first_container(d)["resources"].update(memory="lots"),
+        "invalid memory quantity",
+    ),
+    "scheduler request above the limit": (
+        lambda d: _first_container(d)["resources"].update(
+            requests={"cpu": "100m", "memory": "2Gi"}
+        ),
+        "requests.memory must not exceed memory",
+    ),
+    "cpu bounds the wrong way round": (
+        lambda d: _first_container(d).update(
+            resourceBounds={
+                "cpu": {"min": "2", "max": "1"},
+                "memory": {"min": "512Mi", "max": "2Gi"},
+            }
+        ),
+        "cpu.min must not exceed cpu.max",
+    ),
+    "memory bounds the wrong way round": (
+        lambda d: _first_container(d).update(
+            resourceBounds={
+                "cpu": {"min": "250m", "max": "1"},
+                "memory": {"min": "2Gi", "max": "1Gi"},
+            }
+        ),
+        "memory.min must not exceed memory.max",
+    ),
+    "default memory outside its bounds": (
+        lambda d: _first_container(d).update(
+            resourceBounds={
+                "cpu": {"min": "250m", "max": "1"},
+                "memory": {"min": "2Gi", "max": "4Gi"},
+            }
+        ),
+        "resources.memory (the default) must lie within resourceBounds.memory",
+    ),
+    "environment variable name that is no shell name": (
+        lambda d: _first_container(d)["env"].append({"name": "1-bad", "value": "x"}),
+        "invalid environment variable name",
+    ),
+    "container name in capitals": (
+        lambda d: _first_container(d).update(name="IDE"),
+        "invalid container name",
+    ),
+    "storage size that is no size": (
+        lambda d: d["workload"]["storage"].update(size="5GB"),
+        "invalid storage size",
+    ),
+    "two containers with one name": (
+        lambda d: d["workload"]["containers"].append(_second_container(d)),
+        "container names must be unique",
+    ),
+    "app name with a space": (
+        lambda d: d.update(name="Online IDE"),
+        "invalid app name",
+    ),
+    "variable name that is no name": (
+        lambda d: d["variables"][1].update(name="Bad Name!"),
+        "invalid variable name",
+    ),
+    "two variables with one name": (
+        lambda d: d["variables"].append(copy.deepcopy(d["variables"][1])),
+        "variable names must be unique",
+    ),
+    "file variable without a mount path": (
+        lambda d: d["variables"][0].pop("mountPath"),
+        "file variables need an absolute mountPath",
+    ),
+    "file size that is no size": (
+        lambda d: d["variables"][0].update(maxSize="big"),
+        "invalid size",
+    ),
+    "enum variable without values": (
+        lambda d: d["variables"][1].pop("values"),
+        "enum variables need 'values'",
+    ),
+    "enum default that is not one of its values": (
+        lambda d: d["variables"][1].update(default="huge"),
+        "default must be one of 'values'",
+    ),
+    "url access without a template": (
+        lambda d: d["access"].__setitem__(0, {"type": "url"}),
+        "url access needs 'template'",
+    ),
+    "password access without a source": (
+        lambda d: d["access"].__setitem__(1, {"type": "password", "username": "{user}"}),
+        "password access needs 'from: generated-password'",
+    ),
+}
+
+
+@pytest.mark.parametrize("mutate, message", MALFORMED.values(), ids=MALFORMED.keys())
+def test_a_malformed_spec_is_rejected_with_the_rule_it_breaks(mutate, message):
+    errs = errors_of(spec_with(mutate))
+
+    assert any(message in text for text in errs.values()), errs
+
+
+def test_the_unmodified_spec_these_cases_start_from_is_valid():
+    # Guards the table above: a case must fail because of its one change, not because the base is broken.
+    assert parse_spec(VALID).name == "online-ide"
+
+
+def test_resource_choices_that_are_not_a_mapping_of_containers_are_refused():
+    from app.k8s.spec import apply_resource_overrides
+
+    spec = parse_spec(VALID)
+
+    for nonsense in (["ide"], "ide", 42):
+        with pytest.raises(SpecValidationError) as exc:
+            apply_resource_overrides(spec, nonsense)
+        assert exc.value.errors == [
+            {"loc": "resources", "msg": "must map container names to cpu/memory"}
+        ]
+
+
+def test_no_resource_choice_leaves_the_spec_as_it_is():
+    from app.k8s.spec import apply_resource_overrides
+
+    spec = parse_spec(VALID)
+
+    assert apply_resource_overrides(spec, None) is spec
+    assert apply_resource_overrides(spec, {}) is spec
