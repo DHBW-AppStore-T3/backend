@@ -290,7 +290,7 @@ jobs:
 
       - name: Test Coverage Gate
         run: |
-          MIN_COVERAGE=70.0
+          MIN_COVERAGE=85.0
           PCT=$(python -c "import json; print(round(json.load(open('coverage-html/coverage.json'))['totals']['percent_covered'], 1))")
           echo "Current coverage: ${PCT}%, required minimum: ${MIN_COVERAGE}%"
           if (( $(echo "$PCT < $MIN_COVERAGE" | bc -l) )); then
