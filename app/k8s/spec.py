@@ -144,7 +144,7 @@ def limits_from(
     vm_image_namespaces: str | None = None,
 ) -> PlatformLimits:
     """Platform limits from their settings (``APP_IMAGE_REGISTRY_ALLOWLIST``, ``APP_MAX_*``, ``APP_VM_IMAGE_NAMESPACES``)."""
-    extra = {}
+    extra: dict[str, Any] = {}
     if vm_image_namespaces is not None:
         extra["vm_image_namespaces"] = tuple(n.strip() for n in vm_image_namespaces.split(",") if n.strip())
     return PlatformLimits(
@@ -731,22 +731,22 @@ def resource_choices(spec: AppSpec, limits: PlatformLimits | None = None) -> lis
             }
         ]
     for c in spec.workload.containers if spec.workload else []:
-        b = c.resource_bounds
-        if b is None:
+        rb = c.resource_bounds
+        if rb is None:
             continue
-        cpu_max = min(parse_cpu_millicores(b.cpu.max), limits.max_cpu_millicores)
-        mem_max = min(parse_memory_mib(b.memory.max), limits.max_memory_mib)
+        cpu_max = min(parse_cpu_millicores(rb.cpu.max), limits.max_cpu_millicores)
+        mem_max = min(parse_memory_mib(rb.memory.max), limits.max_memory_mib)
         out.append(
             {
                 "container": c.name,
                 "cpu": {
                     "default": c.resources.cpu,
-                    "min": b.cpu.min,
+                    "min": rb.cpu.min,
                     "max": _format_cpu(cpu_max),
                 },
                 "memory": {
                     "default": c.resources.memory,
-                    "min": b.memory.min,
+                    "min": rb.memory.min,
                     "max": _format_memory(mem_max),
                 },
             }
