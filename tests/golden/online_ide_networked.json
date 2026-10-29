@@ -34,7 +34,7 @@
         "requests.cpu": "3000m",
         "requests.memory": "6144Mi",
         "requests.storage": "30720Mi",
-        "services": "6",
+        "services": "7",
         "services.loadbalancers": "0",
         "services.nodeports": "0"
       }
@@ -188,28 +188,61 @@
     "spec": {
       "egress": [
         {
+          "ports": [
+            {
+              "port": 80,
+              "protocol": "TCP"
+            },
+            {
+              "port": 443,
+              "protocol": "TCP"
+            }
+          ],
           "to": [
             {
               "ipBlock": {
                 "cidr": "0.0.0.0/0",
                 "except": [
+                  "0.0.0.0/8",
                   "10.0.0.0/8",
+                  "100.64.0.0/10",
+                  "127.0.0.0/8",
+                  "169.254.0.0/16",
                   "172.16.0.0/12",
+                  "192.0.0.0/24",
                   "192.168.0.0/16",
-                  "169.254.0.0/16"
+                  "198.18.0.0/15",
+                  "224.0.0.0/3"
                 ]
               }
             }
           ]
         },
         {
+          "ports": [
+            {
+              "port": 80,
+              "protocol": "TCP"
+            },
+            {
+              "port": 443,
+              "protocol": "TCP"
+            }
+          ],
           "to": [
             {
               "ipBlock": {
                 "cidr": "::/0",
                 "except": [
+                  "::1/128",
+                  "64:ff9b::/96",
+                  "64:ff9b:1::/48",
+                  "100::/64",
+                  "2002::/16",
                   "fc00::/7",
-                  "fe80::/10"
+                  "fe80::/10",
+                  "fec0::/10",
+                  "ff00::/8"
                 ]
               }
             }
@@ -237,12 +270,6 @@
     "spec": {
       "egress": [
         {
-          "ports": [
-            {
-              "port": 8080,
-              "protocol": "TCP"
-            }
-          ],
           "to": [
             {
               "podSelector": {}
@@ -255,12 +282,6 @@
           "from": [
             {
               "podSelector": {}
-            }
-          ],
-          "ports": [
-            {
-              "port": 8080,
-              "protocol": "TCP"
             }
           ]
         }
@@ -469,6 +490,8 @@
       "namespace": "dep-123e4567"
     },
     "spec": {
+      "clusterIP": "None",
+      "ipFamilyPolicy": "PreferDualStack",
       "ports": [
         {
           "name": "http",
@@ -729,6 +752,8 @@
       "namespace": "dep-123e4567"
     },
     "spec": {
+      "clusterIP": "None",
+      "ipFamilyPolicy": "PreferDualStack",
       "ports": [
         {
           "name": "http",
@@ -989,6 +1014,8 @@
       "namespace": "dep-123e4567"
     },
     "spec": {
+      "clusterIP": "None",
+      "ipFamilyPolicy": "PreferDualStack",
       "ports": [
         {
           "name": "http",
@@ -1249,6 +1276,8 @@
       "namespace": "dep-123e4567"
     },
     "spec": {
+      "clusterIP": "None",
+      "ipFamilyPolicy": "PreferDualStack",
       "ports": [
         {
           "name": "http",
@@ -1509,6 +1538,8 @@
       "namespace": "dep-123e4567"
     },
     "spec": {
+      "clusterIP": "None",
+      "ipFamilyPolicy": "PreferDualStack",
       "ports": [
         {
           "name": "http",
@@ -1769,6 +1800,8 @@
       "namespace": "dep-123e4567"
     },
     "spec": {
+      "clusterIP": "None",
+      "ipFamilyPolicy": "PreferDualStack",
       "ports": [
         {
           "name": "http",
@@ -1830,6 +1863,26 @@
           "secretName": "team-c-frank-tls"
         }
       ]
+    }
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Service",
+    "metadata": {
+      "labels": {
+        "app.kubernetes.io/managed-by": "appstore",
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000",
+        "appstore.dhbw/owner": "11111111-2222-4333-8444-555555555555"
+      },
+      "name": "peers",
+      "namespace": "dep-123e4567"
+    },
+    "spec": {
+      "clusterIP": "None",
+      "ipFamilyPolicy": "PreferDualStack",
+      "selector": {
+        "appstore.dhbw/deployment-id": "123e4567-e89b-12d3-a456-426614174000"
+      }
     }
   }
 ]

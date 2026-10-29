@@ -326,8 +326,9 @@ def _networked(**choices):
 
 
 def test_network_defaults_are_off_and_not_changeable():
-    spec = parse_spec(VALID)
-    assert spec.pod_network == "none" and spec.user_choices is None
+    spec = parse_spec({k: v for k, v in VALID.items() if k != "egress"})
+    assert spec.egress == "none" and spec.pod_network == "none"
+    assert not spec.network.internet.allowed and not spec.network.pod_network.allowed
 
 
 def test_unknown_user_choice_and_pod_network_value_are_rejected():
@@ -338,8 +339,7 @@ def test_unknown_user_choice_and_pod_network_value_are_rejected():
 def test_network_override_sets_both_values_and_keeps_the_original():
     from app.k8s.spec import apply_network_overrides
 
-    spec = parse_spec(_networked(internet=True, podNetwork=True))
-    spec.egress = "none"
+    spec = parse_spec({**_networked(internet=True, podNetwork=True), "egress": "none"})
     out = apply_network_overrides(spec, {"internet": True, "podNetwork": True})
     assert out.egress == "internet" and out.pod_network == "namespace"
     assert spec.egress == "none" and spec.pod_network == "none"
@@ -414,6 +414,95 @@ def test_network_override_refuses_a_falsy_non_mapping(choice):
 
 
 # ----------------------------------------------------------------
+# network: {internet: {allowed, default}, podNetwork: {allowed, default}}
+# ----------------------------------------------------------------
+def _with_network(network):
+    data = {k: v for k, v in copy.deepcopy(VALID).items() if k != "egress"}
+    return {**data, "network": network}
+
+
+@pytest.mark.parametrize(
+    ("setting", "fixed_on", "offered"),
+    [
+        ({}, False, False),  # never available
+        ({"allowed": False, "default": True}, True, False),  # always on, no choice
+        ({"allowed": True, "default": False}, False, True),  # a choice, starting off
+        ({"allowed": True, "default": True}, True, True),  # a choice, starting on
+    ],
+)
+def test_network_setting_states_decide_the_value_and_whether_it_is_offered(setting, fixed_on, offered):
+    from app.k8s.spec import network_choices
+
+    spec = parse_spec(_with_network({"internet": setting}))
+    assert (spec.egress == "internet") is fixed_on
+    assert ("internet" in network_choices(spec)) is offered
+    assert spec.pod_network == "none" and "podNetwork" not in network_choices(spec)
+
+
+def test_network_block_rejects_unknown_keys_and_non_booleans():
+    assert "network.dns" in errors_of(_with_network({"dns": {"allowed": True}}))
+    assert "network.internet.allowed" in errors_of(_with_network({"internet": {"allowed": "yes"}}))
+    assert "network.podNetwork.default" in errors_of(_with_network({"podNetwork": {"default": 1}}))
+    assert "network.internet.ports" in errors_of(_with_network({"internet": {"ports": [25]}}))
+
+
+def test_network_block_cannot_be_mixed_with_the_older_keys():
+    for legacy in ({"egress": "internet"}, {"podNetwork": "namespace"}, {"userChoices": {"internet": True}}):
+        data = {**_with_network({"internet": {"allowed": True}}), **legacy}
+        assert "cannot be combined" in errors_of(data)["<root>"]
+
+
+@pytest.mark.parametrize(
+    ("legacy", "internet", "pod_network"),
+    [
+        ({}, {"allowed": False, "default": False}, {"allowed": False, "default": False}),
+        ({"egress": "internet"}, {"allowed": False, "default": True}, {"allowed": False, "default": False}),
+        (
+            {"egress": "internet", "userChoices": {"internet": True}},
+            {"allowed": True, "default": True},
+            {"allowed": False, "default": False},
+        ),
+        (
+            {"podNetwork": "namespace", "userChoices": {"podNetwork": True}},
+            {"allowed": False, "default": False},
+            {"allowed": True, "default": True},
+        ),
+    ],
+)
+def test_older_network_keys_read_as_the_same_network_block(legacy, internet, pod_network):
+    data = {k: v for k, v in copy.deepcopy(VALID).items() if k != "egress"} | legacy
+    network = parse_spec(data).network.model_dump(by_alias=True)
+    assert network == {"internet": internet, "podNetwork": pod_network}
+
+
+def test_the_job_payload_carries_the_network_block_and_not_the_older_keys():
+    spec = parse_spec(VALID)  # says egress: internet
+    dumped = spec.model_dump(mode="json", by_alias=True, exclude_none=True)
+    assert dumped["network"]["internet"] == {"allowed": False, "default": True}
+    assert not {"egress", "podNetwork", "userChoices"} & set(dumped)
+    assert parse_spec(dumped).egress == "internet"  # and the worker reads it back unchanged
+
+
+def test_a_person_s_choice_makes_the_spec_fixed_and_keeps_the_original():
+    from app.k8s.spec import apply_network_overrides
+
+    spec = parse_spec(_with_network({"internet": {"allowed": True, "default": True}, "podNetwork": {"allowed": True}}))
+    out = apply_network_overrides(spec, {"internet": False, "podNetwork": True})
+    assert out.egress == "none" and out.pod_network == "namespace"
+    assert not out.network.internet.allowed and not out.network.pod_network.allowed  # fixed: no second choice
+    assert spec.egress == "internet" and spec.network.internet.allowed  # the reviewed spec is untouched
+    # fixed values survive the round trip to the worker
+    assert parse_spec(out.model_dump(mode="json", by_alias=True, exclude_none=True)).egress == "none"
+
+
+def test_a_setting_that_is_always_on_cannot_be_switched_off():
+    from app.k8s.spec import apply_network_overrides
+
+    spec = parse_spec(_with_network({"internet": {"allowed": False, "default": True}}))
+    with pytest.raises(SpecValidationError) as exc:
+        apply_network_overrides(spec, {"internet": False})
+    assert [(e["loc"], e["msg"]) for e in exc.value.errors] == [("network.internet", "this setting cannot be changed")]
+
 # The rules that reject a malformed appstore.yaml. The spec comes from an app author (a teacher account that
 # may be compromised) and is validated again by the worker before anything is created; each rule below is
 # one a regression could drop silently.

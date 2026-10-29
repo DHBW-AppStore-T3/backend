@@ -367,8 +367,41 @@ def _check_placeholders(template: str, allowed: set[str]) -> None:
             raise ValueError(f"unknown placeholder {{{field_name}}} (allowed: {', '.join(sorted(allowed))})")
 
 
-class UserChoices(_Strict):
-    """Settings the author lets the person deploying change (opt-in, off by default)."""
+class NetworkSetting(_Strict):
+    """One network capability: may the person deploying change it, and what is it by default?
+
+    ======== ======= ==========================================================
+    allowed  default meaning
+    ======== ======= ==========================================================
+    false    false   never available (the default of every capability)
+    false    true    always on, not a choice
+    true     false   a choice in the wizard, starting off
+    true     true    a choice in the wizard, starting on
+    ======== ======= ==========================================================
+
+    Two booleans cover all four states without an invalid combination. Once a
+    person has chosen, the spec the worker gets has ``allowed: false`` and the
+    chosen value as ``default``: such a spec is fixed and valid on its own.
+    """
+
+    allowed: StrictBool = False
+    default: StrictBool = False
+
+
+class NetworkSpec(_Strict):
+    """What the pods of a deployment may reach (``network:`` of ``appstore.yaml``).
+
+    ``internet``: the internet over TCP 80/443 (never the cluster, the nodes or
+    private ranges). ``podNetwork``: TCP and UDP on any port between the pods of
+    the same deployment (and nowhere else), with DNS names for them.
+    """
+
+    internet: NetworkSetting = Field(default_factory=NetworkSetting)
+    pod_network: NetworkSetting = Field(default_factory=NetworkSetting, alias="podNetwork")
+
+
+class _LegacyUserChoices(_Strict):
+    """``userChoices`` of apps up to v2.x: the settings the person deploying could change."""
 
     internet: StrictBool = False
     pod_network: StrictBool = Field(default=False, alias="podNetwork")
@@ -438,14 +471,46 @@ class AppSpec(_Strict):
     scope: Literal["team", "user"] = "team"
     workload: Workload | None = None
     vm: VmSpec | None = None
-    egress: Literal["none", "internet"] = "none"
-    pod_network: Literal["none", "namespace"] = Field(default="none", alias="podNetwork")
-    user_choices: UserChoices | None = Field(default=None, alias="userChoices")
+    network: NetworkSpec = Field(default_factory=NetworkSpec)
+    # Up to v2.x an app said ``egress: internet``, ``podNetwork: namespace`` and ``userChoices: {...}``.
+    # Older versions of an app stay deployable: the keys are read exactly as they were and become
+    # ``network`` (see ``_read_legacy_network``). Never written back (``exclude``).
+    legacy_egress: Literal["none", "internet"] | None = Field(default=None, alias="egress", exclude=True)
+    legacy_pod_network: Literal["none", "namespace"] | None = Field(default=None, alias="podNetwork", exclude=True)
+    legacy_user_choices: _LegacyUserChoices | None = Field(default=None, alias="userChoices", exclude=True)
     variables: list[Variable] = Field(default_factory=list)
     access: list[Access] = Field(default_factory=list)
 
+    def _read_legacy_network(self) -> None:
+        # Absent is fine, an explicit null is not (it never was for these two).
+        for attr, key in (("legacy_egress", "egress"), ("legacy_pod_network", "podNetwork")):
+            if attr in self.model_fields_set and getattr(self, attr) is None:
+                raise ValueError(f"{key}: must not be null")
+        keys = {"legacy_egress", "legacy_pod_network", "legacy_user_choices"}
+        if "network" in self.model_fields_set and keys & self.model_fields_set:
+            raise ValueError("network: cannot be combined with the older egress / podNetwork / userChoices")
+        legacy = (self.legacy_egress, self.legacy_pod_network, self.legacy_user_choices)
+        if all(v is None for v in legacy):
+            return
+        choices = self.legacy_user_choices or _LegacyUserChoices()
+        self.network = NetworkSpec(
+            internet=NetworkSetting(allowed=choices.internet, default=self.legacy_egress == "internet"),
+            podNetwork=NetworkSetting(allowed=choices.pod_network, default=self.legacy_pod_network == "namespace"),
+        )
+        self.legacy_egress = self.legacy_pod_network = self.legacy_user_choices = None
+
+    @property
+    def egress(self) -> Literal["none", "internet"]:
+        """What a deployment of this spec gets: the default (the choice, in a spec the person has fixed)."""
+        return "internet" if self.network.internet.default else "none"
+
+    @property
+    def pod_network(self) -> Literal["none", "namespace"]:
+        return "namespace" if self.network.pod_network.default else "none"
+
     @model_validator(mode="after")
     def _check(self) -> AppSpec:
+        self._read_legacy_network()
         if not _NAME_RE.match(self.name):
             raise ValueError(f"invalid app name {self.name!r} (lowercase letters, digits, '-')")
         if self.runtime == "kubernetes" and self.workload is None:
@@ -758,15 +823,15 @@ def apply_network_overrides(spec: AppSpec, choice: Any) -> AppSpec:
     """A copy of ``spec`` with the network settings a person chose.
 
     ``choice`` is ``{"internet": bool, "podNetwork": bool}`` (either key may be
-    left out). Only keys the author released in ``userChoices`` can be set;
-    the rest keeps the author's value. Raises :class:`SpecValidationError`
-    with one field path per problem.
+    left out and keeps the author's default). Only settings the author marked
+    ``allowed`` can be set. The copy is fixed (``allowed: false``, the choice
+    as ``default``), so the worker renders exactly what was chosen. Raises
+    :class:`SpecValidationError` with one field path per problem.
     """
     if choice is None or choice == {}:
         return spec
     if not isinstance(choice, dict):
         raise SpecValidationError([{"loc": "network", "msg": "must map internet/podNetwork to true or false"}])
-    allowed = spec.user_choices
     errors: list[dict[str, str]] = []
     for key, value in choice.items():
         loc = f"network.{key}"
@@ -774,25 +839,23 @@ def apply_network_overrides(spec: AppSpec, choice: Any) -> AppSpec:
             errors.append({"loc": loc, "msg": "unknown setting (allowed: internet, podNetwork)"})
         elif not isinstance(value, bool):
             errors.append({"loc": loc, "msg": "must be true or false"})
-        elif allowed is None or not (allowed.internet if key == "internet" else allowed.pod_network):
+        elif not (spec.network.internet if key == "internet" else spec.network.pod_network).allowed:
             errors.append({"loc": loc, "msg": "this setting cannot be changed"})
     if errors:
         raise SpecValidationError(errors)
     result = spec.model_copy(deep=True)
     if "internet" in choice:
-        result.egress = "internet" if choice["internet"] else "none"
+        result.network.internet = NetworkSetting(allowed=False, default=choice["internet"])
     if "podNetwork" in choice:
-        result.pod_network = "namespace" if choice["podNetwork"] else "none"
+        result.network.pod_network = NetworkSetting(allowed=False, default=choice["podNetwork"])
     return result
 
 
 def network_choices(spec: AppSpec) -> dict[str, Any]:
-    """What the wizard offers: per released setting the author's default."""
+    """What the wizard offers: per setting the author allows, its default."""
     out: dict[str, Any] = {}
-    if spec.user_choices is None:
-        return out
-    if spec.user_choices.internet:
-        out["internet"] = {"default": spec.egress == "internet"}
-    if spec.user_choices.pod_network:
-        out["podNetwork"] = {"default": spec.pod_network == "namespace"}
+    if spec.network.internet.allowed:
+        out["internet"] = {"default": spec.network.internet.default}
+    if spec.network.pod_network.allowed:
+        out["podNetwork"] = {"default": spec.network.pod_network.default}
     return out

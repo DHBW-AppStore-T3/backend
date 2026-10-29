@@ -48,12 +48,10 @@ class LoadedSpec:
 
     def payload(self) -> dict[str, Any]:
         """The spec as the pod worker gets it in the job (it validates it again)."""
-        data = self.spec.model_dump(mode="json", by_alias=True, exclude_none=True)
-        # Left out at its default so that a worker that predates the field
-        # (it forbids unknown keys) still accepts apps that do not use it.
-        if data.get("podNetwork") == "none":
-            del data["podNetwork"]
-        return data
+        # The spec as parsed (``network:`` block, also for apps that still use the older
+        # egress / podNetwork / userChoices). Deploy the worker first: one that predates the
+        # block forbids unknown keys.
+        return self.spec.model_dump(mode="json", by_alias=True, exclude_none=True)
 
 
 def platform_limits() -> PlatformLimits:

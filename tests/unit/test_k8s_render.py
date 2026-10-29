@@ -148,25 +148,94 @@ def test_network_policy_denies_by_default_and_excludes_internal_ranges_for_both_
     assert "fc00::/7" in blocks["::/0"] and "fe80::/10" in blocks["::/0"]
 
 
-def test_egress_none_has_no_internet_policy():
-    names = {p["metadata"]["name"] for p in of_kind(build({**VALID, "egress": "none"})[1], "NetworkPolicy")}
-    assert names == {"default-deny", "allow-ingress-controller", "allow-dns"}
+def _policy(objs, name):
+    return next(p for p in of_kind(objs, "NetworkPolicy") if p["metadata"]["name"] == name)["spec"]
+
+
+def _names(objs, kind="NetworkPolicy"):
+    return {o["metadata"]["name"] for o in of_kind(objs, kind)}
+
+
+def test_a_pod_that_may_neither_reach_the_internet_nor_its_peers_gets_no_dns():
+    # Nothing to resolve, and DNS (forwarded upstream) would be a way out of an offline pod.
+    assert _names(build({**VALID, "egress": "none"})[1]) == {"default-deny", "allow-ingress-controller"}
+
+
+def test_dns_is_there_when_the_pod_has_something_to_resolve():
+    assert "allow-dns" in _names(build()[1])  # internet
+    assert "allow-dns" in _names(build({**VALID, "egress": "none", "podNetwork": "namespace"})[1])  # peers
 
 
 def test_pod_network_none_has_no_intra_namespace_policy():
     names = {p["metadata"]["name"] for p in of_kind(build()[1], "NetworkPolicy")}
     assert "allow-intra-namespace" not in names
+    assert "peers" not in _names(build()[1], "Service")
 
 
-def test_pod_network_namespace_allows_only_own_pods_on_the_expose_port_both_ways():
-    spec, objs, _ = build({**VALID, "egress": "none", "podNetwork": "namespace"})
-    pol = next(p for p in of_kind(objs, "NetworkPolicy") if p["metadata"]["name"] == "allow-intra-namespace")["spec"]
-    port = [{"protocol": "TCP", "port": spec.workload.containers[0].expose.port}]
+def test_pod_network_namespace_lets_the_deployments_own_pods_talk_on_any_port_both_ways():
+    _, objs, _ = build({**VALID, "egress": "none", "podNetwork": "namespace"})
+    pol = _policy(objs, "allow-intra-namespace")
+    # No ports: TCP, UDP and ICMP, every port. No namespaceSelector or ipBlock: the own namespace only.
     assert pol["podSelector"] == {} and pol["policyTypes"] == ["Ingress", "Egress"]
-    assert pol["ingress"] == [{"from": [{"podSelector": {}}], "ports": port}]
-    assert pol["egress"] == [{"to": [{"podSelector": {}}], "ports": port}]
-    names = {p["metadata"]["name"] for p in of_kind(objs, "NetworkPolicy")}
-    assert names == {"default-deny", "allow-ingress-controller", "allow-dns", "allow-intra-namespace"}
+    assert pol["ingress"] == [{"from": [{"podSelector": {}}]}]
+    assert pol["egress"] == [{"to": [{"podSelector": {}}]}]
+    assert _names(objs) == {"default-deny", "allow-ingress-controller", "allow-dns", "allow-intra-namespace"}
+
+
+def test_pod_network_names_every_pod_and_all_of_them():
+    _, objs, _ = build({**VALID, "podNetwork": "namespace"})
+    services = {s["metadata"]["name"]: s["spec"] for s in of_kind(objs, "Service")}
+    workloads = {n for n in services if n != "peers"}
+    assert len(workloads) == 6
+    # Headless: the name resolves to the pod, so any port works and not just the exposed one.
+    assert all(services[n]["clusterIP"] == "None" for n in workloads)
+    assert all(services[n]["ipFamilyPolicy"] == "PreferDualStack" for n in services)  # A and AAAA
+    assert services["peers"] == {
+        "clusterIP": "None",
+        "ipFamilyPolicy": "PreferDualStack",
+        "selector": {DEPLOYMENT_LABEL: DEP.id},
+    }
+    # and the quota has room for them
+    assert of_kind(objs, "ResourceQuota")[0]["spec"]["hard"]["services"] == "7"
+
+
+def test_without_pod_network_workload_services_keep_their_cluster_address():
+    services = of_kind(build()[1], "Service")
+    assert all("clusterIP" not in s["spec"] for s in services)
+    assert of_kind(build()[1], "ResourceQuota")[0]["spec"]["hard"]["services"] == "6"
+
+
+def test_a_workload_cannot_take_the_name_of_the_peers_service():
+    teams = [Team("peers", (member("alice"),))]
+    with pytest.raises(ValueError, match="peers"):
+        workload_refs(parse_spec({**VALID, "scope": "team", "podNetwork": "namespace"}), teams)
+    # the name is only reserved where the Service exists
+    assert workload_refs(parse_spec({**VALID, "scope": "team"}), teams)[0].name == "peers"
+
+
+def test_internet_is_open_on_web_ports_only_and_never_on_multicast_or_cluster_ranges():
+    pol = _policy(build()[1], "allow-egress-internet")
+    ports = [{"protocol": "TCP", "port": 80}, {"protocol": "TCP", "port": 443}]
+    assert [r["ports"] for r in pol["egress"]] == [ports, ports]
+    v4, v6 = (r["to"][0]["ipBlock"]["except"] for r in pol["egress"])
+    # limited broadcast + multicast, shared and loopback space, the metadata service's range
+    assert {"224.0.0.0/3", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "10.0.0.0/8"} <= set(v4)
+    # IPv6 multicast, and the prefixes that smuggle IPv4 (also private IPv4) through IPv6
+    assert {"ff00::/8", "64:ff9b::/96", "2002::/16", "fc00::/7", "fe80::/10"} <= set(v6)
+
+
+def test_the_open_egress_ports_come_from_the_settings():
+    s = dataclasses.replace(SETTINGS, egress_tcp_ports=(443, 8443))
+    pol = _policy(build(settings=s)[1], "allow-egress-internet")
+    assert pol["egress"][0]["ports"] == [{"protocol": "TCP", "port": 443}, {"protocol": "TCP", "port": 8443}]
+
+
+def test_only_the_ingress_controller_pods_reach_the_apps_when_their_labels_are_known():
+    peer = lambda objs: _policy(objs, "allow-ingress-controller")["ingress"][0]["from"][0]  # noqa: E731
+    assert "podSelector" not in peer(build()[1])
+    s = dataclasses.replace(SETTINGS, ingress_pod_labels={"app.kubernetes.io/name": "traefik"})
+    assert peer(build(settings=s)[1])["podSelector"] == {"matchLabels": {"app.kubernetes.io/name": "traefik"}}
+    assert peer(build(settings=s)[1])["namespaceSelector"] == {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}}
 
 
 def test_extra_egress_except_split_by_family():

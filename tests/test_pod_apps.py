@@ -361,7 +361,11 @@ def test_a_chosen_vm_size_and_network_reach_the_job_but_not_the_review(
     assert response.status_code == 201, response.text
     _, kwargs = queued.last()
     assert (kwargs["spec"]["vm"]["cpuCores"], kwargs["spec"]["vm"]["memoryGiB"]) == (6, 12)
-    assert (kwargs["spec"]["egress"], kwargs["spec"]["podNetwork"]) == ("none", "namespace")
+    # The job carries what was chosen as a fixed spec: the worker renders exactly that.
+    assert kwargs["spec"]["network"] == {
+        "internet": {"allowed": False, "default": False},
+        "podNetwork": {"allowed": False, "default": True},
+    }
     db.expire_all()
     assert (
         db.query(AppVersionApproval).filter_by(appId=app.appId).one().spec_sha256
@@ -1352,7 +1356,10 @@ def test_a_chosen_network_reaches_the_job(client, db, mock_user, pod_repo, queue
 
     assert response.status_code == 201, response.text
     _, kwargs = queued.last()
-    assert kwargs["spec"]["egress"] == "internet" and kwargs["spec"]["podNetwork"] == "namespace"
+    assert kwargs["spec"]["network"] == {
+        "internet": {"allowed": False, "default": True},
+        "podNetwork": {"allowed": False, "default": True},
+    }
 
 
 def test_a_network_choice_without_release_is_refused(client, db, mock_user, pod_repo, queued):
@@ -1391,10 +1398,10 @@ def _body(app, network, teams):
     }
 
 
-def test_the_job_payload_of_an_old_style_spec_has_no_pod_network_key(
+def test_the_job_payload_of_an_old_style_spec_carries_the_network_block_not_the_old_keys(
     client, db, mock_user, pod_repo, queued
 ):
-    # A worker that predates podNetwork forbids unknown keys.
+    # Deploy the worker first: one that predates the network block forbids unknown keys.
     pod_repo(SPEC)
     alice = _student(db, "alice")
     app = _app(db, mock_user)
@@ -1404,7 +1411,8 @@ def test_the_job_payload_of_an_old_style_spec_has_no_pod_network_key(
         client.post("/deployments/", json=_body(app, None, [_team("T", alice)])).status_code == 201
     )
     _, kwargs = queued.last()
-    assert "podNetwork" not in kwargs["spec"] and "userChoices" not in kwargs["spec"]
+    assert not {"egress", "podNetwork", "userChoices"} & set(kwargs["spec"])
+    assert kwargs["spec"]["network"]["internet"] == {"allowed": False, "default": True}  # SPEC says egress: internet
 
 
 def test_the_job_payload_carries_pod_network_when_the_author_sets_it(
@@ -1418,7 +1426,7 @@ def test_the_job_payload_carries_pod_network_when_the_author_sets_it(
     assert (
         client.post("/deployments/", json=_body(app, None, [_team("T", alice)])).status_code == 201
     )
-    assert queued.last()[1]["spec"]["podNetwork"] == "namespace"
+    assert queued.last()[1]["spec"]["network"]["podNetwork"] == {"allowed": False, "default": True}
 
 
 def test_a_network_choice_keeps_the_approved_hash_and_is_stored(
@@ -1434,7 +1442,7 @@ def test_a_network_choice_keeps_the_approved_hash_and_is_stored(
 
     assert response.status_code == 201, response.text
     _, kwargs = queued.last()
-    assert kwargs["spec"]["podNetwork"] == "namespace"
+    assert kwargs["spec"]["network"]["podNetwork"] == {"allowed": False, "default": True}
     db.expire_all()
     assert db.query(AppVersionApproval).filter_by(appId=app.appId).one().spec_sha256 == before
     row = db.get(Deployment, uuid.UUID(response.json()["deploymentId"]))
@@ -1481,3 +1489,85 @@ def test_valid_resources_do_not_save_an_invalid_network_choice(
 
     assert response.status_code == 422 and response.json()["detail"]["reason"] == "invalid_network"
     assert queued() == []
+
+
+# ----------------------------------------------------------------
+# network: {internet, podNetwork: {allowed, default}} of appstore.yaml
+# ----------------------------------------------------------------
+def _network_spec(**network):
+    return {**{k: v for k, v in copy.deepcopy(SPEC).items() if k != "egress"}, "network": network}
+
+
+def test_an_app_decides_what_the_wizard_offers_and_where_it_starts(client, db, mock_user, pod_repo):
+    pod_repo(
+        _network_spec(
+            internet={"allowed": True, "default": True},
+            podNetwork={"allowed": True, "default": False},
+        )
+    )
+    app = _app(db, mock_user)
+    runtime = client.get(f"/apps/{app.appId}/runtime", params={"version": "v1.0"}).json()
+    assert runtime["network"] == {"internet": {"default": True}, "podNetwork": {"default": False}}
+    assert runtime["egress"] == "internet"  # what a deployment gets when nobody changes anything
+
+
+def test_a_setting_the_app_does_not_allow_is_not_offered_and_cannot_be_chosen(
+    client, db, mock_user, pod_repo, queued
+):
+    # No internet for this app (nothing to download), and nobody can switch it on.
+    pod_repo(_network_spec(internet={"allowed": False}, podNetwork={"allowed": True}))
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+    runtime = client.get(f"/apps/{app.appId}/runtime", params={"version": "v1.0"}).json()
+    assert runtime["network"] == {"podNetwork": {"default": False}}
+
+    refused = _deploy_with_network(client, app, {"internet": True}, [_team("T", alice)])
+    assert refused.status_code == 422
+    assert refused.json()["detail"]["errors"] == [
+        {"loc": "network.internet", "msg": "this setting cannot be changed"}
+    ]
+    assert queued() == []  # nothing was started
+
+
+def test_the_start_values_of_the_app_reach_the_job_when_nobody_chooses(
+    client, db, mock_user, pod_repo, queued
+):
+    pod_repo(
+        _network_spec(
+            internet={"allowed": True, "default": True},
+            podNetwork={"allowed": True, "default": True},
+        )
+    )
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+    assert (
+        client.post("/deployments/", json=_body(app, None, [_team("T", alice)])).status_code == 201
+    )
+    assert queued.last()[1]["spec"]["network"] == {
+        "internet": {"allowed": True, "default": True},
+        "podNetwork": {"allowed": True, "default": True},
+    }
+
+
+def test_a_choice_overrides_the_start_value_and_fixes_the_job(client, db, mock_user, pod_repo, queued):
+    pod_repo(
+        _network_spec(
+            internet={"allowed": True, "default": True},
+            podNetwork={"allowed": True, "default": False},
+        )
+    )
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+
+    response = _deploy_with_network(
+        client, app, {"internet": False, "podNetwork": True}, [_team("T", alice)]
+    )
+
+    assert response.status_code == 201, response.text
+    assert queued.last()[1]["spec"]["network"] == {
+        "internet": {"allowed": False, "default": False},
+        "podNetwork": {"allowed": False, "default": True},
+    }

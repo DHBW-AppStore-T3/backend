@@ -50,10 +50,48 @@ ROLE_VM = "vm"
 ROLE_VNC_PROXY = "vnc-proxy"
 VNC_PROXY_ACCOUNT = "vnc-proxy"
 
-# Never reachable from student pods: pod/service/node networks, RFC1918,
-# link-local (incl. metadata service 169.254.169.254), ULA and IPv6 link-local.
-_EGRESS_EXCEPT_V4 = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"]
-_EGRESS_EXCEPT_V6 = ["fc00::/7", "fe80::/10"]
+# Never reachable from student pods: RFC1918, shared (carrier-grade NAT) and
+# link-local space (incl. the metadata service 169.254.169.254), loopback,
+# "this network", benchmarking/IETF ranges, and everything from 224.0.0.0 up
+# (multicast, reserved, the limited broadcast 255.255.255.255); for IPv6 ULA,
+# link-local, site-local, multicast, and the prefixes that carry IPv4 inside
+# IPv6 (NAT64, 6to4), which would bypass the IPv4 entries. The pod,
+# service and node networks come on top (``extra_egress_except``).
+# Mirrored in the chart (``appstore.privateV4``/``privateV6``): its policy only
+# admits a policy whose list contains every one of them.
+_EGRESS_EXCEPT_V4 = [
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.168.0.0/16",
+    "198.18.0.0/15",
+    "224.0.0.0/3",
+]
+_EGRESS_EXCEPT_V6 = [
+    "::1/128",
+    "64:ff9b::/96",
+    "64:ff9b:1::/48",
+    "100::/64",
+    "2002::/16",
+    "fc00::/7",
+    "fe80::/10",
+    "fec0::/10",
+    "ff00::/8",
+]
+# Where "internet" leads: web, package managers, Git over HTTPS. Not SMTP, SSH,
+# scanners' favourites. The chart can widen it (``podApps.egressTcpPorts``).
+DEFAULT_EGRESS_TCP_PORTS = (80, 443)
+# A Windows guest also keeps its clock with NTP.
+_VM_EGRESS_UDP_PORTS = (123,)
+# The headless Service that resolves to every pod of a deployment (see ``_peer_services``).
+PEERS_SERVICE = "peers"
+# The names of the peers resolve to IPv4 and IPv6 addresses where the cluster has both: a student's server that
+# binds IPv4 only (socket.AF_INET) must be reachable too, and the cluster's Services are IPv6 first.
+HEADLESS_FAMILY_POLICY = "PreferDualStack"
 
 # Readiness of the exposed container: the named port ``http`` (= ``expose.port``).
 _READINESS_PROBE: dict[str, Any] = {
@@ -105,6 +143,14 @@ class RenderSettings:
     tolerations: tuple[Mapping[str, str], ...] = ()
     run_as_id: int = 1000
     extra_egress_except: tuple[str, ...] = ()  # pod/service/node CIDRs of the cluster
+    # TCP ports "internet" is open on (DEFAULT_EGRESS_TCP_PORTS).
+    egress_tcp_ports: tuple[int, ...] = DEFAULT_EGRESS_TCP_PORTS
+    # The Kubernetes API as the noVNC proxy reaches it (Service address, the API server's own
+    # address); empty: any address on 443/6443, as before this setting existed.
+    kube_api_cidrs: tuple[str, ...] = ()
+    # Labels of the ingress controller's pods; with them only these pods (not every pod of
+    # ``ingress_namespace``) reach the apps.
+    ingress_pod_labels: Mapping[str, str] = field(default_factory=dict)
     # Hosts are <workload>-<deployment>.<app_domain>. Default apps.<zone>; set it
     # to the zone itself to stay under an existing single-level wildcard certificate.
     app_domain_override: str = ""
@@ -191,6 +237,10 @@ def workload_refs(spec: AppSpec, teams: list[Team]) -> list[WorkloadRef]:
     names = [r.name for r in refs]
     if len(set(names)) != len(names):
         raise ValueError("workload names collide; team names must be distinct after normalisation")
+    if spec.pod_network == "namespace" and PEERS_SERVICE in names:
+        raise ValueError(
+            f"a workload cannot be called {PEERS_SERVICE!r}: that name resolves to all pods of the deployment"
+        )
     return refs
 
 
@@ -268,7 +318,8 @@ def _quota_and_limits(spec: AppSpec, dep: DeploymentCtx, n: int) -> list[dict[st
     hard: dict[str, str] = {
         **total,
         "pods": str(n),
-        "services": str(n),
+        # One per workload, and ``peers`` where the pods may talk to each other.
+        "services": str(n + (1 if spec.pod_network == "namespace" else 0)),
         "services.loadbalancers": "0",
         "services.nodeports": "0",
         "persistentvolumeclaims": str(n if spec.workload.storage else 0),
@@ -320,30 +371,27 @@ def _np_default_deny(dep: DeploymentCtx) -> dict[str, Any]:
 def _np_allow_ingress_controller(
     dep: DeploymentCtx, settings: RenderSettings, port: int, pod_selector: dict[str, Any]
 ) -> dict[str, Any]:
-    """The ingress controller's namespace may reach ``port`` of the selected pods."""
+    """The ingress controller (its pods, when their labels are known) may reach ``port`` of the selected pods."""
+    peer: dict[str, Any] = {
+        "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": settings.ingress_namespace}}
+    }
+    if settings.ingress_pod_labels:
+        peer["podSelector"] = {"matchLabels": dict(settings.ingress_pod_labels)}
     return _netpol(
         dep,
         "allow-ingress-controller",
         {
             "policyTypes": ["Ingress"],
-            "ingress": [
-                {
-                    "from": [
-                        {
-                            "namespaceSelector": {
-                                "matchLabels": {"kubernetes.io/metadata.name": settings.ingress_namespace}
-                            }
-                        }
-                    ],
-                    "ports": [{"protocol": "TCP", "port": port}],
-                }
-            ],
+            "ingress": [{"from": [peer], "ports": [{"protocol": "TCP", "port": port}]}],
         },
         pod_selector,
     )
 
 
-def _np_allow_dns(dep: DeploymentCtx) -> dict[str, Any]:
+def _np_allow_dns(dep: DeploymentCtx, pod_selector: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Cluster DNS for the selected pods (default: all). Only where something is to be resolved:
+    a pod that may reach neither the internet nor its peers has no name to look up, and DNS
+    would be a way out for it (queries are forwarded to the upstream resolvers)."""
     return _netpol(
         dep,
         "allow-dns",
@@ -364,25 +412,30 @@ def _np_allow_dns(dep: DeploymentCtx) -> dict[str, Any]:
                 }
             ],
         },
-        {},
+        pod_selector if pod_selector is not None else {},
     )
 
 
 def _np_allow_egress_internet(
-    dep: DeploymentCtx, settings: RenderSettings, pod_selector: dict[str, Any]
+    dep: DeploymentCtx,
+    settings: RenderSettings,
+    pod_selector: dict[str, Any],
+    extra_ports: tuple[dict[str, Any], ...] = (),
 ) -> dict[str, Any]:
-    """Internet for the selected pods, without pod/service/node networks, private and link-local ranges."""
+    """Internet for the selected pods over the configured TCP ports (``extra_ports`` on top),
+    without pod/service/node networks and the private, link-local, multicast and IPv4-in-IPv6 ranges."""
     extra = list(settings.extra_egress_except)
     v4 = _EGRESS_EXCEPT_V4 + [c for c in extra if ":" not in c]
     v6 = _EGRESS_EXCEPT_V6 + [c for c in extra if ":" in c]
+    ports = [{"protocol": "TCP", "port": p} for p in settings.egress_tcp_ports] + [dict(p) for p in extra_ports]
     return _netpol(
         dep,
         "allow-egress-internet",
         {
             "policyTypes": ["Egress"],
             "egress": [
-                {"to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": v4}}]},
-                {"to": [{"ipBlock": {"cidr": "::/0", "except": v6}}]},
+                {"to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": v4}}], "ports": ports},
+                {"to": [{"ipBlock": {"cidr": "::/0", "except": v6}}], "ports": ports},
             ],
         },
         pod_selector,
@@ -397,7 +450,9 @@ def _np_allow_intra_namespace(
 ) -> dict[str, Any]:
     """Both directions between the selected pods and ``peer`` (default-deny blocks both).
 
-    Without ``ports`` every port is open.
+    Without ``ports`` every port and protocol (TCP, UDP, ICMP) is open: that is what the
+    students' own servers and clients need. ``peer`` never names a namespace, so it is the
+    deployment's own pods and nobody else.
     """
     port_part = {"ports": ports} if ports else {}
     return _netpol(
@@ -418,15 +473,32 @@ def _network_policies(spec: AppSpec, dep: DeploymentCtx, settings: RenderSetting
     policies = [
         _np_default_deny(dep),
         _np_allow_ingress_controller(dep, settings, port, {}),
-        _np_allow_dns(dep),
     ]
+    if spec.egress == "internet" or spec.pod_network == "namespace":
+        policies.append(_np_allow_dns(dep))
     if spec.egress == "internet":
         policies.append(_np_allow_egress_internet(dep, settings, {}))
     if spec.pod_network == "namespace":
-        # No namespaceSelector or ipBlock, so it reaches only pods of this
-        # deployment's namespace; the admission policy demands TCP ports here.
-        policies.append(_np_allow_intra_namespace(dep, [{"podSelector": {}}], {}, [{"protocol": "TCP", "port": port}]))
+        # No namespaceSelector or ipBlock, so it reaches only pods of this deployment's namespace.
+        policies.append(_np_allow_intra_namespace(dep, [{"podSelector": {}}], {}))
     return policies
+
+
+def _peers_service(dep: DeploymentCtx, selector: dict[str, str]) -> dict[str, Any]:
+    """The headless Service ``peers``: one DNS name that resolves to every pod of the deployment.
+
+    Together with the headless per-workload Services (``<workload>`` resolves to that pod) it makes
+    the pods findable by name, on any port, TCP or UDP, IPv4 and IPv6. The ``peers`` list is how a
+    program reaches all others: a broadcast to the deployment, done by sending to each address. A
+    real link-layer broadcast cannot be limited to one deployment (the node's pods share it), so the
+    network does not carry one.
+    """
+    return {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": _meta(PEERS_SERVICE, dep),
+        "spec": {"clusterIP": "None", "ipFamilyPolicy": HEADLESS_FAMILY_POLICY, "selector": dict(selector)},
+    }
 
 
 def _ingress(
@@ -665,7 +737,7 @@ def _workload_objects(
         "metadata": sts_meta,
         "spec": sts_spec,
     }
-    service = {
+    service: dict[str, Any] = {
         "apiVersion": "v1",
         "kind": "Service",
         "metadata": _meta(ref.name, dep, ref.name),
@@ -675,6 +747,9 @@ def _workload_objects(
             "ports": [{"name": "http", "port": exposed.expose.port, "targetPort": "http"}],
         },
     }
+    if spec.pod_network == "namespace":
+        # Headless: the name resolves to the pod itself, so the peers reach any port, not just this one.
+        service["spec"].update(clusterIP="None", ipFamilyPolicy=HEADLESS_FAMILY_POLICY)
     ingress = _ingress(dep, settings, ref.name, exposed.expose.path)
     objects = [secret]
     if file_items:
@@ -724,21 +799,29 @@ def _vm_network_policies(spec: AppSpec, dep: DeploymentCtx, settings: RenderSett
 
     The browser reaches the VNC proxy through the ingress controller; the proxy
     reaches the VM through the Kubernetes API (KubeVirt's VNC subresource), never
-    through a pod port. The VM itself gets DNS, and internet / the other VMs of
-    the namespace when the app (or the person, see ``userChoices``) allows it.
+    through a pod port. The VM itself gets DNS only where it has something to
+    resolve, and internet / the other VMs of the namespace when the app (or the
+    person, see ``network`` in the spec) allows it.
     """
     proxy = {"matchLabels": {ROLE_LABEL: ROLE_VNC_PROXY}}
     vm = {"matchLabels": {ROLE_LABEL: ROLE_VM}}
+    # The proxy resolves kubernetes.default.svc, so it always gets DNS; the VM only with a use for it.
+    talks = spec.egress == "internet" or spec.pod_network == "namespace"
+    # The proxy talks to the API server (kubernetes.default: service port 443, node port 6443). With
+    # the cluster's API addresses known (``kube_api_cidrs``) these are the only destinations. Without
+    # them the destination is any address, as where the API server sits differs per cluster and a
+    # NetworkPolicy cannot name the "kubernetes" service. Either way it is limited to the proxy pods
+    # (the app's code never runs there) and to ports 443/6443; the proxy has no other egress and its
+    # service account may only open VNC streams (vnc-proxy role).
+    api_peers = (
+        [{"ipBlock": {"cidr": c}} for c in settings.kube_api_cidrs]
+        if settings.kube_api_cidrs
+        else [{"ipBlock": {"cidr": "0.0.0.0/0"}}, {"ipBlock": {"cidr": "::/0"}}]
+    )
     policies = [
         _np_default_deny(dep),
         _np_allow_ingress_controller(dep, settings, 8080, proxy),
-        _np_allow_dns(dep),
-        # The proxy talks to the API server (kubernetes.default: service port 443, node port 6443).
-        # The destination is any address on purpose: where the API server sits differs per
-        # cluster (service IP, node IPs, an external endpoint) and a NetworkPolicy cannot name
-        # the "kubernetes" service. What this opens is limited to the proxy pods (``proxy``
-        # selector, the app's code never runs there) and to ports 443/6443; the proxy has no
-        # other egress and its service account may only open VNC streams (vnc-proxy role).
+        _np_allow_dns(dep, None if talks else proxy),
         _netpol(
             dep,
             "allow-vnc-proxy-to-apiserver",
@@ -746,7 +829,7 @@ def _vm_network_policies(spec: AppSpec, dep: DeploymentCtx, settings: RenderSett
                 "policyTypes": ["Egress"],
                 "egress": [
                     {
-                        "to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}, {"ipBlock": {"cidr": "::/0"}}],
+                        "to": api_peers,
                         "ports": [{"protocol": "TCP", "port": 443}, {"protocol": "TCP", "port": 6443}],
                     }
                 ],
@@ -755,7 +838,11 @@ def _vm_network_policies(spec: AppSpec, dep: DeploymentCtx, settings: RenderSett
         ),
     ]
     if spec.egress == "internet":
-        policies.append(_np_allow_egress_internet(dep, settings, vm))
+        policies.append(
+            _np_allow_egress_internet(
+                dep, settings, vm, tuple({"protocol": "UDP", "port": p} for p in _VM_EGRESS_UDP_PORTS)
+            )
+        )
     if spec.pod_network == "namespace":
         # The VMs of this namespace see each other (any port); the proxies are not part of it.
         policies.append(_np_allow_intra_namespace(dep, [{"podSelector": vm}], vm))
@@ -970,7 +1057,7 @@ def _vm_workload_objects(
     # The Ingress and its Service keep the proxy's name; only the host drops the "-novnc".
     ingress = _ingress(dep, settings, novnc_name, "/", host=ref.host(dep, settings))
 
-    return [
+    objects = [
         vnc_secret,
         pvc,
         virtual_machine,
@@ -978,6 +1065,21 @@ def _vm_workload_objects(
         novnc_service,
         ingress,
     ]
+    if spec.pod_network == "namespace":
+        # ``<workload>`` resolves to this VM's pod address (headless: no port is singled out).
+        objects.append(
+            {
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": _meta(workload_name, dep, workload_name),
+                "spec": {
+                    "clusterIP": "None",
+                    "ipFamilyPolicy": HEADLESS_FAMILY_POLICY,
+                    "selector": {WORKLOAD_LABEL: workload_name, DEPLOYMENT_LABEL: dep.id, ROLE_LABEL: ROLE_VM},
+                },
+            }
+        )
+    return objects
 
 
 def render_vm(
@@ -1012,6 +1114,8 @@ def render_vm(
     ]
     for ref in refs:
         objects.extend(_vm_workload_objects(spec, dep, ref, passwords[ref.name], settings))
+    if spec.pod_network == "namespace":
+        objects.append(_peers_service(dep, {DEPLOYMENT_LABEL: dep.id, ROLE_LABEL: ROLE_VM}))
     return objects
 
 
@@ -1047,6 +1151,8 @@ def render(
     ]
     for ref in refs:
         objects.extend(_workload_objects(spec, dep, ref, passwords[ref.name], settings, files, variable_values))
+    if spec.pod_network == "namespace":
+        objects.append(_peers_service(dep, {DEPLOYMENT_LABEL: dep.id}))
     return objects
 
 
