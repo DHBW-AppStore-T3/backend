@@ -8,7 +8,7 @@ Closes #
 
 ## Prüfung
 
-<!-- Wie wurde das Verhalten geprüft? Welche Endpunkte, Rollen und Umgebung (lokal mit `deployment` → `make dev-up`, Swagger UI, Frontend, Staging)? -->
+<!-- Wie wurde das Verhalten geprüft? Welche Endpunkte, Rollen und Umgebung (lokal mit `deployment` → `make init` (k3d-Cluster), Swagger UI, Frontend, Staging)? -->
 
 ## Checkliste
 
@@ -44,9 +44,9 @@ nicht wiederholt.
 - [ ] API-Contract: Schema-Änderungen sind abwärtskompatibel oder als BREAKING markiert; OpenAPI exportiert (`make openapi`) und Frontend-PR mit aktualisierten Typen verlinkt
 - [ ] Datenbank: Schemaänderung mit Alembic-Migration in `alembic/versions/`; `upgrade` und `downgrade` lokal mit bestehenden Daten getestet; Rechte der Worker-Rolle `appstore_worker` bedacht (Migration vergibt sie)
 - [ ] Worker: Änderungen an `app/task_contract.py` oder `app/k8s/` (Task-Typen, Payloads, Events, Status) sind im Worker-Repo identisch nachgezogen (`tests/unit/test_shared_files.py` prüft den Hash), sonst Worker-PR verlinkt
-- [ ] Konfiguration: Neue Umgebungsvariablen in `app/config.py` (mit sinnvollem Default) und im `deployment`-Repo nachgezogen (lokal `.env.example` und `docker-compose.dev.yml`; Staging/Produktion `k8s/charts/appstore` und `k8s/environments/`)
+- [ ] Konfiguration: Neue Umgebungsvariablen in `app/config.py` (mit sinnvollem Default) und im `deployment`-Repo nachgezogen (Chart `k8s/charts/appstore` und `k8s/environments/`; der lokale Cluster nutzt dasselbe Chart mit den Werten in `k8s/local/up.sh`)
 
 **Sicherheit & Doku**
 
 - [ ] Sicherheit: Keine Secrets im Diff; keine Credentials oder Tokens in Logs oder API-Responses; neue `pip-audit`-/`.trivyignore`-Ausnahmen begründet
-- [ ] Doku: `claude_docs/HANDOVER.md` aktualisiert (u. a. Alembic-Head, falls eine Migration dazukommt); Architektur/Entscheidungen in `claude_docs/` nachgezogen, falls betroffen
+- [ ] Doku: `claude_docs/HANDOVER.md` aktualisiert (u. a. Alembic-Head, falls eine Migration dazukommt); `README.md` (Befehle, Konfiguration, Endpunkte) und `claude_docs/` (Architektur, Entscheidungen) nachgezogen, falls betroffen; bei geändertem Verhalten, Datenmodell oder Ablauf auch die Org-Doku in `DHBW-AppStore-T3/.github` unter `docs/` (Endnutzer-Doku, Entwicklerguide, ER- und Sequenzdiagramme)
