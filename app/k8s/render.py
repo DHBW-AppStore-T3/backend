@@ -238,7 +238,9 @@ def workload_refs(spec: AppSpec, teams: list[Team]) -> list[WorkloadRef]:
     if len(set(names)) != len(names):
         raise ValueError("workload names collide; team names must be distinct after normalisation")
     if spec.pod_network == "namespace" and PEERS_SERVICE in names:
-        raise ValueError(f"a workload cannot be called {PEERS_SERVICE!r}: that name resolves to all pods of the deployment")
+        raise ValueError(
+            f"a workload cannot be called {PEERS_SERVICE!r}: that name resolves to all pods of the deployment"
+        )
     return refs
 
 

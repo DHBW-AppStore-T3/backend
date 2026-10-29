@@ -495,9 +495,7 @@ class AppSpec(_Strict):
         choices = self.legacy_user_choices or _LegacyUserChoices()
         self.network = NetworkSpec(
             internet=NetworkSetting(allowed=choices.internet, default=self.legacy_egress == "internet"),
-            podNetwork=NetworkSetting(
-                allowed=choices.pod_network, default=self.legacy_pod_network == "namespace"
-            ),
+            podNetwork=NetworkSetting(allowed=choices.pod_network, default=self.legacy_pod_network == "namespace"),
         )
         self.legacy_egress = self.legacy_pod_network = self.legacy_user_choices = None
 
