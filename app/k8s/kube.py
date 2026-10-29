@@ -152,7 +152,11 @@ class KubeApi:
             """Every request, typed or dynamic, goes through ``call_api``: it gets ``REQUEST_TIMEOUT``."""
 
             def call_api(self, *args: Any, _request_timeout: Any = None, **kwargs: Any) -> Any:
-                return super().call_api(*args, _request_timeout=_request_timeout or REQUEST_TIMEOUT, **kwargs)
+                # ``_request_timeout`` is keyword-only here, so *args cannot fill it (the kubernetes stub's positional
+                # parameter list makes mypy think it can).
+                return super().call_api(  # type: ignore[misc]
+                    *args, _request_timeout=_request_timeout or REQUEST_TIMEOUT, **kwargs
+                )
 
         try:
             config.load_incluster_config()

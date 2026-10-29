@@ -134,8 +134,9 @@ def team_endpoints_output(outputs: dict[str, Any] | None) -> dict[str, Any]:
     """The team-endpoint output of ``outputs`` (``{"<name>": {"value": ...}}``), or ``{}``."""
     for name in (OUTPUT_TEAM_ENDPOINTS, LEGACY_OUTPUT_TEAM_ENDPOINTS):
         bag = (outputs or {}).get(name)
-        if isinstance(bag, dict) and isinstance(bag.get("value"), dict):
-            return bag["value"]
+        value = bag.get("value") if isinstance(bag, dict) else None
+        if isinstance(value, dict):
+            return value
     return {}
 
 
