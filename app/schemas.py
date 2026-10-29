@@ -1,10 +1,11 @@
+import json
 from datetime import datetime
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
-from app.models import AppVersionApprovalStatus, OpenStackAuthType, TaskStatus, TaskType, UserRole
+from app.models import AppVersionApprovalStatus, TaskStatus, TaskType, UserRole
 
 
 # ----------------------------------------------------------------
@@ -28,6 +29,11 @@ class UserUpdate(BaseModel):
 
 
 class UserResponse(UserBase):
+    # Output only: the address was validated when the user was created or
+    # synced from Keycloak. Re-validating it strictly here made every response
+    # embedding the user fail with HTTP 500 for reserved domains (.invalid,
+    # .test, example.test), which email-validator rejects.
+    email: str
     userId: UUID
     role: UserRole
     courseId: UUID | None = None
@@ -84,6 +90,7 @@ class CourseMembersUpdate(BaseModel):
     user-id whose FK is (re-)pointed to this course; an existing
     enrollment on another course is overwritten.
     """
+
     userIds: list[UUID] = []
 
 
@@ -126,11 +133,28 @@ class AppResponse(AppBase):
     userId: UUID
     created_at: datetime
     is_private: bool
+    # An admin deactivated the app; only an admin can make it public again.
+    hidden_by_admin: bool = False
+    # Highlighted by an admin in the catalog.
+    recommended: bool = False
+    # The version tag teachers deploy, set by an admin; None until one is set.
+    # ``GET /apps/{id}`` reports it only while that version can still be
+    # deployed (its tag exists and points to the approved commit).
+    deploy_version: str | None = None
     # Data-URL or null. Populated from ``app.image`` + ``app.image_mime``
     # by ``serialize_app_image``; the raw bytes never leave the backend.
     image: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class AppRecommendedUpdate(BaseModel):
+    recommended: bool
+
+
+class AppDeployVersionUpdate(BaseModel):
+    # ``null`` clears the setting.
+    version_tag: str | None = Field(min_length=1)
 
 
 class AppWithUser(AppResponse):
@@ -161,6 +185,14 @@ class AppVersionApprovalResponse(BaseModel):
     approvalId: UUID
     appId: UUID
     version_tag: str
+    # The reviewed commit; the approval does not cover the tag once it
+    # moves (.github#7 G). None for reviews from before the pinning.
+    commit_sha: str | None = None
+    # How the version runs and the reviewed appstore.yaml (its SHA-256)
+    # and image digests (.github#4).
+    runtime: str = "kubernetes"
+    spec_sha256: str | None = None
+    image_digests: list[str] | None = None
     status: AppVersionApprovalStatus
     diff_url: str | None = None
     notes: str | None = None
@@ -170,6 +202,14 @@ class AppVersionApprovalResponse(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("image_digests", mode="before")
+    @classmethod
+    def _digests_from_json(cls, value):
+        """Stored as a JSON list on the row."""
+        if isinstance(value, str):
+            return json.loads(value)
+        return value
 
 
 class AppVersionApprovalWithApp(AppVersionApprovalResponse):
@@ -195,12 +235,12 @@ class DeploymentFileUpload(BaseModel):
     """Single file uploaded by the teacher in the deploy wizard.
 
     Persisted verbatim into ``userInputVar.terraform`` keyed by the
-    variable name (and recipient key for team/user scope) so the worker
-    passes it to terraform and cloud-init decodes it into ``write_files``.
+    variable name (and recipient key for team/user scope); the pod
+    deployer puts it into the workload's files.
 
-    ``content_b64`` MUST be standard (RFC 4648) base64. The value sent
-    to Terraform stays base64 for cloud-init's ``encoding: b64``.
+    ``content_b64`` MUST be standard (RFC 4648) base64.
     """
+
     name: str
     content_b64: str
     size: int
@@ -208,15 +248,17 @@ class DeploymentFileUpload(BaseModel):
 
 
 class DeploymentCreate(DeploymentBase):
-    releaseTag: str | None = None
+    # Required: the deployment runs the commit this tag points to now,
+    # which must be the approved one for a public app (.github#7 G).
+    releaseTag: str = Field(..., min_length=1)
     userInputVar: dict[str, Any] | None = None
-    # Files-map keyed by ``@openstack:file:<scope>``-marked variable
-    # name. Inner key:
+    # Files-map keyed by the name of a ``file`` variable of the
+    # appstore.yaml. Inner key:
     #   * scope = all  → exactly one inner key, conventionally "all"
     #   * scope = team → one entry per team name
     #   * scope = user → one entry per ``Team-User`` composite key
     # The backend doesn't auto-route — what the wizard puts in here
-    # ends up 1:1 in the Terraform variable.
+    # ends up 1:1 in the variable.
     files: dict[str, dict[str, DeploymentFileUpload]] | None = None
     teams: list[Team] = []
 
@@ -225,6 +267,9 @@ class DeploymentResponse(DeploymentBase):
     deploymentId: UUID
     userId: UUID
     releaseTag: str | None = None
+    # The commit every job of the deployment runs.
+    commit_sha: str | None = None
+    runtime: str = "kubernetes"
     userInputVar: dict[str, Any] | None = None
     status: str | None = None  # From latest task
     created_at: datetime | None = None
@@ -272,9 +317,10 @@ class TaskSummary(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-# Terraform outputs parsed
+# Outputs of a deployment
 class DeploymentOutputs(BaseModel):
-    """Parsed Terraform outputs - structure depends on app"""
+    """Outputs of the deploy job - structure depends on app"""
+
     raw: dict[str, Any] | None = None  # Full outputs as dict
 
     model_config = ConfigDict(from_attributes=True)
@@ -288,133 +334,94 @@ class MyAccessResponse(BaseModel):
     can see their OWN credentials without the owner-view that gates the
     full outputs. Only the caller's own account is ever present.
 
-    Both maps mirror the raw terraform ``user_accounts`` / ``team_vms``
-    output shape (one key each: the member's account and their team's VM)
+    Both maps use the ``user_accounts`` / ``team_vms`` output shape (one key
+    each: the member's account and their team's workload)
     so the frontend's existing account-matching pipeline consumes this
     unchanged. Empty maps mean "no credentials yet" (no successful deploy,
     or the app issued no per-user account) — a valid 200, not an error.
     """
+
     user_accounts: dict[str, dict[str, Any]] = {}
+    team_endpoints: dict[str, dict[str, Any]] = {}
+    # Legacy alias of ``team_endpoints`` (same value) until the frontend reads the new name.
     team_vms: dict[str, dict[str, Any]] = {}
 
     model_config = ConfigDict(from_attributes=True)
 
 
+class DeploymentPermissions(BaseModel):
+    """What the caller may do with a deployment, decided by the API.
+
+    ``owner_view``: tasks, logs, the live stream, infrastructure and the
+    (redacted) outputs. ``operate``: pause, resume, destroy, redeploy,
+    cancel and team changes. ``member``: the caller is in one of its teams
+    and gets their own access through ``my-access``.
+    """
+
+    owner_view: bool = False
+    operate: bool = False
+    member: bool = False
+
+
 # Full deployment detail response
 class DeploymentDetail(DeploymentWithRelations):
     """Full deployment details with teams, task info, and outputs"""
+
     teams: list[DeploymentTeamResponse] = []
     latest_task: TaskSummary | None = None
     outputs: DeploymentOutputs | None = None
     logs: str | None = None  # Optional: can be excluded for large logs
+    permissions: DeploymentPermissions = DeploymentPermissions()
+    # Lifecycle actions allowed right now (``services.lifecycle``), for a
+    # caller with ``operate``: destroy, delete, pause, resume, cancel,
+    # redeploy. Empty for everyone else.
+    actions: list[str] = []
 
     model_config = ConfigDict(from_attributes=True)
 
 
 # ----------------------------------------------------------------
-# DEPLOYMENT RESOURCE / INFRASTRUCTURE SCHEMAS
+# POD WORKLOAD SCHEMAS
 # ----------------------------------------------------------------
-# These mirror the dataclasses in ``app/services/deployment_status.py``
-# 1:1 so the conversion at the endpoint boundary is a plain
-# ``model_validate(asdict(view))``. Defined separately from the
-# dataclasses because Pydantic integrates better with FastAPI's OpenAPI
-# emitter and the service module stays free of a Pydantic dependency.
+class PodSetupProgress(BaseModel):
+    """What an app reports about its first-start setup (an ``appstore-progress`` log line)."""
+
+    percent: int
+    step: str | None = None
+    # Seconds the app expects to need still; null when it cannot tell yet.
+    etaSeconds: int | None = None
 
 
-class LifecycleStatesSchema(BaseModel):
-    """Server lifecycle quad + optional fault message.
+class PodWorkloadSchema(BaseModel):
+    """One workload of a pod or kubevirt-vm deployment, read live from the cluster (.github#4).
 
-    Fields are pass-through from OpenStack's Nova response (stable
-    strings like ``"ACTIVE"`` / ``"BUILD"`` / ``"ERROR"``). The frontend
-    renders a pill from ``status`` + ``task_state`` and shows
-    ``fault_message`` as a banner when ``status == "ERROR"``.
+    The name is historic (pods came first); the schema serves both runtimes.
     """
-    status: str | None = None
-    task_state: str | None = None
-    vm_state: str | None = None
-    power_state: str | None = None
-    fault_message: str | None = None
 
-
-class HardwareSpecSchema(BaseModel):
-    flavor_name: str | None = None
-    ram_mb: int | None = None
-    vcpus: int | None = None
-    disk_gb: int | None = None
-    image_id: str | None = None
-    image_name: str | None = None
-    availability_zone: str | None = None
-    launched_at: str | None = None
-
-
-class NetworkAddressSchema(BaseModel):
-    network: str
-    fixed_ip: str | None = None
-    floating_ip: str | None = None
-    mac: str | None = None
-
-
-class NetworkPortSchema(BaseModel):
-    port_id: str
-    network_id: str | None = None
-    status: str | None = None
-    mac: str | None = None
-    fixed_ip: str | None = None
-    security_group_ids: list[str] = []
-
-
-class SecurityGroupSummarySchema(BaseModel):
-    id: str
-    name: str
-    description: str | None = None
-    ingress_rules: int
-    egress_rules: int
-
-
-class VolumeAttachmentSchema(BaseModel):
-    volume_id: str
-    device: str | None = None
-    size_gb: int | None = None
-    bootable: bool | None = None
-    status: str | None = None
-    name: str | None = None
-
-
-class DeploymentResourceSchema(BaseModel):
-    """One row in the resource list (stage 1) or the response of the
-    detail endpoint (stage 2 — same shape, more fields populated).
-
-    Non-instance categories (network, subnet, etc.) only populate
-    ``address``, ``type``, ``category``, ``provider_id``,
-    ``display_name``; the instance-only fields stay ``None`` /
-    empty list.
-    """
-    address: str
-    type: str
-    category: str
+    workload: str
     team: str | None = None
-    provider_id: str
-    display_name: str
-    drift: Literal["in_sync", "stale", "missing"] = "in_sync"
-    # Stage 1 fields (instance-only)
-    lifecycle: LifecycleStatesSchema | None = None
-    hardware: HardwareSpecSchema | None = None
-    addresses: list[NetworkAddressSchema] = []
-    # Stage 2 fields (instance-only, only set on the detail endpoint)
-    ports: list[NetworkPortSchema] | None = None
-    security_groups: list[SecurityGroupSummarySchema] | None = None
-    volumes: list[VolumeAttachmentSchema] | None = None
-    metadata: dict[str, str] | None = None
+    # ``scope: user``: whose workload it is.
+    user_id: str | None = None
+    ready: bool = False
+    restarts: int = 0
+    # Kubernetes' pod phase or why a container waits (Pending, CrashLoopBackOff,
+    # ...), or Stopped / Unschedulable; a pod that runs but is not Ready is
+    # Starting or NotResponding (app.services.k8s_status).
+    phase: str
+    url: str | None = None
+    lastEvent: str | None = None
+    # Set while the app runs a setup of its own (an installer) after it started.
+    setup: PodSetupProgress | None = None
 
 
 class DeploymentResourceListResponse(BaseModel):
     """Wrap the list in an object so we can add cursor/refresh-stamp
     metadata later without a breaking API change."""
-    resources: list[DeploymentResourceSchema]
-    # True when the response was fetched with live OpenStack join.
-    # False means the caller passed ``?refresh=false`` and the
-    # response reflects only cached TF state.
+
+    # Whether the cluster could be asked.
     live: bool
+    runtime: str = "kubernetes"
+    workloads: list[PodWorkloadSchema] = []
 
 
 # ----------------------------------------------------------------
@@ -422,7 +429,6 @@ class DeploymentResourceListResponse(BaseModel):
 # ----------------------------------------------------------------
 class TaskBase(BaseModel):
     deploymentId: UUID
-    celeryTaskId: str
     type: TaskType
     status: TaskStatus
     started_at: datetime | None = None
@@ -432,6 +438,7 @@ class TaskBase(BaseModel):
     outputs: str | None = None
     current_phase: str | None = None
     progress_pct: int | None = None
+
 
 class TaskCreate(TaskBase):
     pass
@@ -447,8 +454,26 @@ class TaskUpdate(BaseModel):
     current_phase: str | None = None
     progress_pct: int | None = None
 
-class TaskResponse(TaskBase):
+
+class TaskResponse(BaseModel):
+    """A task as the task API shows it to the owner view.
+
+    Deliberately without ``tf_state`` and ``outputs`` (.github#7 E): the
+    state holds every attribute of every resource, generated passwords
+    included, and the outputs hold every member's credentials. Members get
+    their own entry through ``my-access``; the owner view's outputs are
+    redacted (``task_results.redact_sensitive_outputs``).
+    """
+
     taskId: UUID
+    deploymentId: UUID
+    type: TaskType
+    status: TaskStatus
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    logs: str | None = None
+    current_phase: str | None = None
+    progress_pct: int | None = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -495,70 +520,3 @@ class UserStatistics(BaseModel):
     successful_deployments: int
     failed_deployments: int
     pending_deployments: int
-
-
-# ----------------------------------------------------------------
-# OPENSTACK CREDENTIAL SCHEMAS
-# ----------------------------------------------------------------
-class OpenStackCredentialBase(BaseModel):
-    """Non-secret connection metadata. Mirrors the `clouds.yaml` shape."""
-    auth_type: OpenStackAuthType
-    auth_url: str
-    region_name: str | None = None
-    interface: str | None = "public"
-    identity_api_version: str | None = "3"
-    project_id: str | None = None
-    project_name: str | None = None
-    user_domain_name: str | None = None
-    project_domain_name: str | None = None
-
-
-class OpenStackCredentialUpsert(OpenStackCredentialBase):
-    """Body of PUT /me/openstack-credentials.
-
-    `identifier` is either a username (password auth) or an
-    application-credential ID. `secret` is the corresponding password or
-    application-credential secret. Both are stored encrypted at rest.
-    """
-    identifier: str = Field(..., min_length=1, description="username OR application-credential ID")
-    secret: str = Field(..., min_length=1, description="password OR application-credential secret")
-
-    @model_validator(mode="after")
-    def _validate_required_fields(self) -> "OpenStackCredentialUpsert":
-        if self.auth_type == OpenStackAuthType.PASSWORD:
-            if not self.user_domain_name:
-                raise ValueError("user_domain_name is required for password auth")
-            if not (self.project_id or self.project_name):
-                raise ValueError("project_id or project_name is required for password auth")
-        # application-credential auth: project_id is recommended but not required;
-        # the credential itself carries the project scope.
-        return self
-
-
-class OpenStackCredentialFromYaml(BaseModel):
-    """Convenience body: paste/upload a `clouds.yaml` and let the server pick it apart."""
-    clouds_yaml: str = Field(..., min_length=1, description="raw clouds.yaml file contents")
-    cloud_name: str | None = Field(
-        None, description="Pick a specific cloud from the YAML; required when there is more than one"
-    )
-
-
-class OpenStackCredentialResponse(OpenStackCredentialBase):
-    """Masked response — never returns identifier/secret material.
-
-    When `has_credential` is False, base fields are absent/empty and the
-    consumer should branch on `has_credential`. `is_locked` and
-    `active_deployments` are populated regardless so the frontend can
-    render the appropriate guard UI even before any credential exists.
-    """
-    auth_type: OpenStackAuthType | None = None  # type: ignore[assignment]
-    auth_url: str | None = None  # type: ignore[assignment]
-    has_credential: bool = True
-    last_validated_at: datetime | None = None
-    last_validation_error: str | None = None
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
-    is_locked: bool = False
-    active_deployments: int = 0
-
-    model_config = ConfigDict(from_attributes=True)

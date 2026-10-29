@@ -16,7 +16,6 @@ from app.models import (
     UserToDeployment,
     UserToTeam,
 )
-from app.utils.capabilities import get_my_course_teacher_ids
 from app.utils.keycloak_auth import get_current_user_keycloak
 
 router = APIRouter()
@@ -26,11 +25,6 @@ class DashboardStatsResponse(BaseModel):
     deployments: int
     apps: int
     courses: int
-    # Counts deployments whose owner sits inside one of the requestor's
-    # taught courses. 0 for anyone not registered as a course-teacher.
-    # Always present so the frontend can render the scope tile without
-    # a separate request.
-    courseScopeDeployments: int = 0
 
 
 @router.get("/stats", response_model=DashboardStatsResponse)
@@ -41,9 +35,7 @@ def get_dashboard_stats(
     """
     Aggregate counts for the dashboard KPI strip.
 
-    Cheap DB-only aggregates — intentionally separated from the OpenStack
-    quota call (`GET /quotas/overview`) so the dashboard renders fast even
-    when the OpenStack API is slow or unavailable.
+    Cheap DB-only aggregates.
 
     Deployments counter MUST mirror the visibility rules of
     ``GET /deployments`` so the KPI matches what the user actually sees
@@ -131,23 +123,8 @@ def get_dashboard_stats(
 
     courses_total = db.query(func.count(Course.courseId)).scalar() or 0
 
-    # Course-teacher scope counter. Counts deployments whose owner sits
-    # in one of the requestor's taught courses; soft-deleted deployments
-    # are excluded the same way as the primary counter.
-    course_scope_deployments = 0
-    my_course_ids = get_my_course_teacher_ids(current_user, db)
-    if my_course_ids:
-        course_scope_deployments = (
-            db.query(func.count(Deployment.deploymentId))
-            .join(User, User.userId == Deployment.userId)
-            .filter(Deployment.deleted_at.is_(None))
-            .filter(User.courseId.in_(my_course_ids))
-            .scalar()
-        ) or 0
-
     return DashboardStatsResponse(
         deployments=deployments_total,
         apps=apps_total,
         courses=courses_total,
-        courseScopeDeployments=course_scope_deployments,
     )

@@ -1,10 +1,11 @@
+import base64
 import time
 from unittest.mock import MagicMock, patch
 
+import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from jose import jwt
 
 from app.services import lti13_service
 
@@ -21,10 +22,8 @@ def _jwk_dict(private_key, kid="test-kid"):
     public_numbers = private_key.public_key().public_numbers()
 
     def _b64(n: int) -> str:
-        from jose.utils import base64url_encode
-
         length = (n.bit_length() + 7) // 8
-        return base64url_encode(n.to_bytes(length, "big")).decode()
+        return base64.urlsafe_b64encode(n.to_bytes(length, "big")).rstrip(b"=").decode()
 
     return {
         "kty": "RSA",
@@ -99,16 +98,31 @@ def test_validate_id_token_rejects_expired_nonce(monkeypatch, rsa_key):
         )
 
 
+USER_ID = "6f1c2d3e-4a5b-4c6d-8e7f-901234567890"
+
+
 def test_issue_and_verify_session_token_roundtrip():
-    token = lti13_service.issue_session_token("student@example.com", "test-secret")
-    email = lti13_service.verify_session_token(token, "test-secret")
-    assert email == "student@example.com"
+    token = lti13_service.issue_session_token(USER_ID, "test-secret")
+    assert str(lti13_service.verify_session_token(token, "test-secret")) == USER_ID
 
 
 def test_verify_session_token_rejects_wrong_secret():
-    token = lti13_service.issue_session_token("student@example.com", "test-secret")
+    token = lti13_service.issue_session_token(USER_ID, "test-secret")
     with pytest.raises(ValueError):
         lti13_service.verify_session_token(token, "wrong-secret")
+
+
+def test_a_session_token_of_before_naming_an_email_is_refused():
+    """The address does not identify a person (review S9): old tokens keyed by it are void."""
+    token = lti13_service.issue_session_token("student@example.com", "test-secret")
+    with pytest.raises(ValueError, match="user id"):
+        lti13_service.verify_session_token(token, "test-secret")
+
+
+def test_a_session_token_lives_four_hours():
+    token = lti13_service.issue_session_token(USER_ID, "test-secret")
+    claims = jwt.decode(token, "test-secret", algorithms=["HS256"])
+    assert claims["exp"] - claims["iat"] == 4 * 3600
 
 
 def test_verify_session_token_rejects_garbage():
@@ -210,6 +224,31 @@ def test_validate_id_token_accepts_valid_token(monkeypatch, rsa_key):
     assert claims["email"] == "student@example.com"
 
 
+@pytest.mark.parametrize(("claimed", "ok"), [("1", True), ("2", False), (None, False)])
+def test_validate_id_token_checks_the_deployment_id(monkeypatch, rsa_key, claimed, ok):
+    monkeypatch.setattr(lti13_service, "fetch_platform_jwks", lambda _jwks_url: [_jwk_dict(rsa_key)])
+    claims = _base_claims()
+    if claimed is not None:
+        claims[lti13_service.DEPLOYMENT_ID_CLAIM] = claimed
+    token = _sign(rsa_key, claims)
+
+    def validate():
+        return lti13_service.validate_id_token(
+            id_token=token,
+            client_id="client-123",
+            expected_nonce="expected-nonce",
+            platform_issuer="https://moodle.example.com",
+            jwks_url="https://moodle.example.com/mod/lti/certs.php",
+            deployment_id="1",
+        )
+
+    if ok:
+        assert validate()["email"] == "student@example.com"
+    else:
+        with pytest.raises(ValueError, match="deployment_id"):
+            validate()
+
+
 def test_extract_role_maps_instructor_variants():
     assert (
         lti13_service._extract_role(
@@ -237,3 +276,22 @@ def test_extract_user_info_falls_back_email_for_missing_name():
     assert info["name"] == "no-name@example.com"
     assert info["role"] == "student"
     assert info["course"] == ""
+    assert info["context_id"] == "" and info["subject"] == ""
+
+
+def test_extract_user_info_names_the_identity_and_the_context():
+    info = lti13_service.extract_user_info(
+        {
+            "iss": "https://moodle.example.com",
+            "sub": 42,
+            "email": "ada@example.com",
+            lti13_service.CONTEXT_CLAIM: {"id": 7, "label": "MA-1", "title": "Mathe 1"},
+        }
+    )
+    assert (info["issuer"], info["subject"], info["context_id"], info["course"]) == (
+        "https://moodle.example.com",
+        "42",
+        "7",
+        "Mathe 1",
+    )
+    assert lti13_service.extract_user_info({lti13_service.CONTEXT_CLAIM: {"id": "c", "label": "MA-1"}})["course"] == "MA-1"

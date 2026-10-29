@@ -1,12 +1,17 @@
+import contextlib
 import json
+import uuid
 from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, asc, desc, exists, func
+from sqlalchemy import and_, asc, desc, exists, func, or_
 from sqlalchemy.orm import Session, joinedload
 
+from app.k8s.render import DeploymentCtx
 from app.models import (
+    CLUSTER_RUNTIMES,
+    RUNTIME_K8S,
     Deployment,
     Task,
     TaskStatus,
@@ -17,6 +22,7 @@ from app.models import (
     UserToTeam,
 )
 from app.schemas import DeploymentCreate
+from app.services import task_results
 from app.utils.time import utcnow
 
 
@@ -26,26 +32,6 @@ def _is_destroyed_subq():
         (Task.deploymentId == Deployment.deploymentId)
         & (Task.type == TaskType.DESTROY)
         & (Task.status == TaskStatus.SUCCESS)
-    )
-
-
-def count_active_user_deployments(db: Session, user_id: UUID) -> int:
-    """Number of *active* deployments owned by ``user_id``.
-
-    "Active" here matches what the user sees on the Deployments page:
-
-      * Owned by them (``Deployment.userId == user_id``).
-      * Not soft-deleted (``deleted_at IS NULL``).
-      * Has not been fully destroyed (no successful DESTROY task) —
-        soft-delete happens after destroy completes, so the check
-        covers the destroy-in-flight window too.
-    """
-    return (
-        db.query(Deployment)
-        .filter(Deployment.userId == user_id)
-        .filter(Deployment.deleted_at.is_(None))
-        .filter(~_is_destroyed_subq())
-        .count()
     )
 
 
@@ -120,6 +106,14 @@ def derive_status(
     * ``(PAUSE,  success)``         → ``paused``
     * ``(RESUME, pending|running)`` → ``resuming``
     * ``(RESUME, success)``         → falls through to ``success``
+    * ``(REDEPLOY, pending|running)`` → ``redeploying``
+    * ``(REDEPLOY, failed|cancelled)`` → ``redeploy_failed``
+    * ``(REDEPLOY, success)``       → falls through to ``success``
+
+    A redeploy touches one VM or workload while the others keep running, so
+    it must never look like a deploy: a ``running`` deploy may be cancelled
+    (which destroys everything) and a ``failed`` one may be deleted, which
+    would hide a deployment whose resources still run (.github#7 L).
 
     PAUSE/RESUME ``failed``/``cancelled`` bleed through unchanged so the
     user sees the pause/resume itself broke. Returns ``None`` when the
@@ -158,6 +152,11 @@ def derive_status(
         # On resume success the deployment is running again; let
         # "success" pass through so the lifecycle matrix treats it like
         # a fresh successful deploy.
+    elif raw_type == "redeploy":
+        if raw_status in ("pending", "running"):
+            return "redeploying"
+        if raw_status in ("failed", "cancelled"):
+            return "redeploy_failed"
     return raw_status
 
 
@@ -288,27 +287,28 @@ def get_deployment_teams_with_members(db: Session, deployment_id: UUID) -> list[
 
 
 def get_deployment_outputs(db: Session, deployment_id: UUID) -> dict[str, Any] | None:
-    """Get parsed Terraform outputs from the latest successful task"""
-    task = (
+    """Parsed outputs of the newest task that reported any.
+
+    Tasks without outputs (or with an empty set, e.g. a destroy) are
+    skipped, so the outputs of the deploy behind them stay visible.
+    """
+    candidates = (
         db.query(Task)
         .filter(Task.deploymentId == deployment_id)
-        .filter(Task.outputs.isnot(None))
+        .filter(or_(Task.outputs.isnot(None), Task.outputs_enc.isnot(None)))
         .order_by(desc(Task.created_at))
-        .first()
     )
-
-    if task and task.outputs:
-        try:
-            return json.loads(task.outputs)
-        except json.JSONDecodeError:
-            return None
+    for task in candidates:
+        outputs = task_results.outputs(task)
+        if outputs:
+            return outputs
     return None
 
 
 def get_latest_successful_deploy_outputs(
     db: Session, deployment_id: UUID
 ) -> dict[str, Any] | None:
-    """Parsed Terraform outputs of the most recent *successful DEPLOY* task.
+    """Parsed outputs of the most recent *successful DEPLOY* task.
 
     Stricter than :func:`get_deployment_outputs`, which returns the latest
     task carrying any non-null ``outputs`` regardless of type or status — a
@@ -331,12 +331,7 @@ def get_latest_successful_deploy_outputs(
         .first()
     )
 
-    if task and task.outputs:
-        try:
-            return json.loads(task.outputs) if isinstance(task.outputs, str) else task.outputs
-        except json.JSONDecodeError:
-            return None
-    return None
+    return task_results.outputs(task) if task else None
 
 
 def get_deployments(
@@ -415,33 +410,21 @@ def get_deployments(
             ),
         )
 
-        if status == "destroying":
-            query = query.filter(
-                latest_subq.c.type == TaskType.DESTROY,
-                latest_subq.c.status.in_((TaskStatus.PENDING, TaskStatus.RUNNING)),
-            )
-        elif status == "destroyed":
-            query = query.filter(
-                latest_subq.c.type == TaskType.DESTROY,
-                latest_subq.c.status == TaskStatus.SUCCESS,
-            )
-        else:
-            # Plain task statuses, mirroring ``derive_status``:
-            # - ``pending``/``running``/``success`` match deploy-typed
-            #   tasks only (destroy surfaces as destroying/destroyed).
-            # - ``failed``/``cancelled`` bleed through both task types.
-            try:
-                status_enum = TaskStatus(status)
-            except ValueError:
-                # Unknown status string → empty result.
-                return []
-            query = query.filter(latest_subq.c.status == status_enum)
-            if status_enum in (
-                TaskStatus.PENDING,
-                TaskStatus.RUNNING,
-                TaskStatus.SUCCESS,
-            ):
-                query = query.filter(latest_subq.c.type != TaskType.DESTROY)
+        pairs = [
+            (task_type, task_status)
+            for task_type in TaskType
+            for task_status in TaskStatus
+            if derive_status(task_status, task_type) == status
+        ]
+        if not pairs:
+            # Unknown status string → empty result.
+            return []
+        query = query.filter(
+            or_(*(
+                and_(latest_subq.c.type == task_type, latest_subq.c.status == task_status)
+                for task_type, task_status in pairs
+            ))
+        )
 
     # Order by deploymentId (UUID)
     query = query.order_by(desc(Deployment.deploymentId))
@@ -449,24 +432,89 @@ def get_deployments(
     return query.offset(skip).limit(limit).all()
 
 
-def create_deployment(db: Session, deployment: DeploymentCreate, user_id: UUID) -> Deployment:
+def k8s_namespace_for(deployment_id: UUID) -> str:
+    """The namespace of a pod deployment: ``dep-`` and the first 8 hex digits of its id."""
+    return DeploymentCtx(id=str(deployment_id)).namespace
+
+
+# Where new deployment ids come from (tests replace it to force collisions).
+_new_id = uuid.uuid4
+
+
+def _free_pod_identity(db: Session) -> tuple[UUID, str]:
+    """A new deployment id whose namespace no deployment ever had.
+
+    Namespaces carry only 32 bits of the id; a collision would let one
+    deployment's destroy reach another's namespace, so it is avoided here
+    (and the column is unique, deleted deployments included).
+    """
+    for _ in range(20):
+        deployment_id = _new_id()
+        namespace = k8s_namespace_for(deployment_id)
+        if db.query(Deployment.deploymentId).filter(Deployment.k8s_namespace == namespace).first() is None:
+            return deployment_id, namespace
+    raise RuntimeError("no free namespace for a new pod deployment")
+
+
+def count_live_workloads(db: Session, user_id: UUID) -> int:
+    """Workloads of ``user_id``'s live pod deployments (the owner's budget)."""
+    total = (
+        db.query(func.coalesce(func.sum(Deployment.k8s_workloads), 0))
+        .filter(Deployment.userId == user_id)
+        .filter(Deployment.runtime.in_(CLUSTER_RUNTIMES))
+        .filter(Deployment.deleted_at.is_(None))
+        .filter(~_is_destroyed_subq())
+        .scalar()
+    )
+    return int(total or 0)
+
+
+def stored_input_bytes(db: Session, user_id: UUID | None = None) -> int:
+    """Bytes that the deployments' ``userInputVar`` take in the database (all rows, or one owner's).
+
+    That is where uploaded files live (as base64); ``pg_column_size`` is what the value takes on
+    disk and does not read it, so this stays cheap with large rows. A soft-deleted deployment has
+    its files stripped and counts for what is left.
+    """
+    query = db.query(func.coalesce(func.sum(func.pg_column_size(Deployment.userInputVar)), 0))
+    if user_id is not None:
+        query = query.filter(Deployment.userId == user_id)
+    return int(query.scalar() or 0)
+
+
+def create_deployment(
+    db: Session,
+    deployment: DeploymentCreate,
+    user_id: UUID,
+    commit_sha: str,
+    *,
+    runtime: str = RUNTIME_K8S,
+    k8s_workloads: int | None = None,
+) -> Deployment:
     """Insert a deployment row in the current transaction.
 
     Does NOT commit — the caller is expected to also insert teams/tasks
     in the same TX and commit once at the end. This is necessary so the
     advisory lock acquired at the start of the request stays held across
-    all related inserts.
+    all related inserts. A pod deployment (``runtime`` ``kubernetes``) gets
+    its namespace and the number of its workloads.
     """
     # Convert userInputVar dict to JSON string for database storage
     user_input_var_json = None
     if deployment.userInputVar is not None:
         user_input_var_json = json.dumps(deployment.userInputVar)
 
+    deployment_id, namespace = _free_pod_identity(db) if runtime in CLUSTER_RUNTIMES else (uuid.uuid4(), None)
     db_deployment = Deployment(
+        deploymentId=deployment_id,
         name=deployment.name,
         appId=deployment.appId,
         userId=user_id,
         releaseTag=deployment.releaseTag,
+        commit_sha=commit_sha,
+        runtime=runtime,
+        k8s_namespace=namespace,
+        k8s_workloads=k8s_workloads,
         userInputVar=user_input_var_json,
     )
     db.add(db_deployment)
@@ -482,12 +530,23 @@ def soft_delete_deployment(db: Session, deployment_id: UUID) -> bool:
     they're useful for audit and the partial-unique index on active
     tasks already prevents the deployment from accepting new work.
 
+    The uploaded files are dropped from ``userInputVar`` (name and size
+    stay): nothing reads them after the deployment is gone, and the row
+    would otherwise keep every upload for good.
+
     Returns ``False`` if the deployment doesn't exist (or was already
     deleted), ``True`` on a successful soft-delete.
     """
     db_deployment = get_deployment(db, deployment_id)
     if not db_deployment:
         return False
+    if db_deployment.userInputVar:
+        from app.services.deployment_input import strip_file_vars_from_user_input
+
+        with contextlib.suppress(json.JSONDecodeError):
+            db_deployment.userInputVar = json.dumps(
+                strip_file_vars_from_user_input(json.loads(db_deployment.userInputVar))
+            )
     db_deployment.deleted_at = utcnow()
     db.commit()
     return True

@@ -6,10 +6,11 @@ payload. These tests cover the access-control matrix and — most
 importantly — the guarantee that a member never receives a teammate's
 credentials in the response.
 
-Unlike the resend-access tests, the notifier is NOT patched out here:
-we seed a real successful DEPLOY task carrying terraform ``user_accounts``
-outputs and assert on the extracted, filtered response so the end-to-end
-extraction path (crud → notifier._find_account_for_user) is exercised.
+Nothing is patched out: we seed a real successful DEPLOY task carrying
+terraform ``user_accounts`` outputs and assert on the extracted, filtered
+response, so the end-to-end path (crud → ``services.access.find_account``)
+is exercised. Matching is exact (.github#7 H): the first account of a team
+no longer matches every member.
 """
 import json
 import uuid
@@ -40,7 +41,7 @@ def _seed_deployment_with_outputs(db, owner, members, *, outputs=None, team_name
         appId=uuid.uuid4(),
         name=f"app-{uuid.uuid4().hex[:8]}",
         userId=owner.userId,
-        git_link="https://example.com/repo.git",
+        git_link="https://example.com/acme/repo.git",
     )
     db.add(app)
     db.flush()
@@ -51,7 +52,7 @@ def _seed_deployment_with_outputs(db, owner, members, *, outputs=None, team_name
         appId=app.appId,
         userId=owner.userId,
         releaseTag="v1.0.0",
-        userInputVar=json.dumps({"terraform": {}, "packer": {}}),
+        userInputVar=json.dumps({"terraform": {}}),
     )
     db.add(deployment)
     db.flush()
@@ -225,3 +226,124 @@ def test_my_access_404_for_unknown_deployment(client):
     """Unknown deployment id → 404."""
     response = client.get(f"/deployments/{uuid.uuid4()}/my-access")
     assert response.status_code == 404
+
+
+# ----------------------------------------------------------------
+# Exact matching (.github#7 H, security review H-3)
+# ----------------------------------------------------------------
+def _member(db, email):
+    from app.models import User, UserRole
+
+    user = User(userId=uuid.uuid4(), keycloak_id=f"kc-{uuid.uuid4()}", email=email,
+                username=email.split("@")[0], role=UserRole.STUDENT)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def _as(user):
+    from app.main import app as fastapi_app
+    from app.utils.keycloak_auth import get_current_user_keycloak
+
+    fastapi_app.dependency_overrides[get_current_user_keycloak] = lambda: user
+
+
+def _accounts(team, entries):
+    return {
+        "user_accounts": {"value": {f"{team}-{k}": v for k, v in entries.items()}},
+        "team_vms": {"value": {team: {"url": "https://vm"}}},
+    }
+
+
+@pytest.mark.integration
+def test_teammates_no_longer_receive_the_first_members_password(client, db, mock_user):
+    """The replay from the branch analysis: Alice, Bob and Eve (no entry of her own)."""
+    alice = _member(db, "alice@dhbw.de")
+    bob = _member(db, "bob@dhbw.de")
+    eve = _member(db, "eve@dhbw.de")
+    outputs = _accounts("Team-1", {
+        "alice": {"username": "alice", "auth": "pw-ALICE", "type": "password"},
+        "bob": {"username": "bob", "auth": "pw-BOB", "type": "password"},
+    })
+    deployment, _team = _seed_deployment_with_outputs(
+        db, owner=mock_user, members=[alice, bob, eve], outputs=outputs,
+    )
+
+    got = {}
+    for user in (alice, bob, eve):
+        _as(user)
+        response = client.get(f"/deployments/{deployment.deploymentId}/my-access")
+        assert response.status_code == 200, response.text
+        got[user.username] = response.json()["user_accounts"]
+
+    assert got["alice"] == {"Team-1-alice": outputs["user_accounts"]["value"]["Team-1-alice"]}
+    assert got["bob"] == {"Team-1-bob": outputs["user_accounts"]["value"]["Team-1-bob"]}
+    assert got["eve"] == {}
+    assert "pw-ALICE" not in json.dumps(got["bob"]) + json.dumps(got["eve"])
+
+
+@pytest.mark.integration
+def test_dotted_local_parts_use_the_templates_key(client, db, mock_user):
+    anna = _member(db, "anna.b@dhbw.de")
+    outputs = _accounts("Team-1", {"anna-b": {"username": "anna-b", "auth": "pw-anna"}})
+    deployment, _team = _seed_deployment_with_outputs(db, owner=mock_user, members=[anna], outputs=outputs)
+
+    _as(anna)
+    body = client.get(f"/deployments/{deployment.deploymentId}/my-access").json()
+
+    assert list(body["user_accounts"]) == ["Team-1-anna-b"]
+
+
+@pytest.mark.integration
+def test_two_members_with_the_same_derived_key_get_nothing(client, db, mock_user):
+    """max@dhbw.de and max@student.dhbw.de map to one template key: ambiguous."""
+    max_a = _member(db, "max@dhbw.de")
+    max_b = _member(db, "max@student.dhbw.de")
+    outputs = _accounts("Team-1", {"max": {"username": "max", "auth": "pw-max"}})
+    deployment, _team = _seed_deployment_with_outputs(db, owner=mock_user, members=[max_a, max_b], outputs=outputs)
+
+    for user in (max_a, max_b):
+        _as(user)
+        assert client.get(f"/deployments/{deployment.deploymentId}/my-access").json()["user_accounts"] == {}
+
+
+@pytest.mark.integration
+def test_entries_naming_their_owner_by_email_match_only_that_owner(client, db, mock_user):
+    """The Windows app writes ``email``/``team`` per account; the key is irrelevant then."""
+    alice = _member(db, "Alice@DHBW.de")
+    bob = _member(db, "bob@dhbw.de")
+    outputs = _accounts("Team-1", {
+        "u0": {"username": "u0", "auth": "pw-alice", "email": "alice@dhbw.de", "team": "Team-1",
+               "authtype": "rdp", "port": 3389},
+        "u1": {"username": "u1", "auth": "pw-bob", "email": "bob@dhbw.de", "team": "Team-1"},
+        "u2": {"username": "u2", "auth": "pw-other-team", "email": "bob@dhbw.de", "team": "Team-2"},
+    })
+    deployment, _team = _seed_deployment_with_outputs(db, owner=mock_user, members=[alice, bob], outputs=outputs)
+
+    _as(alice)
+    alice_body = client.get(f"/deployments/{deployment.deploymentId}/my-access").json()
+    _as(bob)
+    bob_body = client.get(f"/deployments/{deployment.deploymentId}/my-access").json()
+
+    assert alice_body["user_accounts"] == {"Team-1-u0": outputs["user_accounts"]["value"]["Team-1-u0"]}
+    assert bob_body["user_accounts"] == {"Team-1-u1": outputs["user_accounts"]["value"]["Team-1-u1"]}
+
+
+@pytest.mark.integration
+def test_entries_naming_their_owner_by_user_id(client, db, mock_user):
+    """Pod deployments write the user id of each person's workload."""
+    alice = _member(db, "alice@dhbw.de")
+    bob = _member(db, "bob@dhbw.de")
+    outputs = _accounts("Team-1", {
+        "alice": {"username": "alice", "auth": "pw-alice", "user_id": str(alice.userId)},
+        # A key that looks like Bob's but names Alice: still Alice's.
+        "bob": {"username": "bob", "auth": "pw-alice-2", "user_id": str(alice.userId)},
+    })
+    deployment, _team = _seed_deployment_with_outputs(db, owner=mock_user, members=[alice, bob], outputs=outputs)
+
+    _as(bob)
+    assert client.get(f"/deployments/{deployment.deploymentId}/my-access").json()["user_accounts"] == {}
+    _as(alice)
+    # Two entries name Alice: ambiguous, so nothing rather than a guess.
+    assert client.get(f"/deployments/{deployment.deploymentId}/my-access").json()["user_accounts"] == {}

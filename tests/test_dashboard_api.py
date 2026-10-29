@@ -88,35 +88,35 @@ def _seed_world(db, *, teacher: User, admin: User, student: User):
             appId=uuid.uuid4(),
             name="A1-teacher-public-approved",
             userId=teacher.userId,
-            git_link="https://example.com/a1.git",
+            git_link="https://example.com/acme/a1.git",
             is_private=False,
         ),
         "A2": App(
             appId=uuid.uuid4(),
             name="A2-teacher-public-pending",
             userId=teacher.userId,
-            git_link="https://example.com/a2.git",
+            git_link="https://example.com/acme/a2.git",
             is_private=False,
         ),
         "A3": App(
             appId=uuid.uuid4(),
             name="A3-teacher-private",
             userId=teacher.userId,
-            git_link="https://example.com/a3.git",
+            git_link="https://example.com/acme/a3.git",
             is_private=True,
         ),
         "A4": App(
             appId=uuid.uuid4(),
             name="A4-admin-public-approved",
             userId=admin.userId,
-            git_link="https://example.com/a4.git",
+            git_link="https://example.com/acme/a4.git",
             is_private=False,
         ),
         "A5": App(
             appId=uuid.uuid4(),
             name="A5-otherstudent-private",
             userId=other_student.userId,
-            git_link="https://example.com/a5.git",
+            git_link="https://example.com/acme/a5.git",
             is_private=True,
         ),
     }
@@ -363,8 +363,6 @@ def test_dashboard_stats_student_does_not_leak_other_data(
     assert body["deployments"] < 5, (
         "student must only see own/team/direct deployments — no global count"
     )
-    # Phase 3 — course-teacher scope is irrelevant for students.
-    assert body["courseScopeDeployments"] == 0
 
 
 # ---------------------------------------------------------------------------

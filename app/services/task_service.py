@@ -1,30 +1,30 @@
 """Task lifecycle helpers.
 
-Two-phase dispatch:
+The task row is the queue entry (.github#5): `enqueue_task_in_tx` inserts it
+as PENDING with the job the worker runs (``tasks.job``) and the job's
+arguments (``tasks.job_kwargs``), and sends ``NOTIFY task_queued``, all in
+the caller's transaction. The caller commits the surrounding business state
+and the task atomically; Postgres delivers the NOTIFY with the commit. There
+is no second step that could fail after the commit, so a task is either
+queued with its deployment or not at all.
 
-1. `prepare_task_in_tx` — INSERT a PENDING task row in the caller's
-   transaction (no commit, no Celery I/O). The caller commits the
-   surrounding business state and the new task row atomically.
-
-2. `dispatch_to_celery` — outside the original TX, push the task to
-   RabbitMQ. On success the row's `celeryTaskId` is stamped; on
-   failure the row is marked FAILED. Either way the user sees a row
-   in the deployment list reflecting reality — no splitbrain.
+A worker claims the oldest PENDING task of a deployment that no other task
+holds a lease on (``worker/app/job_runtime.py``). The destroy that follows a
+cancel therefore waits until the cancelled job's worker let go of it
+(security review A-5, race 2).
 """
 from __future__ import annotations
 
-import logging
 import uuid
+from typing import Any
 
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.celery_app import celery_app
 from app.crud import tasks as crud_tasks
 from app.models import Task, TaskStatus, TaskType
-
-logger = logging.getLogger(__name__)
-
+from app.task_contract import NOTIFY_TASK_QUEUED
 
 # Name of the Postgres partial unique index backing the "one active
 # task per deployment" rule. String-matched when translating
@@ -37,17 +37,19 @@ class ActiveTaskExistsError(Exception):
     """A PENDING/RUNNING task already exists for this deployment."""
 
 
-def prepare_task_in_tx(
+def enqueue_task_in_tx(
     db: Session,
     deployment_id: uuid.UUID,
     task_type: TaskType,
+    job: str,
+    job_kwargs: dict[str, Any],
 ) -> Task:
-    """Insert a PENDING task row in the caller's transaction.
+    """Queue a PENDING task in the caller's transaction.
 
     Does NOT call `db.commit()` — the caller is responsible for
     committing the surrounding state alongside this row, so that
     deployment + teams + task are all visible (or all rolled back)
-    atomically.
+    atomically. Workers are woken with the commit.
 
     Raises `ActiveTaskExistsError` if the deployment already has a
     PENDING/RUNNING task. A Postgres partial unique index enforces this
@@ -63,10 +65,12 @@ def prepare_task_in_tx(
             )
 
     db_task = Task(
+        taskId=uuid.uuid4(),
         deploymentId=deployment_id,
         type=task_type,
         status=TaskStatus.PENDING,
-        celeryTaskId=None,
+        job=job,
+        job_kwargs=job_kwargs,
     )
     db.add(db_task)
     try:
@@ -82,41 +86,6 @@ def prepare_task_in_tx(
                 "(detected via DB unique constraint)"
             ) from e
         raise
+    db.execute(text("SELECT pg_notify(:channel, '')"), {"channel": NOTIFY_TASK_QUEUED})
     db.refresh(db_task)
     return db_task
-
-
-def dispatch_to_celery(
-    db: Session,
-    task: Task,
-    celery_task_name: str,
-    celery_args: list,
-) -> tuple[Task, str]:
-    """Push a prepared task to Celery.
-
-    MUST be called after the surrounding TX committed. Runs in fresh
-    transactions so the task row is updated independently of any later
-    request-handling commit.
-
-    On `send_task` failure the task is marked FAILED and the original
-    exception is re-raised — the caller turns that into a 503.
-    """
-    try:
-        result = celery_app.send_task(celery_task_name, args=celery_args)
-    except Exception:
-        logger.exception(
-            "Celery dispatch failed for task %s (deployment %s)",
-            task.taskId,
-            task.deploymentId,
-        )
-        task.status = TaskStatus.FAILED
-        task.logs = "Failed to dispatch to Celery"
-        db.commit()
-        db.refresh(task)
-        raise
-
-    task.celeryTaskId = result.id
-    db.commit()
-    db.refresh(task)
-    logger.info("Task %s dispatched as celery task %s", task.taskId, result.id)
-    return task, result.id

@@ -50,11 +50,12 @@ def _app(owner_id: uuid.UUID, is_private: bool = False) -> SimpleNamespace:
     )
 
 
-def _deployment(owner_id: uuid.UUID, course_id: uuid.UUID | None = None) -> SimpleNamespace:
+def _deployment(owner_id: uuid.UUID, course_id: uuid.UUID | None = None,
+                owner_role: UserRole = UserRole.STUDENT) -> SimpleNamespace:
     return SimpleNamespace(
         deploymentId=uuid.uuid4(),
         userId=owner_id,
-        user=SimpleNamespace(courseId=course_id),
+        user=SimpleNamespace(courseId=course_id, role=owner_role),
     )
 
 
@@ -152,7 +153,7 @@ def test_ensure_view_deployment_member_passes_for_team_member(student, db_mock):
 
 # ================================================================
 # DEPLOYMENTS — ensure_view_deployment_owner
-# Bug #1 regression: only owner / admin / course-teacher may inspect.
+# Bug #1 regression: only owner / admin may inspect.
 # ================================================================
 def test_ensure_view_deployment_owner_raises_for_non_owner_student(student):
     """A student who is not the owner cannot reach the owner-view."""
@@ -165,19 +166,19 @@ def test_ensure_view_deployment_owner_raises_for_non_owner_student(student):
     assert exc.value.detail["code"] == "deployment_owner_view_forbidden"
 
 
-def test_ensure_view_deployment_owner_passes_for_course_teacher(teacher):
-    """Phase 3 inspect-only right: a course-teacher of the deployment-
-    owner's course gets the owner view (logs / TF state / infrastructure)
-    without operate rights. ensure_* must not raise.
-    """
+@pytest.mark.parametrize("owner_role", [UserRole.STUDENT, UserRole.TEACHER])
+def test_ensure_view_deployment_owner_refuses_a_course_teacher(teacher, owner_role):
+    """Course-teachers have no inspect right (only teachers and admins
+    deploy; .github#7 F): a matching course_teachers row opens nothing."""
     course_id = uuid.uuid4()
-    dep = _deployment(uuid.uuid4(), course_id=course_id)
+    dep = _deployment(uuid.uuid4(), course_id=course_id, owner_role=owner_role)
     db = MagicMock()
-    # is_course_teacher_id finds a matching CourseTeacher row.
     db.query.return_value.filter.return_value.first.return_value = (
         SimpleNamespace(courseId=course_id, userId=teacher.userId)
     )
-    caps.ensure_view_deployment_owner(teacher, dep, db)
+    with pytest.raises(HTTPException) as exc:
+        caps.ensure_view_deployment_owner(teacher, dep, db)
+    assert exc.value.status_code == 403
 
 
 # ================================================================
@@ -201,23 +202,6 @@ def test_ensure_operate_deployment_passes_for_owner(student, db_mock):
     """The owner may operate the deployment — no raise."""
     dep = _deployment(student.userId)
     caps.ensure_operate_deployment(student, dep, db_mock)
-
-
-# ================================================================
-# DEPLOYMENTS — ensure_resend_access
-# ================================================================
-def test_ensure_resend_access_raises_for_unrelated_user(student):
-    """Resending credentials to someone else requires owner-view access.
-    A student who is not the owner and not in the team is rejected.
-    """
-    dep = _deployment(uuid.uuid4())
-    target = uuid.uuid4()
-    db = MagicMock()
-    db.query.return_value.filter.return_value.first.return_value = None
-    with pytest.raises(HTTPException) as exc:
-        caps.ensure_resend_access(student, dep, target, db)
-    assert exc.value.status_code == 403
-    assert exc.value.detail["code"] == "deployment_resend_forbidden"
 
 
 # ================================================================

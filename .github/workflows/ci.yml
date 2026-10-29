@@ -6,6 +6,9 @@ on:
     tags: ['v*.*.*']
   pull_request:
     branches: [main, dev]
+  # Runs the pipeline again for a branch (on dev and main it also publishes
+  # and rolls out, as a push does).
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -101,12 +104,11 @@ jobs:
           # Runner-VM gibt es ohnehin nur diese eine DB. Lokal ist die
           # Trennung wichtig (Dev-DB vs. Wegwerf-Test-DB); in CI nicht.
           DATABASE_URL: "postgresql://test:test@localhost:5432/test"
-          # Lifespan-startup spawns a Celery event-listener + a
+          # Lifespan-startup spawns the task-event LISTEN hub + a
           # reconciler asyncio task on every ``TestClient(app)``
           # construct. Across hundreds of test-client contexts those
-          # daemons stack up, hold DB + broker connections, and
-          # eventually exhaust the SQLAlchemy pool / block on broker
-          # reads. This flag short-circuits the lifespan body in
+          # daemons stack up, hold DB connections, and eventually
+          # exhaust the SQLAlchemy pool. This flag short-circuits the lifespan body in
           # tests — production paths set neither var.
           DISABLE_BACKGROUND_TASKS: "1"
           CREDENTIAL_ENCRYPTION_KEY: "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U="
@@ -189,8 +191,8 @@ jobs:
           # ValidationError.
           DATABASE_URL: "postgresql://test:test@localhost:5432/test"
           # Required — see test-unit job for the full rationale.
-          # Without this, the FastAPI lifespan spawns a Celery
-          # listener thread on every TestClient(app) enter, stacks
+          # Without this, the FastAPI lifespan spawns the event hub
+          # and the reconciler on every TestClient(app) enter, stacks
           # up over hundreds of tests, and either hangs the runner
           # or OOM-kills it.
           DISABLE_BACKGROUND_TASKS: "1"
@@ -286,17 +288,32 @@ jobs:
           path: coverage-html
           retention-days: 14
 
-      - name: Test Coverage Gate (enforce on main)
-        if: github.ref == 'refs/heads/main' || github.base_ref == 'main'
+      - name: Test Coverage Gate
         run: |
-          MIN_COVERAGE=70.0
-          PCT=$(python -c "import json; print(round(json.load(open('coverage-html/coverage.json'))['totals']['percent_covered'], 1))")
-          echo "Current coverage: ${PCT}%, required minimum: ${MIN_COVERAGE}%"
-          if (( $(echo "$PCT < $MIN_COVERAGE" | bc -l) )); then
-            echo "❌ Coverage Gate Failed: ${PCT}% is below required ${MIN_COVERAGE}%"
-            exit 1
-          fi
-          echo "✅ Coverage Gate Passed: ${PCT}% >= ${MIN_COVERAGE}%"
+          # Lines and branches are gated separately (a blended number lets a good
+          # line rate hide a weak branch rate). Keep each minimum at least 2
+          # points below the CI value (a flaky drop must not block merges) and
+          # update claude_docs/HANDOVER.md with them.
+          MIN_LINE_COVERAGE=80.0
+          MIN_BRANCH_COVERAGE=80.0
+          PYTHONUTF8=1 python - "$MIN_LINE_COVERAGE" "$MIN_BRANCH_COVERAGE" <<'PY'
+          import json, sys
+          t = json.load(open('coverage-html/coverage.json'))['totals']
+          checks = [
+              ('lines', t['covered_lines'], t['num_statements'], float(sys.argv[1])),
+              ('branches', t['covered_branches'], t['num_branches'], float(sys.argv[2])),
+          ]
+          ok = True
+          for name, covered, total, minimum in checks:
+              pct = round(100 * covered / total, 1)
+              print(f"Current backend {name} coverage: {pct}%, required minimum: {minimum}%")
+              if pct < minimum:
+                  print(f"❌ Coverage Gate Failed: {name} {pct}% is below required {minimum}%")
+                  ok = False
+              else:
+                  print(f"✅ Coverage Gate Passed: {name} {pct}% >= {minimum}%")
+          sys.exit(0 if ok else 1)
+          PY
 
   # ================================================================
   # 🔒 SECURITY (deps + filesystem) — blocks on HIGH/CRITICAL
@@ -304,6 +321,37 @@ jobs:
   # Runs in parallel with lint/test-unit. Findings appear in the
   # GitHub Security tab via SARIF upload. Whitelist false positives
   # in `.trivyignore` (with a comment explaining why).
+  # The validator of app-registry (scripts/validate_appstore_yaml.py, which every
+  # app's CI runs) must give the same verdict as app/k8s/spec.py. app-registry
+  # checks that weekly; here a change to the contract shows its drift in its own
+  # pull request. Not in the needs of the build: it informs, it does not block.
+  contract-drift:
+    name: "🔗 App contract vs app-registry validator"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Checkout app-registry
+        uses: actions/checkout@v4
+        with:
+          repository: DHBW-AppStore-T3/app-registry
+          path: app-registry
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Same verdict as the validator
+        working-directory: app-registry
+        env:
+          BACKEND_SPEC_PY: ${{ github.workspace }}/app/k8s/spec.py
+        run: |
+          pip install --quiet pyyaml jsonschema pydantic
+          python -m unittest discover -s tests -p "test_contract_drift.py" -v
+
   security:
     name: "🔒 Security"
     runs-on: ubuntu-latest
@@ -333,16 +381,10 @@ jobs:
         run: |
           poetry run python -m pip install --upgrade pip
           poetry run python -m pip install pip-audit
-          # PYSEC-2026-1325 (ecdsa): Minerva timing side-channel on
-          # P-256. No upstream fix — python-ecdsa considers side-channel
-          # attacks out of scope, so this will never be resolved. It's
-          # pulled in transitively by python-jose. The vuln only affects
-          # *signing* (sign_digest); our only use of jose is verifying
-          # Keycloak RS256 tokens (app/utils/keycloak_auth.py), so the
-          # attack surface is not present. Ignored here rather than left
-          # to fail --strict indefinitely. Revisit if we ever sign with
-          # ecdsa or migrate off python-jose (e.g. to PyJWT).
-          poetry run pip-audit --strict --ignore-vuln PYSEC-2026-1325
+          # python-jose and its ecdsa dependency are gone (PyJWT, .github#7 P),
+          # and with them the two ignored advisories PYSEC-2026-1325 and
+          # CVE-2026-85394.
+          poetry run pip-audit --strict
 
       # Trivy fs runs twice on purpose:
       #   1. blocking gate — fails the job on HIGH/CRITICAL
@@ -385,7 +427,7 @@ jobs:
   build:
     name: "🐳 Build"
     runs-on: ubuntu-latest
-    needs: [lint, test-integration, security]
+    needs: [lint, test-integration, coverage, security]
     permissions:
       contents: read
       packages: write
@@ -422,6 +464,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Rebuilds the Debian upgrade layer (Dockerfile, SECURITY_REFRESH).
+          build-args: SECURITY_REFRESH=${{ github.run_id }}
 
   # ================================================================
   # 🔒 IMAGE SCAN — Trivy CVE scan against the built image
@@ -455,6 +499,7 @@ jobs:
           platforms: linux/amd64
           tags: backend:scan
           cache-from: type=gha
+          build-args: SECURITY_REFRESH=${{ github.run_id }}
 
       - name: Trivy image scan (gate)
         uses: aquasecurity/trivy-action@v0.36.0
@@ -490,10 +535,16 @@ jobs:
     name: "📦 Push"
     runs-on: ubuntu-latest
     needs: [build, image-scan]
-    if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') && github.event_name == 'push'
+    if: >-
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     permissions:
       contents: read
       packages: write
+      id-token: write       # sign the image's origin (Sigstore, keyless)
+      attestations: write   # store that signature with GitHub
+    outputs:
+      digest: ${{ steps.push-image.outputs.digest }}
 
     steps:
       - name: Checkout repository
@@ -525,6 +576,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Build and push Docker image
+        id: push-image
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -535,39 +587,49 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Rebuilds the Debian upgrade layer (Dockerfile, SECURITY_REFRESH).
+          build-args: SECURITY_REFRESH=${{ github.run_id }}
+      # Signs which repository, workflow, branch and commit built this digest (SLSA
+      # build provenance, keyless); the deployment repo rolls out only images that
+      # have it (.github/scripts/verify-image.sh there).
+      - name: Attest the image's origin
+        if: steps.push-image.outputs.digest != ''
+        uses: actions/attest@v4
+        with:
+          subject-name: ghcr.io/dhbw-appstore-t3/backend
+          subject-digest: ${{ steps.push-image.outputs.digest }}
 
   # ================================================================
-  # 🚀 TRIGGER STAGING DEPLOY
+  # ☸️ ROLL OUT ON KUBERNETES — dev -> staging, main -> prod
   # ================================================================
-  trigger-staging:
-    name: "🚀 Trigger Staging Deploy"
+  # The deployment repo pins the image just pushed (tag sha-<commit>) by its
+  # digest in k8s/images/<staging|prod>.yaml; Argo CD of that environment
+  # follows (see k8s-bump.yml there: a self-merging PR on dev,
+  # a PR on main that a person approves).
+  k8s-rollout:
+    name: "☸️ Roll out on k8s"
     runs-on: ubuntu-latest
     needs: [push]
-    if: github.ref == 'refs/heads/dev' && github.event_name == 'push'
+    if: >-
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
 
     steps:
-      - name: Trigger staging deployment
+      # A one-hour token of the GitHub App "DHBW AppStore deploy" (installed only
+      # on the deployment repository, Actions: write), not a personal token.
+      - name: Token for the deployment repository
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.DEPLOY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
+          owner: DHBW-AppStore-T3
+          repositories: deployment
+          permission-actions: write
+      - name: Pin the new image in the deployment repo
         run: |
-          gh workflow run staging.yml \
-            --repo DHBW-AppStore-T3/deployment \
-            --ref dev
+          gh workflow run k8s-bump.yml --repo DHBW-AppStore-T3/deployment --ref "$GITHUB_REF_NAME" \
+            -f component=backend -f tag="sha-${GITHUB_SHA::7}" -f digest="$DIGEST"
         env:
-          GH_TOKEN: ${{ secrets.DEPLOYMENT_PAT }}
-
-  # ================================================================
-  # 🚀 TRIGGER PRODUCTION DEPLOY
-  # ================================================================
-  trigger-production:
-    name: "🚀 Trigger Production Deploy"
-    runs-on: ubuntu-latest
-    needs: [push]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-
-    steps:
-      - name: Trigger production deployment
-        run: |
-          gh workflow run production.yml \
-            --repo DHBW-AppStore-T3/deployment \
-            --ref main
-        env:
-          GH_TOKEN: ${{ secrets.DEPLOYMENT_PAT }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DIGEST: ${{ needs.push.outputs.digest }}

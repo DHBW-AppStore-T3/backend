@@ -157,3 +157,48 @@ def soft_delete_app(db: Session, app_id: UUID) -> bool:
     db_app.deleted_at = utcnow()
     db.commit()
     return True
+
+
+def set_hidden_by_admin(db: Session, app_id: UUID, hidden: bool) -> App | None:
+    """Set or lift an admin's deactivation of the app and commit; None if it does not exist.
+
+    Setting it also makes the app private; lifting it leaves ``is_private``
+    to the caller. Soft-deleted apps are included.
+    """
+    db_app = get_app(db, app_id, include_deleted=True)
+    if not db_app:
+        return None
+    db_app.hidden_by_admin = hidden
+    if hidden:
+        db_app.is_private = True
+    db.commit()
+    db.refresh(db_app)
+    return db_app
+
+
+def set_recommended(db: Session, app_id: UUID, recommended: bool) -> App | None:
+    """Set or clear the admin's recommendation and commit; None if the app does not exist.
+
+    Soft-deleted apps are included.
+    """
+    db_app = get_app(db, app_id, include_deleted=True)
+    if not db_app:
+        return None
+    db_app.recommended = recommended
+    db.commit()
+    db.refresh(db_app)
+    return db_app
+
+
+def set_deploy_version(db: Session, app_id: UUID, version_tag: str | None) -> App | None:
+    """Set (or with None clear) the version teachers deploy and commit; None if the app does not exist.
+
+    The caller checks that the version is approved. Soft-deleted apps are included.
+    """
+    db_app = get_app(db, app_id, include_deleted=True)
+    if not db_app:
+        return None
+    db_app.deploy_version = version_tag
+    db.commit()
+    db.refresh(db_app)
+    return db_app

@@ -1,0 +1,167 @@
+"""What the API and the worker agree on about a task (.github#5).
+
+Queue: a task row is its own queue entry. The API inserts it as PENDING
+with the job to run (``tasks.job``) and its arguments (``tasks.job_kwargs``);
+a worker claims the oldest one it may run, see ``worker/app/job_runtime.py``.
+
+Events: the worker appends ``task_events`` rows while a job runs; the API
+streams them as Server-Sent Events. The API writes a terminal event itself
+when it cancels a task or fails one whose worker died. Event types keep the
+names of the former Celery events, so the SSE event names and the frontend
+stay as they were.
+
+NOTIFY channels: ``task_events`` (trigger, one per event row),
+``task_queued`` (API -> worker, a task was queued), ``task_cancel`` (API ->
+worker, payload: task id) and ``task_released`` (-> worker, payload: task
+id, once a task's lease is let go, by its worker or by the API's reaper; a
+task of the same deployment may run now).
+
+Results: the worker seals the OpenTofu/Terraform outputs and state with the
+shared Fernet key into ``tasks.outputs_enc``; plaintext results never leave
+the worker any more.
+
+This file is identical in ``backend/app/task_contract.py`` and
+``worker/app/task_contract.py``; ``tests/unit/test_shared_files.py`` checks
+its hash in both repositories.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any, Protocol
+
+EVENT_PROGRESS = "task-progress"
+EVENT_LOG = "task-log"
+EVENT_SUCCEEDED = "task-succeeded"
+EVENT_FAILED = "task-failed"
+EVENT_REVOKED = "task-revoked"
+TERMINAL_EVENTS = frozenset({EVENT_SUCCEEDED, EVENT_FAILED, EVENT_REVOKED})
+
+# ``failure_kind`` of a task-failed event; frontends treat a missing kind
+# as a worker failure.
+FAILURE_KIND_WORKER = "worker_failure"
+FAILURE_KIND_WORKER_LOST = "worker_lost"
+FAILURE_KIND_INFRASTRUCTURE = "infrastructure"
+FAILURE_KIND_TIME_LIMIT = "time_limit"
+
+NOTIFY_TASK_EVENTS = "task_events"
+NOTIFY_TASK_QUEUED = "task_queued"
+NOTIFY_TASK_CANCEL = "task_cancel"
+NOTIFY_TASK_RELEASED = "task_released"
+
+# Log events per task; after that one marker event, then the live stream
+# carries progress only. The full transcript lands in ``tasks.logs``.
+MAX_LOG_EVENTS = 10_000
+# Upper bound of one event's JSON; longer messages are cut.
+MAX_EVENT_BYTES = 32 * 1024
+
+TASK_STATUS_BY_TERMINAL_EVENT = {
+    EVENT_SUCCEEDED: "success",
+    EVENT_FAILED: "failed",
+    EVENT_REVOKED: "cancelled",
+}
+
+
+class Cipher(Protocol):
+    def encrypt(self, data: bytes) -> bytes: ...
+
+    def decrypt(self, token: bytes) -> bytes: ...
+
+
+def event_payload(event_type: str, *, deployment_id: str, task_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+    """The JSON of one event row: the fields plus type and ids, cut to ``MAX_EVENT_BYTES``."""
+    payload = {**fields, "type": event_type, "deployment_id": str(deployment_id), "task_id": str(task_id)}
+    encoded = json.dumps(payload, default=str)
+    if len(encoded.encode("utf-8")) > MAX_EVENT_BYTES and isinstance(payload.get("message"), str):
+        overflow = len(encoded.encode("utf-8")) - MAX_EVENT_BYTES
+        keep = max(len(payload["message"]) - overflow - 64, 0)
+        payload["message"] = payload["message"][:keep] + " …[truncated]"
+        payload["truncated"] = True
+    return payload
+
+
+def terminal_payload(
+    event_type: str,
+    *,
+    deployment_id: str,
+    task_id: str,
+    task_type: str | None,
+    failure_kind: str | None = None,
+) -> dict[str, Any]:
+    """Payload of a terminal event (succeeded / failed / revoked), the shape the SSE clients know."""
+    fields: dict[str, Any] = {"task_type": task_type, "status": TASK_STATUS_BY_TERMINAL_EVENT[event_type]}
+    if event_type == EVENT_FAILED and failure_kind:
+        fields["failure_kind"] = failure_kind
+    return event_payload(event_type, deployment_id=deployment_id, task_id=task_id, fields=fields)
+
+
+# Names of the result contract (.github#15). The terraform/tf names are the
+# legacy ones; the neutral names are accepted everywhere but written nowhere
+# yet (phase 1 of the rename: readers first, writers once all readers run).
+RESULT_OUTPUTS = "outputs"
+RESULT_STATE = "state"
+LEGACY_RESULT_OUTPUTS = "terraform_outputs"
+LEGACY_RESULT_STATE = "tf_state"
+# Key of a deployment's variable values inside ``deployments.userInputVar``
+# (and the job's ``user_vars``); the first one present wins.
+USER_INPUT_VARIABLES_KEYS = ("variables", "terraform")
+# Output that maps a team to its endpoint(s); ``my-access`` reads either.
+OUTPUT_TEAM_ENDPOINTS = "team_endpoints"
+LEGACY_OUTPUT_TEAM_ENDPOINTS = "team_vms"
+
+
+def result_outputs(document: dict[str, Any]) -> Any:
+    """The outputs of a result document, under the new or the legacy name."""
+    return document[RESULT_OUTPUTS] if RESULT_OUTPUTS in document else document.get(LEGACY_RESULT_OUTPUTS)
+
+
+def result_state(document: dict[str, Any]) -> Any:
+    """The state of a result document, under the new or the legacy name."""
+    return document[RESULT_STATE] if RESULT_STATE in document else document.get(LEGACY_RESULT_STATE)
+
+
+def user_input_variables(user_input: Any) -> dict[str, Any]:
+    """The variable block of a ``userInputVar`` / ``user_vars`` mapping, or ``{}``."""
+    if isinstance(user_input, dict):
+        for key in USER_INPUT_VARIABLES_KEYS:
+            block = user_input.get(key)
+            if isinstance(block, dict):
+                return block
+    return {}
+
+
+def team_endpoints_output(outputs: dict[str, Any] | None) -> dict[str, Any]:
+    """The team-endpoint output of ``outputs`` (``{"<name>": {"value": ...}}``), or ``{}``."""
+    for name in (OUTPUT_TEAM_ENDPOINTS, LEGACY_OUTPUT_TEAM_ENDPOINTS):
+        bag = (outputs or {}).get(name)
+        value = bag.get("value") if isinstance(bag, dict) else None
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def seal_results(cipher: Cipher, *, terraform_outputs: Any, tf_state: str | None) -> bytes:
+    """Fernet token over the task's outputs and state (``tasks.outputs_enc``).
+
+    Still written under the legacy names, so that a reader of the previous
+    release opens it.
+    """
+    document = {LEGACY_RESULT_OUTPUTS: terraform_outputs, LEGACY_RESULT_STATE: tf_state}
+    return cipher.encrypt(json.dumps(document, default=str).encode("utf-8"))
+
+
+def open_results(cipher: Cipher, token: bytes) -> dict[str, Any]:
+    """Inverse of :func:`seal_results`.
+
+    Reads both name generations. The result carries the legacy keys
+    ``terraform_outputs`` / ``tf_state`` and the neutral ``outputs`` /
+    ``state``, all of them always present.
+    """
+    document = json.loads(cipher.decrypt(bytes(token)).decode("utf-8"))
+    outputs, state = result_outputs(document), result_state(document)
+    return {
+        LEGACY_RESULT_OUTPUTS: outputs,
+        LEGACY_RESULT_STATE: state,
+        RESULT_OUTPUTS: outputs,
+        RESULT_STATE: state,
+    }

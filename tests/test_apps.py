@@ -32,7 +32,7 @@ def test_get_apps_unauthenticated(unauth_client):
 # changing the repo would make existing deployments point at a different
 # repo than they originally deployed.
 
-ORIGINAL_GIT_LINK = "https://example.com/orig.git"
+ORIGINAL_GIT_LINK = "https://example.com/acme/orig.git"
 
 
 @pytest.fixture
@@ -340,3 +340,17 @@ def test_admin_can_change_user_role(db):
         assert response.json()["role"] == "teacher"
     finally:
         fastapi_app.dependency_overrides.clear()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("email", ["owner@example.test", "owner@lti.invalid", "owner@dhbw.de"])
+def test_get_app_with_reserved_email_domain_owner(client, db, mock_user, email):
+    """Reserved domains (.invalid, .test) must not turn GET /apps/{id} into a 500."""
+    from tests.conftest import create_app_in_db
+
+    mock_user.email = email
+    db.commit()
+    app = create_app_in_db(db, mock_user)
+    response = client.get(f"/apps/{app.appId}")
+    assert response.status_code == 200, response.text
+    assert response.json()["user"]["email"] == email

@@ -45,13 +45,23 @@ import warnings
 
 # IMPORTANT: this env-var must be set BEFORE ``app.main`` is imported.
 # ``lifespan`` reads it on every ``TestClient(app)`` enter to decide
-# whether to spawn the Celery event-listener thread and reconciler
-# task. Without this gate, each test-client context stacks up another
-# listener thread (daemon, never cleanly stopped) that holds DB +
-# broker connections — within a handful of tests the SQLAlchemy pool
-# is exhausted and the next legit query deadlocks. See ``app/main.py``
-# for the full rationale.
+# whether to start the task-event LISTEN hub and the reconciler task.
+# Without this gate, each test-client context stacks up another
+# listener (never cleanly stopped) that holds DB connections — within a
+# handful of tests the SQLAlchemy pool is exhausted and the next legit
+# query deadlocks. See ``app/main.py`` for the full rationale.
 os.environ.setdefault("DISABLE_BACKGROUND_TASKS", "1")
+# App repositories may only come from these hosts (.github#7 B); the tests'
+# fixtures use example.com and github.com.
+os.environ.setdefault("APP_GIT_ALLOWED_HOSTS", "github.com,example.com")
+# The suite runs with the published CI key and plain-HTTP URLs, which only
+# development accepts (.github#7 O); tests of the production checks build
+# their own Settings.
+os.environ.setdefault("APP_ENV", "development")
+
+import hashlib
+import tempfile
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -63,6 +73,7 @@ from app.database import Base, get_db
 from app.main import app
 from app.models import (  # noqa: F401  (importiert für seitliche Effekte / Metadata-Registrierung)
     App,
+    Task,
     User,
     UserRole,
 )
@@ -98,6 +109,30 @@ engine = create_engine(
     pool_recycle=300,
 )
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+# ----------------------------------------------------------------
+# Marker-Pflicht
+# ----------------------------------------------------------------
+def pytest_collection_modifyitems(config, items):
+    """Refuse tests that CI would never run.
+
+    CI runs ``pytest -m unit`` and ``pytest -m integration`` and nothing
+    else, so a test with neither marker passes or fails unseen. Mark a whole
+    file with ``pytestmark = pytest.mark.unit`` (no database: put it in
+    ``tests/unit/``) or ``pytest.mark.integration``.
+    """
+    unmarked = sorted(
+        {
+            item.nodeid.split("::")[0]
+            for item in items
+            if item.get_closest_marker("unit") is None and item.get_closest_marker("integration") is None
+        }
+    )
+    if unmarked:
+        raise pytest.UsageError(
+            "tests without a 'unit' or 'integration' marker are never run by CI: " + ", ".join(unmarked)
+        )
 
 
 # ----------------------------------------------------------------
@@ -146,8 +181,162 @@ def _truncate_tables(_setup_schema):
 
 
 # ----------------------------------------------------------------
+# Fake Git remote — no test reaches a real Git host.
+# ----------------------------------------------------------------
+DEFAULT_SPEC = {
+    "apiVersion": "appstore/v2",
+    "name": "test-app",
+    "runtime": "kubernetes",
+    "scope": "team",
+    "workload": {
+        "containers": [
+            {
+                "name": "app",
+                "image": "ghcr.io/dhbw-appstore-t3/apps/test-app@sha256:" + "a" * 64,
+                "expose": {"port": 8080},
+                "resources": {"cpu": "500m", "memory": "1Gi"},
+            }
+        ],
+    },
+}
+
+
+def spec_with(**changes) -> str:
+    """The default ``appstore.yaml`` with top-level keys replaced (``None`` removes one)."""
+    import yaml
+
+    spec = {**DEFAULT_SPEC, **changes}
+    return yaml.safe_dump({k: v for k, v in spec.items() if v is not None})
+
+
+class FakeGitRemote:
+    """Stands in for the app repositories behind ``git_service``.
+
+    ``tags`` maps tag -> commit SHA. With ``any_tag`` (the default) every
+    tag a test asks for exists and points to ``sha_for(tag)``; set
+    ``any_tag = False`` to make only ``tags`` exist. ``files`` maps a path
+    inside the repository to its content (by default a valid
+    ``appstore.yaml``) and is written into every sparse clone, so
+    ``load_variable_definitions`` parses it. ``moved`` makes a
+    tag point to another commit from now on (a moved tag).
+    """
+
+    def __init__(self) -> None:
+        self.any_tag = True
+        self.tags: dict[str, str] = {}
+        # Every commit holds a valid appstore.yaml unless a test replaces it.
+        self.files: dict[str, str] = {"appstore.yaml": spec_with()}
+        self.clones: list[tuple[str, str, str]] = []
+        self.readable = True
+
+    @staticmethod
+    def sha_for(tag: str, salt: str = "") -> str:
+        return hashlib.sha1(f"{salt}{tag}".encode()).hexdigest()
+
+    def move(self, tag: str) -> str:
+        self.tags[tag] = self.sha_for(tag, salt="moved:")
+        return self.tags[tag]
+
+    def ls_remote(self, git_url: str):
+        import git as gitpython
+
+        from app.services.git_service import checked_url
+
+        checked_url(git_url)
+        if not self.readable:
+            raise gitpython.GitCommandError(["git", "ls-remote"], 128, stderr="repository not found")
+        tags = dict(self.tags)
+        return [{"version": t, "commit": s[:8], "sha": s, "type": "tag"} for t, s in tags.items()]
+
+    def verify(self, git_url: str) -> dict:
+        self.ls_remote(git_url)
+        return {"success": True, "message": "ok"}
+
+    def resolve(self, git_url: str, tag: str):
+        self.ls_remote(git_url)
+        if tag in self.tags:
+            return self.tags[tag]
+        return self.sha_for(tag) if self.any_tag else None
+
+    def clone(self, git_url: str, tag: str, commit_sha: str) -> str:
+        self.ls_remote(git_url)
+        self.clones.append((git_url, tag, commit_sha))
+        path = Path(tempfile.mkdtemp(prefix="fake_vars_"))
+        for rel, content in self.files.items():
+            target = path / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        return str(path)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_rate_limits():
+    """Every test starts with untouched per-person budgets (app/utils/rate_limit.py)."""
+    from app.utils import rate_limit
+
+    rate_limit.limiter.reset()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def fake_git(request, monkeypatch):
+    """Every test talks to a ``FakeGitRemote`` unless marked ``real_git``."""
+    from app.routers import apps as apps_router
+    from app.services import git_service as git_module
+
+    apps_router.clear_variable_cache()
+    remote = FakeGitRemote()
+    if request.node.get_closest_marker("real_git"):
+        yield remote
+        return
+    svc = git_module.git_service
+    monkeypatch.setattr(svc, "_ls_remote_tags", remote.ls_remote)
+    monkeypatch.setattr(svc, "resolve_tag", remote.resolve)
+    monkeypatch.setattr(svc, "clone_release_vars", remote.clone)
+    monkeypatch.setattr(svc, "verify_repository_access", remote.verify)
+    yield remote
+    apps_router.clear_variable_cache()
+
+
+# ----------------------------------------------------------------
 # DB-Session-Fixture — frische Session pro Test, immer geschlossen.
 # ----------------------------------------------------------------
+class QueuedJobs:
+    """The jobs the API queued during a test: ``(job, job_kwargs)`` of new task rows, oldest first.
+
+    Read in a session of its own, so the test's ``db`` session keeps its state.
+    """
+
+    def __init__(self) -> None:
+        self._seen: set = set()
+
+    def _rows(self):
+        with TestingSessionLocal() as session:
+            return (
+                session.query(Task.taskId, Task.job, Task.job_kwargs)
+                .filter(Task.job.isnot(None))
+                .order_by(Task.created_at)
+                .all()
+            )
+
+    def __call__(self) -> list[tuple]:
+        return [(job, kwargs) for task_id, job, kwargs in self._rows() if task_id not in self._seen]
+
+    def last(self) -> tuple:
+        jobs = self()
+        assert jobs, "nothing was queued"
+        return jobs[-1]
+
+    def reset(self) -> None:
+        """Forget what was queued so far."""
+        self._seen.update(task_id for task_id, _, _ in self._rows())
+
+
+@pytest.fixture
+def queued():
+    return QueuedJobs()
+
+
 @pytest.fixture
 def db():
     session = TestingSessionLocal()
@@ -301,6 +490,27 @@ def unauth_client():
 # ----------------------------------------------------------------
 # SHARED DB HELPERS
 # ----------------------------------------------------------------
+def approve_version_in_db(db, app, version_tag="v1.0.0", commit_sha=None, status=None, spec_sha256=None):
+    """Store an approval of ``version_tag`` at ``commit_sha`` (default: what the fake remote resolves).
+
+    It covers the default ``appstore.yaml`` of ``FakeGitRemote`` unless ``spec_sha256`` says otherwise.
+    """
+    from app.models import AppVersionApproval, AppVersionApprovalStatus
+
+    approval = AppVersionApproval(
+        appId=app.appId,
+        version_tag=version_tag,
+        commit_sha=commit_sha or FakeGitRemote.sha_for(version_tag),
+        status=status or AppVersionApprovalStatus.APPROVED,
+        runtime="kubernetes",
+        spec_sha256=spec_sha256 or hashlib.sha256(spec_with().encode()).hexdigest(),
+    )
+    db.add(approval)
+    db.commit()
+    db.refresh(approval)
+    return approval
+
+
 def create_app_in_db(db, user, *, name="Test App", git_link="https://github.com/example/repo", is_private=False):
     db_app = App(
         appId=uuid.uuid4(),

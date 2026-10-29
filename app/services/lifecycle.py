@@ -7,7 +7,7 @@ canonical mapping.
 Status values follow ``crud_deployments.get_deployment_status``:
 
 * ``pending`` / ``running`` — a deploy task is in flight
-* ``success`` — deploy finished, resources live in OpenStack
+* ``success`` — deploy finished, resources live in the cluster
 * ``failed`` — last task ended in error (deploy / destroy / pause / resume)
 * ``cancelled`` — last task was revoked
 * ``destroying`` — a destroy task is in flight (synthetic)
@@ -15,6 +15,11 @@ Status values follow ``crud_deployments.get_deployment_status``:
 * ``pausing`` — a pause task is in flight (synthetic)
 * ``paused`` — a pause task finished successfully (synthetic)
 * ``resuming`` — a resume task is in flight (synthetic)
+* ``pause_failed`` / ``resume_failed`` — the last pause/resume task ended
+  in error (synthetic)
+* ``redeploying`` — a single-VM/workload redeploy is in flight (synthetic)
+* ``redeploy_failed`` — the last redeploy ended in error; the other
+  resources are untouched (synthetic)
 """
 
 from __future__ import annotations
@@ -31,18 +36,20 @@ class DeploymentAction(str, Enum):
 
     DESTROY = "destroy"
     DELETE = "delete"
-    # Pause halts compute (``openstack server stop`` for every server);
-    # volumes and networks stay so resume restores the same instances.
+    # Pause scales the workloads to zero; volumes stay so resume restores
+    # the same data.
     PAUSE = "pause"
     # Resume reverses pause. Only valid in the synthetic ``paused``
     # state so the matrix stays unambiguous.
     RESUME = "resume"
     # Cancel stops a deploy that is still in flight. It is the only
     # action permitted while a worker task is running, and it is not a
-    # plain "forget about it": the worker task is revoked and a destroy
-    # follows that also reaps the Packer build instance, which lives
-    # outside Terraform state and would otherwise be left running.
+    # plain "forget about it": the worker task is stopped and a destroy
+    # follows that removes the namespace.
     CANCEL = "cancel"
+    # Restart or reset one pod workload. Only while the deployment's
+    # resources are up, so it cannot race a pause (.github#7 L).
+    REDEPLOY = "redeploy"
 
 
 # Synthetic statuses where a worker task is currently in flight. Every
@@ -55,6 +62,7 @@ IN_FLIGHT_STATUSES: frozenset[str] = frozenset({
     "destroying",
     "pausing",
     "resuming",
+    "redeploying",
 })
 
 
@@ -67,8 +75,9 @@ _ALLOWED: dict[str, set[DeploymentAction]] = {
     # very task before doing anything else.
     "pending": {DeploymentAction.CANCEL},
     "running": {DeploymentAction.CANCEL},
-    # Deployed and running — tear down or pause compute to free quota.
-    "success": {DeploymentAction.DESTROY, DeploymentAction.PAUSE},
+    # Deployed and running — tear down or pause compute to free quota, or
+    # rebuild a single VM/workload.
+    "success": {DeploymentAction.DESTROY, DeploymentAction.PAUSE, DeploymentAction.REDEPLOY},
     # A failed deploy may have created some resources, so Destroy is
     # offered to reconcile; Delete is available when there's nothing to
     # clean up. Both end at "row hidden from UI".
@@ -77,7 +86,7 @@ _ALLOWED: dict[str, set[DeploymentAction]] = {
     # deployment, so that status only exists transiently (sub-second).
     "cancelled": {DeploymentAction.DELETE},
     # Paused — Resume is the obvious action; Destroy stays available so
-    # the user needn't resume first (terraform-destroy works on SHUTOFF).
+    # the user needn't resume first.
     "paused": {DeploymentAction.RESUME, DeploymentAction.DESTROY},
     # Pause failed: the deployment is still running. Allow PAUSE retry,
     # RESUME (harmless), and DESTROY.
@@ -93,20 +102,29 @@ _ALLOWED: dict[str, set[DeploymentAction]] = {
         DeploymentAction.PAUSE,
         DeploymentAction.DESTROY,
     },
-    # pending / running / destroying / pausing / resuming — no action
-    # allowed; a DB partial-unique index on in-flight tasks enforces
-    # this at insert time too.
+    # Redeploy failed: only that one VM/workload is in doubt, the rest
+    # runs. Allow a retry, PAUSE and DESTROY — not DELETE, which would hide
+    # a deployment whose resources still run.
+    "redeploy_failed": {
+        DeploymentAction.REDEPLOY,
+        DeploymentAction.PAUSE,
+        DeploymentAction.DESTROY,
+    },
+    # pending / running / destroying / pausing / resuming / redeploying —
+    # no action allowed (cancel only for a deploy); a DB partial-unique
+    # index on in-flight tasks enforces this at insert time too.
 }
 
 # Human-readable explanation for the 409 we throw when an action isn't
 # allowed. Keys match the action; the message lists the statuses where
 # the action is valid.
 _REQUIRED_STATES: dict[DeploymentAction, str] = {
-    DeploymentAction.DESTROY: "success, failed, paused, pause_failed or resume_failed",
+    DeploymentAction.DESTROY: "success, failed, paused, pause_failed, resume_failed or redeploy_failed",
     DeploymentAction.DELETE: "failed or cancelled",
-    DeploymentAction.PAUSE: "success, pause_failed or resume_failed",
+    DeploymentAction.PAUSE: "success, pause_failed, resume_failed or redeploy_failed",
     DeploymentAction.RESUME: "paused, pause_failed or resume_failed",
     DeploymentAction.CANCEL: "pending or running",
+    DeploymentAction.REDEPLOY: "success or redeploy_failed",
 }
 
 

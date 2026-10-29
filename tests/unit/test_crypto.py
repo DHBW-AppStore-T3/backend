@@ -24,7 +24,7 @@ def test_encrypt_decrypt_roundtrip_returns_original_plaintext() -> None:
 @pytest.mark.unit
 def test_encrypt_b64_produces_ascii_string_and_roundtrips() -> None:
     """encrypt_b64 erzeugt einen ASCII/base64-sicheren String, der wieder dekodierbar ist."""
-    plaintext = "celery-envelope-payload"
+    plaintext = "queue-envelope-payload"
     token_b64 = crypto.encrypt_b64(plaintext)
     assert isinstance(token_b64, str)
     # Muss reine ASCII sein und sich als base64 dekodieren lassen.
@@ -102,3 +102,41 @@ def test_reload_with_freshly_generated_key_succeeds(monkeypatch: pytest.MonkeyPa
     finally:
         monkeypatch.setattr(settings, "CREDENTIAL_ENCRYPTION_KEY", original_key, raising=False)
         importlib.reload(crypto)
+
+
+@pytest.fixture
+def reload_with_results_key(monkeypatch: pytest.MonkeyPatch):
+    """Baut die Ciphers des Moduls mit einem anderen RESULTS_ENCRYPTION_KEY neu; danach wieder wie vorher."""
+    original = settings.RESULTS_ENCRYPTION_KEY
+
+    def reload(key: str):
+        monkeypatch.setattr(settings, "RESULTS_ENCRYPTION_KEY", key, raising=False)
+        return importlib.reload(crypto)
+
+    yield reload
+    monkeypatch.setattr(settings, "RESULTS_ENCRYPTION_KEY", original, raising=False)
+    importlib.reload(crypto)
+
+
+@pytest.mark.unit
+def test_results_are_sealed_with_their_own_key_and_old_ones_still_open(reload_with_results_key) -> None:
+    """Ergebnisse werden mit RESULTS_ENCRYPTION_KEY versiegelt; mit dem Credential-Key versiegelte bleiben lesbar."""
+    results_key = Fernet.generate_key()
+    sealed_before = Fernet(settings.CREDENTIAL_ENCRYPTION_KEY.encode()).encrypt(b"old outputs")
+
+    module = reload_with_results_key(results_key.decode())
+
+    sealed = module.results_cipher.encrypt(b"outputs")
+    assert Fernet(results_key).decrypt(sealed) == b"outputs"
+    with pytest.raises(InvalidToken):
+        Fernet(settings.CREDENTIAL_ENCRYPTION_KEY.encode()).decrypt(sealed)
+    assert module.results_cipher.decrypt(sealed_before) == b"old outputs"
+
+
+@pytest.mark.unit
+def test_without_a_results_key_the_credential_key_seals_as_before(reload_with_results_key) -> None:
+    """Ohne RESULTS_ENCRYPTION_KEY versiegelt der Credential-Key wie bisher."""
+    module = reload_with_results_key("")
+
+    sealed = module.results_cipher.encrypt(b"outputs")
+    assert Fernet(settings.CREDENTIAL_ENCRYPTION_KEY.encode()).decrypt(sealed) == b"outputs"

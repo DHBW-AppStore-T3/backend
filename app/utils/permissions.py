@@ -80,16 +80,19 @@ require_staff = require_roles(UserRole.TEACHER, UserRole.ADMIN)
 # ----------------------------------------------------------------
 def has_deployment_access(deployment: Deployment, user: User, db: Session) -> bool:
     """
-    Return True if `user` may read/manage `deployment`.
+    Return True if `user` may read `deployment` (member view).
 
     Allowed when any of:
-      - user is teacher or admin
+      - user is an admin
       - user is the deployment owner
       - user is part of any team assigned to this deployment
         (via UserToTeam joined to Team.deploymentId)
       - user appears in UserToDeployment for this deployment
+
+    Teachers no longer read every deployment (.github#7 F, security review
+    H-1); the owner view is in :mod:`app.utils.capabilities`.
     """
-    if user.role in STAFF_ROLES:
+    if user.role == UserRole.ADMIN:
         return True
     if str(deployment.userId) == str(user.userId):
         return True

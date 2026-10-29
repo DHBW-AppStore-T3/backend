@@ -19,9 +19,21 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
+import logging
+from collections.abc import Callable
 
 from fastapi import HTTPException, status
+
+from app.config import settings
+from app.services import malware_scan
+from app.services.upload_validation import UploadRejected, inspect_upload
+from app.task_contract import USER_INPUT_VARIABLES_KEYS, user_input_variables
+from app.utils import upload_mac
+from app.utils.filenames import safe_filename
+
+logger = logging.getLogger(__name__)
 
 # Defense-in-depth limits for inline file uploads. The UX-side warning
 # is mirrored on the wizard, but a hand-crafted POST could still try
@@ -37,10 +49,94 @@ _MAX_FILE_BYTES_PER_FILE = 2 * 1024 * 1024
 _MAX_FILE_BYTES_PER_DEPLOYMENT = 10 * 1024 * 1024
 
 
+# ``reason`` values of the HTTPExceptions that :func:`attach_files_to_user_input` raises for a refused upload.
+_UPLOAD_REJECTION_REASONS = frozenset({
+    "file_var_collision", "file_var_empty", "file_extension_rejected", "file_b64_invalid",
+    "file_size_mismatch", "file_too_large", "deployment_files_too_large", "file_content_rejected",
+    "upload_scan_unavailable", "owner_storage_quota_exceeded", "upload_storage_full",
+})
+
+
+def log_rejected_upload(user_id, exc: HTTPException) -> None:
+    """One structured line per refused upload, so that attacks show up in the logs.
+
+    ``upload_rejected user=<id> reason=<reason> code=<code> variable=<name> slot=<slot>``: greppable, and a
+    count over it (Loki) is the metric. Only fixed codes and names the platform chose go in; the file name is
+    the client's and is left out, so nothing in it can forge a log line.
+    """
+    detail = exc.detail
+    if not isinstance(detail, dict) or detail.get("reason") not in _UPLOAD_REJECTION_REASONS:
+        return
+    fields = {k: detail.get(k) for k in ("reason", "code", "variable", "slot")}
+    logger.warning(
+        "upload_rejected user=%s %s", user_id,
+        " ".join(f"{k}={json.dumps(str(v))}" for k, v in fields.items() if v is not None),
+    )
+
+
+def log_accepted_uploads(user_id, deployment_id, accepted: list[dict]) -> None:
+    """One structured line per stored file: who put which bytes into which deployment.
+
+    ``upload_accepted user=<id> deployment=<id> variable=<name> slot=<slot> size=<bytes> sha256=<hex>``.
+    The hash identifies the content without keeping it, so that a file that turns out to be
+    harmful can be traced to the account and the deployments that took it. Like the refused
+    ones, only fixed codes and the names the platform chose go in, never the client's file name.
+    """
+    for entry in accepted:
+        logger.info(
+            "upload_accepted user=%s deployment=%s variable=%s slot=%s size=%d sha256=%s",
+            user_id, deployment_id, json.dumps(str(entry["variable"])), json.dumps(str(entry["slot"])),
+            entry["size"], entry["sha256"],
+        )
+
+
+def check_upload_quota(
+    files: dict | None,
+    owner_stored: Callable[[], int],
+    total_stored: Callable[[], int],
+) -> None:
+    """Refuse an upload that would take more database space than the owner or the platform may use.
+
+    ``owner_stored`` / ``total_stored`` give the bytes already stored (called only when the request
+    carries files and a limit is set). The size counted for the new files is their base64 length,
+    which is what ends up in the row. Runs before anything is decoded or scanned.
+    """
+    if not files:
+        return
+    per_owner = settings.MAX_STORED_INPUT_BYTES_PER_OWNER
+    overall = settings.MAX_STORED_INPUT_BYTES_TOTAL
+    if per_owner <= 0 and overall <= 0:
+        return
+    incoming = sum(
+        len(upload.content_b64)
+        for slot_map in files.values()
+        if isinstance(slot_map, dict)
+        for upload in slot_map.values()
+    )
+    if per_owner > 0:
+        used = owner_stored()
+        if used + incoming > per_owner:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail={
+                    "reason": "owner_storage_quota_exceeded",
+                    "limit_bytes": per_owner,
+                    "used_bytes": used,
+                    "needed_bytes": incoming,
+                },
+            )
+    if overall > 0 and total_stored() + incoming > overall:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"reason": "upload_storage_full"},
+        )
+
+
 def attach_files_to_user_input(
     user_input_var: dict | None,
     files: dict | None,
     variable_definitions: list[dict] | None = None,
+    accepted: list[dict] | None = None,
 ) -> dict:
     """Validate and merge wizard-uploaded files into ``userInputVar``.
 
@@ -65,14 +161,19 @@ def attach_files_to_user_input(
         Defense-in-depth: the wizard's ``accept`` attribute already
         filters in the picker, but a hand-crafted POST could bypass it.
 
+    ``accepted``, if given, receives one ``{variable, slot, size, sha256}`` per stored file,
+    for :func:`log_accepted_uploads`.
+
     Raises ``HTTPException(413)`` for size violations and
     ``HTTPException(422)`` for malformed payload — Pydantic already
     rejected the obvious cases (missing fields, wrong types) before
     we get here, so we only catch what gets past it.
     """
     base = dict(user_input_var or {})
-    base.setdefault("terraform", {})
-    base.setdefault("packer", {})
+    # The variable block is "terraform" (legacy) or "variables"; keep the
+    # name the caller used, "terraform" if it sent neither.
+    block_key = "variables" if isinstance(base.get("variables"), dict) else "terraform"
+    base.setdefault(block_key, {})
 
     if not files:
         return base
@@ -92,7 +193,7 @@ def attach_files_to_user_input(
                 scoped_file_vars.add(vdef["name"])
 
     total_bytes = 0
-    terraform_block = dict(base.get("terraform") or {})
+    terraform_block = dict(base.get(block_key) or {})
 
     for var_name, slot_map in files.items():
         if var_name in terraform_block:
@@ -121,7 +222,7 @@ def attach_files_to_user_input(
             content_b64 = upload.content_b64
 
             # Extension-filter check — only when the app author declared
-            # an ``@openstack:file:<scope>:<exts>`` filter. We compare
+            # a ``fileExtensions`` filter. We compare
             # the filename suffix (after the last dot, lowercased) to
             # the allowed list. Missing dot or unknown suffix → 422.
             allowed_exts = allowed_exts_by_var.get(var_name)
@@ -189,11 +290,66 @@ def attach_files_to_user_input(
                     },
                 )
 
+            # What the bytes are, not what the name or the browser says: a ZIP is
+            # unpacked in somebody's pod, so it is checked completely (entries,
+            # real unpacked size, paths, links); programs and archive formats
+            # that cannot be inspected are refused unless the app lists them.
+            try:
+                inspected = inspect_upload(upload.name or "", decoded, allowed_exts)
+            except UploadRejected as rejected:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "reason": "file_content_rejected",
+                        "code": rejected.code,
+                        "message": rejected.message,
+                        "variable": var_name,
+                        "slot": slot_key,
+                        "filename": safe_filename(upload.name),
+                    },
+                )
+
+            # Virus scan (only if a ClamAV daemon is configured; then it is mandatory).
+            try:
+                malware_scan.scan(decoded)
+            except malware_scan.Infected as infected:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "reason": "file_content_rejected",
+                        "code": "malware_detected",
+                        "message": f"the virus scanner found {infected.signature}",
+                        "variable": var_name,
+                        "slot": slot_key,
+                        "filename": safe_filename(upload.name),
+                    },
+                )
+            except malware_scan.ScanFailed as failed:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={"reason": "upload_scan_unavailable", "message": str(failed)},
+                )
+
+            if accepted is not None:
+                accepted.append(
+                    {
+                        "variable": var_name,
+                        "slot": slot_key,
+                        "size": len(decoded),
+                        "sha256": hashlib.sha256(decoded).hexdigest(),
+                    }
+                )
+            stored_name = safe_filename(upload.name)
             encoded_slots[slot_key] = {
-                "name": upload.name,
+                # Stored as a plain file name: apps write it to disk and the
+                # download route puts it into a header (.github#7 R).
+                "name": stored_name,
                 "content_b64": content_b64,
                 "size": upload.size,
-                "content_type": upload.content_type or "application/octet-stream",
+                # Derived from the content; the client's claim is not stored.
+                "content_type": inspected.content_type,
+                # Proof for the worker that these bytes passed the checks above.
+                "mac": upload_mac.sign(var_name, slot_key, stored_name, decoded),
             }
         # scope=team|user: HCL type is map(map(object({...}))) —
         # outer key is the team/user slot, inner key is the upload slot.
@@ -206,7 +362,7 @@ def attach_files_to_user_input(
         else:
             terraform_block[var_name] = encoded_slots
 
-    base["terraform"] = terraform_block
+    base[block_key] = terraform_block
     return base
 
 
@@ -291,9 +447,9 @@ def validate_scoped_user_input(
             return True
         return isinstance(val, (list, dict)) and len(val) == 0
 
-    for source_key in ("terraform", "packer"):
-        block = user_input_var.get(source_key)
-        if not isinstance(block, dict):
+    for source_key in ("terraform",):
+        block = user_input_variables(user_input_var)
+        if not block:
             continue
         for vdef in variable_definitions:
             if vdef.get("source") != source_key:
@@ -420,20 +576,26 @@ def strip_file_vars_from_user_input(user_input_var: dict | None) -> dict | None:
     if not isinstance(user_input_var, dict):
         return user_input_var
 
-    out = {k: v for k, v in user_input_var.items() if k != "terraform"}
-    tf_block = user_input_var.get("terraform")
-    if not isinstance(tf_block, dict):
-        if "terraform" in user_input_var:
-            out["terraform"] = tf_block
-        return out
+    out = {k: v for k, v in user_input_var.items() if k not in USER_INPUT_VARIABLES_KEYS}
+    for block_key in USER_INPUT_VARIABLES_KEYS:
+        tf_block = user_input_var.get(block_key)
+        if not isinstance(tf_block, dict):
+            if block_key in user_input_var:
+                out[block_key] = tf_block
+            continue
 
-    stripped_tf: dict = {}
-    for var_name, value in tf_block.items():
-        if looks_like_file_var(value):
-            stripped_tf[var_name] = _file_var_metadata_only(value)
-        else:
-            stripped_tf[var_name] = value
-    out["terraform"] = stripped_tf
+        stripped_tf: dict = {}
+        for var_name, value in tf_block.items():
+            if looks_like_file_var(value):
+                stripped_tf[var_name] = _file_var_metadata_only(value)
+            elif _looks_like_scoped_file_var(value):
+                # scope=team|user: {slot: {"uploaded": {name, content_b64, ...}}}
+                stripped_tf[var_name] = {
+                    slot: _file_var_metadata_only(inner) for slot, inner in value.items()
+                }
+            else:
+                stripped_tf[var_name] = value
+        out[block_key] = stripped_tf
     return out
 
 
@@ -487,6 +649,21 @@ def looks_like_file_var(value) -> bool:
     return True
 
 
+def _looks_like_scoped_file_var(value) -> bool:
+    """``scope=team|user`` shape: every slot wraps a file-shape map (``{"uploaded": {...}}``)."""
+    return (
+        isinstance(value, dict)
+        and bool(value)
+        and all(looks_like_file_var(inner) for inner in value.values())
+    )
+
+
+def is_stored_file_var(value) -> bool:
+    """A stored file variable in either shape: flat (``scope=all``) or wrapped per slot
+    (``scope=team|user``, ``{slot: {"uploaded": {...}}}``)."""
+    return looks_like_file_var(value) or _looks_like_scoped_file_var(value)
+
+
 def _file_var_metadata_only(value: dict) -> dict:
     """Return a copy of a file-shape variable with the ``content_b64``
     payload stripped. Metadata fields (name, size, content_type)
@@ -495,5 +672,5 @@ def _file_var_metadata_only(value: dict) -> dict:
     """
     out: dict = {}
     for slot_key, slot in value.items():
-        out[slot_key] = {k: v for k, v in slot.items() if k != "content_b64"}
+        out[slot_key] = {k: v for k, v in slot.items() if k not in ("content_b64", "mac")}
     return out

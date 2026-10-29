@@ -13,6 +13,8 @@ from app.models import App, Deployment, Task, TaskStatus, TaskType, User
 from app.services import lifecycle as lifecycle_service
 from app.services.lifecycle import DeploymentAction
 
+pytestmark = pytest.mark.integration
+
 
 def _seed_deployment_with_latest_task(
     db, user: User, *, task_type: TaskType, task_status: TaskStatus
@@ -57,9 +59,11 @@ def _seed_deployment_with_latest_task(
 @pytest.mark.parametrize(
     "task_type, task_status, expected",
     [
-        # Deploy success → Pause and Destroy both available.
+        # Deploy success → Pause, Destroy and a single redeploy available.
         (TaskType.DEPLOY, TaskStatus.SUCCESS,
-         {DeploymentAction.PAUSE, DeploymentAction.DESTROY}),
+         {DeploymentAction.PAUSE, DeploymentAction.DESTROY, DeploymentAction.REDEPLOY}),
+        # A running deploy may only be cancelled.
+        (TaskType.DEPLOY, TaskStatus.RUNNING, {DeploymentAction.CANCEL}),
         # Pause in flight → no actions allowed.
         (TaskType.PAUSE, TaskStatus.PENDING, set()),
         (TaskType.PAUSE, TaskStatus.RUNNING, set()),
@@ -74,7 +78,7 @@ def _seed_deployment_with_latest_task(
         (TaskType.RESUME, TaskStatus.RUNNING, set()),
         # Resume success collapses to "success" — full action set returns.
         (TaskType.RESUME, TaskStatus.SUCCESS,
-         {DeploymentAction.PAUSE, DeploymentAction.DESTROY}),
+         {DeploymentAction.PAUSE, DeploymentAction.DESTROY, DeploymentAction.REDEPLOY}),
         # Resume failed → synthetic ``resume_failed`` state: SHUTOFF
         # instances, retry resume, also allow pause (idempotent) and
         # destroy.
@@ -82,6 +86,22 @@ def _seed_deployment_with_latest_task(
          {DeploymentAction.RESUME, DeploymentAction.PAUSE, DeploymentAction.DESTROY}),
         # Destroy still works as before.
         (TaskType.DESTROY, TaskStatus.PENDING, set()),
+        # A redeploy in flight is not a deploy: no cancel (which would
+        # destroy everything), nothing else either (.github#7 L).
+        (TaskType.REDEPLOY, TaskStatus.PENDING, set()),
+        (TaskType.REDEPLOY, TaskStatus.RUNNING, set()),
+        # Redeploy failed: retry, pause, destroy; never delete (the other
+        # VMs still run).
+        (TaskType.REDEPLOY, TaskStatus.FAILED,
+         {DeploymentAction.REDEPLOY, DeploymentAction.PAUSE, DeploymentAction.DESTROY}),
+        # A redeploy the reconciler failed (worker lost) is the same case.
+        (TaskType.REDEPLOY, TaskStatus.CANCELLED,
+         {DeploymentAction.REDEPLOY, DeploymentAction.PAUSE, DeploymentAction.DESTROY}),
+        # Redeploy success: the deployment is plainly up again.
+        (TaskType.REDEPLOY, TaskStatus.SUCCESS,
+         {DeploymentAction.PAUSE, DeploymentAction.DESTROY, DeploymentAction.REDEPLOY}),
+        # Paused / failed deployments cannot be redeployed.
+        (TaskType.DEPLOY, TaskStatus.FAILED, {DeploymentAction.DESTROY, DeploymentAction.DELETE}),
     ],
 )
 def test_lifecycle_matrix(db, mock_user, task_type, task_status, expected):
@@ -119,10 +139,10 @@ def test_resume_allowed_only_from_paused(db, mock_user):
 
 def test_in_flight_statuses_set_is_complete():
     """The IN_FLIGHT_STATUSES constant must list every synthetic
-    in-flight state so the gating helpers (DELETE branch, resend-
-    access guard) stay in sync with ``_ALLOWED``.
+    in-flight state so the gating helpers (DELETE branch) stay in sync
+    with ``_ALLOWED``.
     """
-    expected = {"pending", "running", "destroying", "pausing", "resuming"}
+    expected = {"pending", "running", "destroying", "pausing", "resuming", "redeploying"}
     assert expected == lifecycle_service.IN_FLIGHT_STATUSES
     # An in-flight status may offer CANCEL and nothing else. The point of
     # the guard is that no action runs *in parallel* with a live task;

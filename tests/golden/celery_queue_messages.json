@@ -1,0 +1,93 @@
+[
+  {
+    "task_id": "6f1c2b0e-8d4a-4c1e-9b7a-2d5e3f4a1b6c",
+    "after_task": null,
+    "payload": {
+      "body": "W1tdLCB7ImRlcGxveW1lbnRfaWQiOiAiMGI5ZDZhNTItM2YxZS00YThjLTlkMmItN2U1ZjRjM2EyYjFkIiwgInVzZXJfdmFycyI6IHsidmFyaWFibGVzIjogeyJncmVldGluZyI6ICJHclx1MDBmY1x1MDBkZmUiLCAibiI6IDN9fSwgInRlYW1zIjogeyJUZWFtIDEiOiBbeyJlbWFpbCI6ICJhQGV4YW1wbGUub3JnIiwgInVzZXJfaWQiOiAiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwgInVzZXJuYW1lIjogImEifV19LCAic3BlYyI6IHsicnVudGltZSI6ICJrdWJlcm5ldGVzIn0sICJvd25lciI6ICIwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDIifSwgeyJjYWxsYmFja3MiOiBudWxsLCAiZXJyYmFja3MiOiBudWxsLCAiY2hhaW4iOiBudWxsLCAiY2hvcmQiOiBudWxsfV0=",
+      "headers": {
+        "id": "6f1c2b0e-8d4a-4c1e-9b7a-2d5e3f4a1b6c",
+        "eta": null,
+        "lang": "py",
+        "task": "pods.deploy_application",
+        "group": null,
+        "origin": "gen1@b046ce0df5ca",
+        "shadow": null,
+        "stamps": {},
+        "expires": null,
+        "retries": 0,
+        "root_id": "6f1c2b0e-8d4a-4c1e-9b7a-2d5e3f4a1b6c",
+        "argsrepr": "()",
+        "parent_id": null,
+        "timelimit": [
+          null,
+          null
+        ],
+        "kwargsrepr": "{'deployment_id': '0b9d6a52-3f1e-4a8c-9d2b-7e5f4c3a2b1d', 'user_vars': {'variables': {'greeting': 'Grüße', 'n': 3}}, 'teams': {'Team 1': [{...}]}, 'spec': {'runtime': 'kubernetes'}, 'owner': '00000000-0000-0000-0000-000000000002'}",
+        "group_index": null,
+        "ignore_result": false,
+        "stamped_headers": null,
+        "replaced_task_nesting": 0
+      },
+      "properties": {
+        "priority": 0,
+        "reply_to": "b9085590-7f09-3cc2-89b9-bbaa850e9243",
+        "delivery_tag": "3edb56cb-5f2f-4820-a4b1-a63b6593a6b2",
+        "body_encoding": "base64",
+        "delivery_info": {
+          "exchange": "",
+          "routing_key": "pods"
+        },
+        "delivery_mode": 2,
+        "correlation_id": "6f1c2b0e-8d4a-4c1e-9b7a-2d5e3f4a1b6c"
+      },
+      "content-type": "application/json",
+      "content-encoding": "utf-8"
+    }
+  },
+  {
+    "task_id": "7a2d3c1f-9e5b-4d2f-8c6b-3e6f4a5b2c7d",
+    "after_task": "6f1c2b0e-8d4a-4c1e-9b7a-2d5e3f4a1b6c",
+    "payload": {
+      "body": "W1tdLCB7ImRlcGxveW1lbnRfaWQiOiAiMGI5ZDZhNTItM2YxZS00YThjLTlkMmItN2U1ZjRjM2EyYjFkIn0sIHsiY2FsbGJhY2tzIjogbnVsbCwgImVycmJhY2tzIjogbnVsbCwgImNoYWluIjogbnVsbCwgImNob3JkIjogbnVsbH1d",
+      "headers": {
+        "id": "7a2d3c1f-9e5b-4d2f-8c6b-3e6f4a5b2c7d",
+        "eta": null,
+        "lang": "py",
+        "task": "pods.destroy_deployment",
+        "group": null,
+        "origin": "gen1@b046ce0df5ca",
+        "shadow": null,
+        "stamps": {},
+        "expires": null,
+        "retries": 0,
+        "root_id": "7a2d3c1f-9e5b-4d2f-8c6b-3e6f4a5b2c7d",
+        "argsrepr": "()",
+        "parent_id": null,
+        "pgq_after": "6f1c2b0e-8d4a-4c1e-9b7a-2d5e3f4a1b6c",
+        "timelimit": [
+          null,
+          null
+        ],
+        "kwargsrepr": "{'deployment_id': '0b9d6a52-3f1e-4a8c-9d2b-7e5f4c3a2b1d'}",
+        "group_index": null,
+        "ignore_result": false,
+        "stamped_headers": null,
+        "replaced_task_nesting": 0
+      },
+      "properties": {
+        "priority": 0,
+        "reply_to": "b9085590-7f09-3cc2-89b9-bbaa850e9243",
+        "delivery_tag": "92c6bf6e-b9c6-4bd5-9f0d-93e5fded0b6b",
+        "body_encoding": "base64",
+        "delivery_info": {
+          "exchange": "",
+          "routing_key": "pods"
+        },
+        "delivery_mode": 2,
+        "correlation_id": "7a2d3c1f-9e5b-4d2f-8c6b-3e6f4a5b2c7d"
+      },
+      "content-type": "application/json",
+      "content-encoding": "utf-8"
+    }
+  }
+]
