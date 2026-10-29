@@ -4,7 +4,7 @@
 
 Closes #
 
-**Art der Änderung:** <!-- feat | fix | refactor | migration | test | docs | ci | chore — bei Breaking Change (API, DB, Task-Payload) zusätzlich "BREAKING" -->
+**Art der Änderung:** <!-- feat | fix | refactor | migration | test | docs | ci | chore — bei Breaking Change (API, DB, Task-Contract) zusätzlich "BREAKING" -->
 
 ## Prüfung
 
@@ -24,9 +24,11 @@ Trifft ein Punkt nicht zu: mit "n/a" markieren UND abhaken, z. B.
 - [x] n/a — Datenbank: keine Schemaänderung
 
 Die reviewende Person prüft, dass die Häkchen stimmen, und bestätigt das mit
-ihrem Approval. Lint, Tests (unit/integration), Security, Build und Image Scan
-laufen als CI-Checks (das Coverage-Gate nur bei PRs nach `main`) und werden
-hier nicht wiederholt.
+ihrem Approval (auf `dev` ist keines erzwungen: dann prüft die Autorin oder der
+Autor die Häkchen selbst und die Fragen kommen im Release-PR zurück). Lint,
+Tests (unit/integration), Coverage-Gate (≥ 80 % Zeilen und Branches auf jedem
+Branch), Security, Build und Image Scan laufen als CI-Checks und werden hier
+nicht wiederholt.
 -->
 
 **Funktionale Eignung**
@@ -40,11 +42,11 @@ hier nicht wiederholt.
 **Schnittstellen & Daten**
 
 - [ ] API-Contract: Schema-Änderungen sind abwärtskompatibel oder als BREAKING markiert; OpenAPI exportiert (`make openapi`) und Frontend-PR mit aktualisierten Typen verlinkt
-- [ ] Datenbank: Schemaänderung mit Alembic-Migration in `alembic/versions/`; `upgrade` und `downgrade` lokal mit bestehenden Daten getestet
-- [ ] Worker: Geänderte Celery-Tasks, Argumente oder Status-Rückmeldungen sind mit dem Worker kompatibel, sonst Worker-PR verlinkt
-- [ ] Konfiguration: Neue Umgebungsvariablen in `app/config.py` (mit sinnvollem Default) und im `deployment`-Repo (`.env.example`, Compose) nachgezogen
+- [ ] Datenbank: Schemaänderung mit Alembic-Migration in `alembic/versions/`; `upgrade` und `downgrade` lokal mit bestehenden Daten getestet; Rechte der Worker-Rolle `appstore_worker` bedacht (Migration vergibt sie)
+- [ ] Worker: Änderungen an `app/task_contract.py` oder `app/k8s/` (Task-Typen, Payloads, Events, Status) sind im Worker-Repo identisch nachgezogen (`tests/unit/test_shared_files.py` prüft den Hash), sonst Worker-PR verlinkt
+- [ ] Konfiguration: Neue Umgebungsvariablen in `app/config.py` (mit sinnvollem Default) und im `deployment`-Repo nachgezogen (lokal `.env.example` und `docker-compose.dev.yml`; Staging/Produktion `k8s/charts/appstore` und `k8s/environments/`)
 
 **Sicherheit & Doku**
 
 - [ ] Sicherheit: Keine Secrets im Diff; keine Credentials oder Tokens in Logs oder API-Responses; neue `pip-audit`-/`.trivyignore`-Ausnahmen begründet
-- [ ] Doku: `claude_docs/HANDOVER.md` aktualisiert; Architektur/Entscheidungen in `claude_docs/` nachgezogen, falls betroffen
+- [ ] Doku: `claude_docs/HANDOVER.md` aktualisiert (u. a. Alembic-Head, falls eine Migration dazukommt); Architektur/Entscheidungen in `claude_docs/` nachgezogen, falls betroffen
