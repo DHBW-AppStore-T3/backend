@@ -438,6 +438,9 @@ class AppRuntimeResponse(BaseModel):
     # Pods only: one workload per team or per person, internet access, and
     # what members get to log in.
     scope: str | None = None
+    # The author lets the person deploying choose between one workload per person and per team (``scope`` is
+    # the default of the wizard).
+    scope_choice: bool = False
     egress: str | None = None
     access: list[dict[str, Any]] = []
     # Containers whose cpu/memory a person may choose (``resourceBounds``):
@@ -468,6 +471,7 @@ def get_app_runtime(
     return AppRuntimeResponse(
         runtime=loaded.runtime,
         scope=loaded.spec.scope,
+        scope_choice=loaded.spec.scope_choice,
         egress=loaded.spec.egress,
         access=[a.model_dump(by_alias=True, exclude_none=True) for a in loaded.spec.access],
         resources=resource_choices(loaded.spec, app_spec.platform_limits()),

@@ -482,6 +482,8 @@ def create_deployment(
     # network (only where the app allows it), for pods and VMs alike.
     loaded_spec = app_spec.with_resource_overrides(loaded_spec, deployment.userInputVar.get("resources"))
     loaded_spec = app_spec.with_network_overrides(loaded_spec, deployment.userInputVar.get("network"))
+    # One workload per person or per team, where the app lets the person choose (see AppSpec.scope_choice).
+    loaded_spec = app_spec.with_scope_override(loaded_spec, deployment.userInputVar.get("scope"))
     workloads = _check_cluster_workloads(db, current_user, loaded_spec, deployment.teams or [])
 
     db_deployment = crud_deployments.create_deployment(

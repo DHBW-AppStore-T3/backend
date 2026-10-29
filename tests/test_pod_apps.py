@@ -1571,3 +1571,65 @@ def test_a_choice_overrides_the_start_value_and_fixes_the_job(client, db, mock_u
         "internet": {"allowed": False, "default": False},
         "podNetwork": {"allowed": False, "default": True},
     }
+
+
+# ----------------------------------------------------------------
+# scopeChoice: per person or per team, chosen in the wizard
+# ----------------------------------------------------------------
+def _scope_choice_spec(**over):
+    return {**copy.deepcopy(SPEC), "scope": "user", "scopeChoice": True, **over}
+
+
+def _deploy_with_scope(client, app, scope, teams):
+    body = {
+        "name": "d",
+        "appId": str(app.appId),
+        "releaseTag": "v1.0",
+        "teams": teams,
+        "userInputVar": {} if scope is None else {"scope": scope},
+    }
+    return client.post("/deployments/", json=body)
+
+
+def test_the_runtime_tells_the_wizard_whether_the_scope_can_be_chosen(client, db, mock_user, pod_repo):
+    pod_repo(_scope_choice_spec())
+    app = _app(db, mock_user)
+    runtime = client.get(f"/apps/{app.appId}/runtime", params={"version": "v1.0"}).json()
+    assert (runtime["scope"], runtime["scope_choice"]) == ("user", True)
+    pod_repo(SPEC)
+    fixed = client.get(f"/apps/{app.appId}/runtime", params={"version": "v1.0"}).json()
+    assert fixed["scope_choice"] is False
+
+
+def test_a_chosen_scope_reaches_the_job_as_a_fixed_spec(client, db, mock_user, pod_repo, queued):
+    pod_repo(_scope_choice_spec())
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+
+    assert _deploy_with_scope(client, app, "team", [_team("T", alice)]).status_code == 201
+    spec = queued.last()[1]["spec"]
+    assert (spec["scope"], spec["scopeChoice"]) == ("team", False)
+
+
+def test_without_a_choice_the_authors_scope_is_used(client, db, mock_user, pod_repo, queued):
+    pod_repo(_scope_choice_spec())
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+
+    assert _deploy_with_scope(client, app, None, [_team("T", alice)]).status_code == 201
+    assert queued.last()[1]["spec"]["scope"] == "user"
+
+
+def test_a_scope_choice_the_app_does_not_allow_is_refused(client, db, mock_user, pod_repo, queued):
+    pod_repo({**copy.deepcopy(SPEC), "scope": "user"})
+    alice = _student(db, "alice")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+
+    refused = _deploy_with_scope(client, app, "team", [_team("T", alice)])
+    assert refused.status_code == 422
+    assert refused.json()["detail"]["reason"] == "invalid_scope"
+    assert refused.json()["detail"]["errors"] == [{"loc": "scope", "msg": "this setting cannot be changed"}]
+    assert queued() == []

@@ -468,7 +468,11 @@ class AppSpec(_Strict):
     api_version: Literal["appstore/v2"] = Field(alias="apiVersion")
     name: str
     runtime: Literal["kubernetes", "kubevirt-vm"]
+    # One workload per team or per person: the default of this app...
     scope: Literal["team", "user"] = "team"
+    # ...and whether the person deploying may choose the other (per deployment, in the wizard). A choice
+    # makes the spec fixed (``scope_choice`` false, the chosen scope), like the network settings.
+    scope_choice: StrictBool = Field(default=False, alias="scopeChoice")
     workload: Workload | None = None
     vm: VmSpec | None = None
     network: NetworkSpec = Field(default_factory=NetworkSpec)
@@ -859,3 +863,23 @@ def network_choices(spec: AppSpec) -> dict[str, Any]:
     if spec.network.pod_network.allowed:
         out["podNetwork"] = {"default": spec.network.pod_network.default}
     return out
+
+
+def apply_scope_override(spec: AppSpec, choice: Any) -> AppSpec:
+    """A copy of ``spec`` with the scope a person chose (``"user"``: one workload per person, ``"team"``: per team).
+
+    Only where the author set ``scopeChoice``. The copy is fixed (no further choice), so the worker renders exactly
+    that. Raises :class:`SpecValidationError` with a field path.
+    """
+    if choice is None:
+        return spec
+    if choice not in ("user", "team"):
+        raise SpecValidationError([{"loc": "scope", "msg": "must be 'user' or 'team'"}])
+    if not spec.scope_choice:
+        if choice == spec.scope:
+            return spec
+        raise SpecValidationError([{"loc": "scope", "msg": "this setting cannot be changed"}])
+    result = spec.model_copy(deep=True)
+    result.scope = choice
+    result.scope_choice = False
+    return result

@@ -644,3 +644,45 @@ def test_no_resource_choice_leaves_the_spec_as_it_is():
 
     assert apply_resource_overrides(spec, None) is spec
     assert apply_resource_overrides(spec, {}) is spec
+
+
+# ----------------------------------------------------------------
+# scope / scopeChoice: one workload per person or per team, chosen per deployment
+# ----------------------------------------------------------------
+def _scope_spec(**over):
+    return {**copy.deepcopy(VALID), **over}
+
+
+def test_scope_is_fixed_unless_the_author_allows_a_choice():
+    spec = parse_spec(_scope_spec())  # VALID says scope: user
+    assert spec.scope == "user" and spec.scope_choice is False
+    assert parse_spec(_scope_spec(scopeChoice=True)).scope_choice is True
+    assert "scopeChoice" in errors_of(_scope_spec(scopeChoice="yes"))
+
+
+def test_a_choice_of_scope_makes_the_spec_fixed_and_keeps_the_original():
+    from app.k8s.spec import apply_scope_override
+
+    spec = parse_spec(_scope_spec(scope="user", scopeChoice=True))
+    out = apply_scope_override(spec, "team")
+    assert out.scope == "team" and out.scope_choice is False
+    assert spec.scope == "user" and spec.scope_choice is True  # the reviewed spec is untouched
+    # the worker validates the job's spec again: a fixed spec is valid on its own
+    assert parse_spec(out.model_dump(mode="json", by_alias=True, exclude_none=True)).scope == "team"
+
+
+def test_no_choice_leaves_the_spec_alone_and_the_author_scope_may_be_repeated():
+    from app.k8s.spec import apply_scope_override
+
+    spec = parse_spec(_scope_spec())
+    assert apply_scope_override(spec, None) is spec
+    assert apply_scope_override(spec, "user") is spec  # what the wizard sends for an app without a choice
+
+
+@pytest.mark.parametrize(("choice", "msg"), [("team", "cannot be changed"), ("everyone", "must be"), (1, "must be")])
+def test_a_scope_the_app_does_not_allow_or_that_does_not_exist_is_refused(choice, msg):
+    from app.k8s.spec import apply_scope_override
+
+    with pytest.raises(SpecValidationError) as exc:
+        apply_scope_override(parse_spec(_scope_spec()), choice)
+    assert [(e["loc"], msg in e["msg"]) for e in exc.value.errors] == [("scope", True)]
