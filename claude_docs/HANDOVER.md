@@ -13,7 +13,7 @@ Lebendes Übergabedokument (Harness-Konzept: [HARNESS.md](https://github.com/DHB
 
 ## 2. CI (`.github/workflows/ci.yml`, Branches `main` und `dev`)
 
-Lint (ruff, OpenAPI-Export als Artefakt) · Unit (`pytest -m unit`) · Integration (`pytest -m integration`, Postgres-Service) · Coverage (kombiniert; getrennte Gates ≥ 86 % Zeilen und ≥ 76 % Branches, auf allen Branches und PRs; ein rotes Gate stoppt Build, Push und Rollout) · Security (`pip-audit --strict`, Trivy-Dateisystem; Ausnahmen in `.trivyignore`) · Build · Image-Scan (Trivy) · Push nach `ghcr.io` (nur bei Push/`workflow_dispatch`) · Roll out on k8s: startet `k8s-bump.yml` im Repo `deployment` mit dem Branch des Pushes.
+Lint (ruff, OpenAPI-Export als Artefakt) · Unit (`pytest -m unit`) · Integration (`pytest -m integration`, Postgres-Service) · Coverage (kombiniert; getrennte Gates ≥ 80 % Zeilen und ≥ 80 % Branches, auf allen Branches und PRs; ein rotes Gate stoppt Build, Push und Rollout) · Security (`pip-audit --strict`, Trivy-Dateisystem; Ausnahmen in `.trivyignore`) · Build · Image-Scan (Trivy) · Push nach `ghcr.io` (nur bei Push/`workflow_dispatch`) · Roll out on k8s: startet `k8s-bump.yml` im Repo `deployment` mit dem Branch des Pushes.
 
 ## 3. Regeln im Code
 

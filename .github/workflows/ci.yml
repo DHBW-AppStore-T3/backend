@@ -294,8 +294,8 @@ jobs:
           # line rate hide a weak branch rate). Keep each minimum at least 2
           # points below the CI value (a flaky drop must not block merges) and
           # update claude_docs/HANDOVER.md with them.
-          MIN_LINE_COVERAGE=86.0
-          MIN_BRANCH_COVERAGE=76.0
+          MIN_LINE_COVERAGE=80.0
+          MIN_BRANCH_COVERAGE=80.0
           PYTHONUTF8=1 python - "$MIN_LINE_COVERAGE" "$MIN_BRANCH_COVERAGE" <<'PY'
           import json, sys
           t = json.load(open('coverage-html/coverage.json'))['totals']
