@@ -151,6 +151,150 @@ def test_jpeg_gif_and_webp_must_be_whole():
     assert rejected("a.webp", samples.webp() + b"extra") == "image_trailing_data"
 
 
+# ----------------------------------------------- hostile and unusual containers
+
+
+def _objstm(inflated: bytes, number: int) -> bytes:
+    packed = zlib.compress(inflated)
+    return (
+        f"{number} 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Filter /FlateDecode /Length {len(packed)} >>\nstream\n".encode()
+        + packed
+        + b"\nendstream\nendobj\n"
+    )
+
+
+@pytest.mark.unit
+def test_a_pdf_stream_that_never_ends_is_rejected():
+    cut_off = samples.pdf().replace(
+        b"trailer", b"5 0 obj\n<< /Length 9 >>\nstream\nno end in sight\ntrailer"
+    )
+    assert rejected("a.pdf", cut_off) == "pdf_invalid"
+
+
+@pytest.mark.unit
+def test_many_object_streams_together_may_not_exceed_the_inflate_budget():
+    # Each stream is far below the per-stream limit, only the sum is too much (a small file inflating to ~35 MiB).
+    def with_streams(count: int) -> bytes:
+        streams = b"".join(_objstm(b"0" * (7 * 1024 * 1024), 10 + i) for i in range(count))
+        return samples.pdf().replace(b"trailer", streams + b"trailer")
+
+    assert inspect_upload("a.pdf", with_streams(4)).kind == "pdf"  # 28 MiB: within the budget
+    assert rejected("a.pdf", with_streams(5)) == "pdf_unscannable"  # 35 MiB: over it
+
+
+def _png_chunk(kind: bytes, body: bytes) -> bytes:
+    return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+
+
+@pytest.mark.unit
+def test_a_png_chunk_that_announces_more_data_than_the_file_has_is_truncated():
+    announces_too_much = b"\x89PNG\r\n\x1a\n" + struct.pack(">I4s", 1000, b"IDAT") + b"x" * 20
+    assert rejected("a.png", announces_too_much) == "image_invalid"
+
+
+@pytest.mark.unit
+def test_a_png_must_start_with_a_header_chunk_even_when_its_checksums_are_right():
+    no_header = b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IDAT", b"\x00" * 5) + _png_chunk(b"IEND", b"")
+    assert rejected("a.png", no_header) == "image_invalid"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "name, data",
+    [
+        ("a.png", samples.png(0, 5)),
+        ("a.jpg", samples.jpeg(10, 0)),
+        ("a.gif", samples.gif(0, 0)),
+    ],
+)
+def test_an_image_without_a_size_is_rejected(name, data):
+    assert rejected(name, data) == "image_invalid"
+
+
+@pytest.mark.unit
+def test_a_jpeg_with_fill_bytes_and_restart_markers_is_a_valid_jpeg():
+    app0 = b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+    sof = (
+        b"\xff\xc0"
+        + struct.pack(">H", 11)
+        + b"\x08"
+        + struct.pack(">HH", 1, 1)
+        + b"\x01\x01\x11\x00"
+    )
+    sos = b"\xff\xda" + struct.pack(">H", 8) + b"\x01\x01\x00\x00\x3f\x00"
+    # Fill bytes (0xFF) may precede any marker and restart markers carry no length: neither is damage.
+    data = b"\xff\xd8" + b"\xff" + app0 + b"\xff\xd0" + sof + sos + b"\x12\x34" + b"\xff\xd9"
+
+    assert inspect_upload("a.jpg", data).kind == "jpeg"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"\xff\xd8\xff\xe0\x00\x06"
+        + b"\x00" * 8,  # after the first segment: a byte that is no marker start
+        b"\xff\xd8\xff\xc0"
+        + struct.pack(">H", 4)
+        + b"\x00\x00",  # a frame header too short to hold a size
+        b"\xff\xd8"
+        + b"\xff\xe0"
+        + struct.pack(">H", 16)
+        + b"JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+        + b"\xff\xd9",
+    ],
+    ids=["broken-segment", "short-frame-header", "no-frame-header"],
+)
+def test_a_malformed_jpeg_is_rejected(data):
+    assert rejected("a.jpg", data) == "image_invalid"
+
+
+@pytest.mark.unit
+def test_gif_and_webp_files_shorter_than_their_header_are_rejected():
+    assert rejected("a.gif", b"GIF89a\x01\x00") == "image_invalid"
+    assert rejected("a.webp", b"RIFF" + struct.pack("<I", 4) + b"WEBP") == "image_invalid"
+
+
+def _webp(kind: bytes, payload: bytes) -> bytes:
+    """A RIFF/WebP container of one chunk of ``kind`` with ``payload`` (10 bytes make the shortest valid header)."""
+    chunk = kind + struct.pack("<I", len(payload)) + payload
+    return b"RIFF" + struct.pack("<I", 4 + len(chunk)) + b"WEBP" + chunk
+
+
+def _vp8x(width: int, height: int) -> bytes:
+    return _webp(
+        b"VP8X",
+        b"\x00\x00\x00\x00"
+        + (width - 1).to_bytes(3, "little")
+        + (height - 1).to_bytes(3, "little"),
+    )
+
+
+def _vp8(width: int, height: int, start_code: bytes = b"\x9d\x01\x2a") -> bytes:
+    return _webp(b"VP8 ", b"\x10\x00\x00" + start_code + struct.pack("<HH", width, height))
+
+
+@pytest.mark.unit
+def test_lossy_and_extended_webp_files_pass_like_lossless_ones():
+    assert inspect_upload("a.webp", _vp8x(640, 480)).content_type == "image/webp"
+    assert inspect_upload("a.webp", _vp8(640, 480)).content_type == "image/webp"
+
+
+@pytest.mark.unit
+def test_webp_variants_are_checked_for_size_and_a_damaged_header():
+    assert rejected("a.webp", _vp8x(20000, 20000)) == "image_too_large"
+    assert (
+        rejected("a.webp", _vp8(16383, 16383)) == "image_too_large"
+    )  # the largest a lossy WebP can announce
+    assert rejected("a.webp", _vp8(640, 480, start_code=b"\x00\x00\x00")) == "image_invalid"
+    lossless = bytearray(samples.webp())
+    lossless[20] = 0x00  # the lossless signature byte
+    assert rejected("a.webp", bytes(lossless)) == "image_invalid"
+    assert (
+        rejected("a.webp", _webp(b"ABCD", b"\x00" * 10)) == "image_invalid"
+    )  # not a WebP variant at all
+
+
 # ----------------------------------------------------------- malware scan
 
 
