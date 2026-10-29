@@ -183,8 +183,9 @@ filterwarnings = [
 ]
 
 [tool.coverage.run]
-# Line AND branch coverage: the gate in ci.yml reads the combined percentage,
-# which with branch=true is (covered lines + covered branches) / (statements + branches).
+# Line AND branch coverage. The gate in ci.yml checks lines and branches against
+# separate minimums; ``percent_covered`` (coverage.py, also used by fail_under) is the
+# blend (covered lines + covered branches) / (statements + branches).
 branch = true
 source = ["."]
 omit = [
