@@ -288,17 +288,32 @@ jobs:
           path: coverage-html
           retention-days: 14
 
-      - name: Test Coverage Gate (enforce on main)
-        if: github.ref == 'refs/heads/main' || github.base_ref == 'main'
+      - name: Test Coverage Gate
         run: |
-          MIN_COVERAGE=70.0
-          PCT=$(python -c "import json; print(round(json.load(open('coverage-html/coverage.json'))['totals']['percent_covered'], 1))")
-          echo "Current coverage: ${PCT}%, required minimum: ${MIN_COVERAGE}%"
-          if (( $(echo "$PCT < $MIN_COVERAGE" | bc -l) )); then
-            echo "❌ Coverage Gate Failed: ${PCT}% is below required ${MIN_COVERAGE}%"
-            exit 1
-          fi
-          echo "✅ Coverage Gate Passed: ${PCT}% >= ${MIN_COVERAGE}%"
+          # Lines and branches are gated separately (a blended number lets a good
+          # line rate hide a weak branch rate). Keep each minimum at least 2
+          # points below the CI value (a flaky drop must not block merges) and
+          # update claude_docs/HANDOVER.md with them.
+          MIN_LINE_COVERAGE=86.0
+          MIN_BRANCH_COVERAGE=76.0
+          PYTHONUTF8=1 python - "$MIN_LINE_COVERAGE" "$MIN_BRANCH_COVERAGE" <<'PY'
+          import json, sys
+          t = json.load(open('coverage-html/coverage.json'))['totals']
+          checks = [
+              ('lines', t['covered_lines'], t['num_statements'], float(sys.argv[1])),
+              ('branches', t['covered_branches'], t['num_branches'], float(sys.argv[2])),
+          ]
+          ok = True
+          for name, covered, total, minimum in checks:
+              pct = round(100 * covered / total, 1)
+              print(f"Current backend {name} coverage: {pct}%, required minimum: {minimum}%")
+              if pct < minimum:
+                  print(f"❌ Coverage Gate Failed: {name} {pct}% is below required {minimum}%")
+                  ok = False
+              else:
+                  print(f"✅ Coverage Gate Passed: {name} {pct}% >= {minimum}%")
+          sys.exit(0 if ok else 1)
+          PY
 
   # ================================================================
   # 🔒 SECURITY (deps + filesystem) — blocks on HIGH/CRITICAL
@@ -412,7 +427,7 @@ jobs:
   build:
     name: "🐳 Build"
     runs-on: ubuntu-latest
-    needs: [lint, test-integration, security]
+    needs: [lint, test-integration, coverage, security]
     permissions:
       contents: read
       packages: write
