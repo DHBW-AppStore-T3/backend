@@ -343,3 +343,101 @@ def test_exposed_container_has_tcp_readiness_probe_on_named_port():
                 assert c["readinessProbe"]["tcpSocket"] == {"port": "http"}
             else:
                 assert "readinessProbe" not in c
+
+
+# ----------------------------------------------------------------
+# Labels, quota, TLS and environment: details that other parts of the platform rely on
+# ----------------------------------------------------------------
+
+
+def _render_with(spec_data=VALID, dep=DEP, settings=SETTINGS, teams=TEAMS):
+    spec = parse_spec(spec_data)
+    passwords = {r.name: f"pw-{r.name}" for r in workload_refs(spec, teams)}
+    return render(spec, dep, teams, settings, passwords)
+
+
+def _container_env(objs, workload):
+    sts = next(o for o in of_kind(objs, "StatefulSet") if o["metadata"]["name"] == workload)
+    return {e["name"]: e for e in sts["spec"]["template"]["spec"]["containers"][0]["env"]}
+
+
+def test_a_deployment_of_a_course_labels_everything_it_creates_with_the_course():
+    dep = dataclasses.replace(DEP, course="WWI24SEA")
+
+    objs = _render_with(dep=dep)
+
+    assert all(o["metadata"]["labels"]["appstore.dhbw/course"] == "WWI24SEA" for o in objs)
+    # And a deployment without a course carries no such label (nothing to filter on by mistake).
+    assert not any("appstore.dhbw/course" in o["metadata"]["labels"] for o in _render_with())
+
+
+def test_an_app_without_storage_asks_the_quota_for_none():
+    data = copy.deepcopy(VALID)
+    del data["workload"]["storage"]
+
+    objs = _render_with(data)
+
+    [quota] = of_kind(objs, "ResourceQuota")
+    assert quota["spec"]["hard"]["requests.storage"] == "0Mi"
+    assert not any(o["spec"].get("volumeClaimTemplates") for o in of_kind(objs, "StatefulSet"))
+
+
+def test_a_configured_certificate_secret_is_used_and_wins_over_a_cluster_issuer():
+    settings = RenderSettings(
+        zone="z.example.org", tls_secret="wildcard-tls", cluster_issuer="letsencrypt"
+    )
+
+    [ingress, *_] = of_kind(_render_with(settings=settings), "Ingress")
+
+    assert ingress["spec"]["tls"][0]["secretName"] == "wildcard-tls"
+    assert ingress["metadata"]["annotations"] == {"cert-manager.io/cluster-issuer": "letsencrypt"}
+
+
+def test_with_only_a_cluster_issuer_each_ingress_gets_its_own_certificate_secret():
+    settings = RenderSettings(zone="z.example.org", cluster_issuer="letsencrypt")
+
+    ingresses = of_kind(_render_with(settings=settings), "Ingress")
+
+    assert ingresses
+    assert all(
+        i["spec"]["tls"][0]["secretName"] == f"{i['metadata']['name']}-tls" for i in ingresses
+    )
+
+
+def test_environment_values_come_from_the_spec_the_team_or_the_person():
+    data = copy.deepcopy(VALID)
+    data["workload"]["containers"][0]["env"] = [
+        {"name": "MODE", "value": "exam"},
+        {"name": "TEAM", "from": "team-name"},
+        {"name": "WHO", "from": "user-name"},
+    ]
+    anna_workload = next(
+        r.name for r in workload_refs(parse_spec(data), TEAMS) if r.user and r.user.name == "alice"
+    )
+
+    per_person = _container_env(_render_with(data), anna_workload)
+    assert per_person["MODE"]["value"] == "exam"
+    assert per_person["TEAM"]["value"] == "team-a"
+    assert per_person["WHO"]["value"] == "alice"
+
+    # A team-scoped app has no person: "user-name" falls back to the team, rather than to nothing.
+    per_team = _container_env(_render_with({**data, "scope": "team"}), "team-a")
+    assert per_team["WHO"]["value"] == "team-a"
+
+
+def test_render_refuses_a_vm_spec_and_a_deployment_without_workloads():
+    vm_spec = parse_spec(
+        {
+            "apiVersion": "appstore/v2",
+            "name": "windows-matlab",
+            "runtime": "kubevirt-vm",
+            "scope": "user",
+            "vm": {"imageRef": "windows11-matlab-golden"},
+            "access": [{"type": "url", "template": "https://{workload}-{deployment}.apps.{zone}"}],
+        }
+    )
+    with pytest.raises(ValueError, match="only supports runtime 'kubernetes'"):
+        render(vm_spec, DEP, TEAMS, SETTINGS, {})
+
+    with pytest.raises(ValueError, match="no workloads: teams are empty"):
+        render(parse_spec(VALID), DEP, [], SETTINGS, {})
