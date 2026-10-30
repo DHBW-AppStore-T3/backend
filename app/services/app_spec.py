@@ -27,6 +27,7 @@ from app.k8s.spec import (
     SpecValidationError,
     apply_network_overrides,
     apply_resource_overrides,
+    apply_scope_override,
     limits_from,
     parse_spec,
 )
@@ -137,6 +138,21 @@ def with_network_overrides(loaded: LoadedSpec, choice: Any) -> LoadedSpec:
             },
         ) from exc
     return dataclasses.replace(loaded, spec=spec)
+
+
+def with_scope_override(loaded: LoadedSpec, choice: Any) -> LoadedSpec:
+    """``loaded`` with the scope a person chose (``userInputVar.scope``: ``"user"`` or ``"team"``), where the app allows it.
+
+    Like the network, only the job gets the changed spec. 422 ``invalid_scope`` with the field path.
+    """
+    try:
+        spec = apply_scope_override(loaded.spec, choice)
+    except SpecValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason": "invalid_scope", "message": "scope is invalid", "errors": exc.errors},
+        ) from exc
+    return loaded if spec is loaded.spec else dataclasses.replace(loaded, spec=spec)
 
 
 def read_spec_from_repo(repo_path: str) -> LoadedSpec:

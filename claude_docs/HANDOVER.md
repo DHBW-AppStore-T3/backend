@@ -24,6 +24,7 @@ Lint (ruff, OpenAPI-Export als Artefakt) · Unit (`pytest -m unit`) · Integrati
 5. `now()` ist in Postgres der Transaktionsbeginn; Sichtbarkeitstests in langlebigen Sessions vorher `rollback()`.
 6. `AppCreate`/`AppUpdate` enthalten weder `recommended` noch `deploy_version`; nur die Admin-Endpunkte setzen sie.
 7. `deploy_version` wird zurückgesetzt, sobald die Freigabe der Version endet (Widerruf, erneute Einreichung).
+8. `scopeChoice` in `appstore.yaml` (Standard `false`, `scope` bleibt der Startwert): Nur wo der Autor es erlaubt, gilt `userInputVar.scope` (`user` oder `team`). Der Job trägt dann ein festes Spec (`scope` = die Wahl, `scopeChoice` false), sonst 422 `invalid_scope`. `GET /apps/{id}/runtime` meldet `scope_choice`. Wie bei `network` und `resources` bekommt nur der Job das geänderte Spec; das geprüfte Spec der Version bleibt unberührt. Der Validator im Repo `app-registry` kennt den Schlüssel ebenfalls (Drift-Test).
 
 ## 4. Offen
 
