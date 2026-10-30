@@ -4,7 +4,7 @@
 
 Closes #
 
-**Art der Änderung:** <!-- feat | fix | refactor | migration | test | docs | ci | chore — bei Breaking Change (API, DB, Task-Contract) zusätzlich "BREAKING" -->
+**Art der Änderung:** <!-- feat | fix | refactor | migration | test | docs | ci | chore; bei Breaking Change (API, DB, Task-Contract) zusätzlich "BREAKING" -->
 
 ## Prüfung
 
@@ -21,11 +21,9 @@ Jeder Punkt wird abgehakt, bevor der PR gemergt werden kann. Der CI-Check
 "PR Checklist" blockiert den Merge, solange hier noch ein offenes "- [ ]" steht.
 
 Trifft ein Punkt nicht zu: mit "n/a" markieren UND abhaken, z. B.
-- [x] n/a — Datenbank: keine Schemaänderung
+- [x] n/a, Datenbank: keine Schemaänderung
 
-Die reviewende Person prüft, dass die Häkchen stimmen, und bestätigt das mit
-ihrem Approval (auf `dev` ist keines erzwungen: dann prüft die Autorin oder der
-Autor die Häkchen selbst und die Fragen kommen im Release-PR zurück). Lint,
+Lint,
 Tests (unit/integration), Coverage-Gate (≥ 80 % Zeilen und Branches auf jedem
 Branch), Security, Build und Image Scan laufen als CI-Checks und werden hier
 nicht wiederholt.

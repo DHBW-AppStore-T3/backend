@@ -36,7 +36,7 @@ auseinanderlaufen.
 <!--
 Jeder Punkt wird abgehakt, bevor der PR gemergt werden kann. Trifft ein
 Punkt nicht zu: mit "n/a" markieren UND abhaken, z. B.
-- [x] n/a — Datenbank: keine neuen Migrationen
+- [x] n/a, Datenbank: keine neuen Migrationen
 
 Die Änderungs-Checklisten der enthaltenen PRs werden hier nicht wiederholt.
 Dieser PR prüft, ob der gesammelte Stand in Produktion darf. Lint, Tests,
