@@ -7,7 +7,7 @@ Lebendes Übergabedokument (Harness-Konzept: [HARNESS.md](https://github.com/DHB
 - **Stack:** FastAPI, SQLAlchemy 2.0, Alembic, PostgreSQL 16 (auch als Task-Queue: Tabelle `tasks`, LISTEN/NOTIFY), PyJWT gegen Keycloak, Python 3.11.
 - **Eine Worker-Queue:** `pods` (Kubernetes- und KubeVirt-Apps). Der OpenStack-VM-Pfad ist entfernt (.github#12).
 - **Live-Status:** SSE aus `task_events` (`LISTEN/NOTIFY`, `Last-Event-ID`).
-- **Alembic-Head:** `c5e7a9b1d3f5`, 28 Revisionen.
+- **Alembic-Head:** `a2c4e6f8b0d2` (`deployments.k8s_scope`), 30 Revisionen.
 - **Branches:** `dev` → Staging, `main` → Produktion. Feature-Branches gehen per PR auf `dev`.
 - **Dokumentation:** `README.md` (Start, Befehle, Konfiguration, Endpunkte, Module), `claude_docs/architecture/` (Überblick, Auth, Datenbank).
 
@@ -25,6 +25,8 @@ Lint (ruff, OpenAPI-Export als Artefakt) · Unit (`pytest -m unit`) · Integrati
 6. `AppCreate`/`AppUpdate` enthalten weder `recommended` noch `deploy_version`; nur die Admin-Endpunkte setzen sie.
 7. `deploy_version` wird zurückgesetzt, sobald die Freigabe der Version endet (Widerruf, erneute Einreichung).
 8. `scopeChoice` in `appstore.yaml` (Standard `false`, `scope` bleibt der Startwert): Nur wo der Autor es erlaubt, gilt `userInputVar.scope` (`user` oder `team`). Der Job trägt dann ein festes Spec (`scope` = die Wahl, `scopeChoice` false), sonst 422 `invalid_scope`. `GET /apps/{id}/runtime` meldet `scope_choice`. Wie bei `network` und `resources` bekommt nur der Job das geänderte Spec; das geprüfte Spec der Version bleibt unberührt. Der Validator im Repo `app-registry` kennt den Schlüssel ebenfalls (Drift-Test).
+9. Was der Job ausgeführt hat, steht in `deployments.k8s_scope` (`team` oder `user`, ältere Zeilen NULL) und kommt als `scope` in Liste, Detail und POST-Antwort. Teams mit mehreren Personen und `scope: user` sind erlaubt (eine Umgebung je Person, Dateien je Team).
+10. Die Teams eines Pod- oder KubeVirt-Deployments sind nach dem Anlegen fest: Schreibende Team-Endpunkte (`/teams/…`) antworten nach der Rechteprüfung mit 409 `teams_fixed`. Der Job hat Workloads und Zugänge aus diesen Teams gebaut, nichts baut sie neu; eine spätere Änderung erreichte niemanden.
 
 ## 4. Offen
 

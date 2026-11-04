@@ -189,6 +189,7 @@ def list_deployments(
                 releaseTag=deployment.releaseTag,
                 commit_sha=deployment.commit_sha,
                 runtime=deployment.runtime,
+                scope=deployment.k8s_scope,
                 userInputVar=user_input_var_parsed,
                 status=status_value,
                 created_at=first_created_at,
@@ -328,6 +329,7 @@ def get_deployment(
         releaseTag=deployment.releaseTag,
         commit_sha=deployment.commit_sha,
         runtime=deployment.runtime,
+        scope=deployment.k8s_scope,
         userInputVar=user_input_var_parsed,
         status=status_value,
         created_at=created_at,
@@ -493,6 +495,7 @@ def create_deployment(
         commit_sha,
         runtime=loaded_spec.runtime,
         k8s_workloads=workloads,
+        k8s_scope=loaded_spec.spec.scope,
     )
 
     user_ids_in_deployment = set()
@@ -566,6 +569,7 @@ def create_deployment(
         releaseTag=db_deployment.releaseTag,
         commit_sha=db_deployment.commit_sha,
         runtime=db_deployment.runtime,
+        scope=db_deployment.k8s_scope,
         userInputVar=user_input_var_parsed,
         status=status_value,
         created_at=created_at,

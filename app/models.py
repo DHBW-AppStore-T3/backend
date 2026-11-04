@@ -211,6 +211,9 @@ class Deployment(Base):
     # (one per team or per person) they run, for the owner's budget.
     k8s_namespace = Column(String(63), nullable=True)
     k8s_workloads = Column(Integer, nullable=True)
+    # ``team`` or ``user``: what one of those workloads is, as the job ran it (the app's scope, or the
+    # one the person chose where the app allows it). NULL for rows from before this column.
+    k8s_scope = Column(String(8), nullable=True)
     userInputVar = Column(Text, nullable=True)  # could also be JSON
     userId = Column(UUID(as_uuid=True), ForeignKey("users.userId"), nullable=False, index=True)
     appId = Column(UUID(as_uuid=True), ForeignKey("apps.appId"), nullable=False, index=True)

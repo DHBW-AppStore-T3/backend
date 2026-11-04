@@ -270,6 +270,8 @@ class DeploymentResponse(DeploymentBase):
     # The commit every job of the deployment runs.
     commit_sha: str | None = None
     runtime: str = "kubernetes"
+    # ``team``: one workload per team, ``user``: one per person (what the job ran); null for older rows.
+    scope: str | None = None
     userInputVar: dict[str, Any] | None = None
     status: str | None = None  # From latest task
     created_at: datetime | None = None

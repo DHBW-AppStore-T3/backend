@@ -11,7 +11,9 @@ role alone (security review H-1, M-2):
   on the deployment (owner or admin), so nobody else decides who gets
   access to a deployment.
 
-Members must exist and be in at most one team of the deployment.
+Members must exist and be in at most one team of the deployment. The teams
+of a pod or KubeVirt deployment are fixed once it is created (409
+``teams_fixed``): its job made the workloads and accounts from them.
 """
 
 from uuid import UUID
@@ -23,7 +25,7 @@ from app.crud import deployments as crud_deployments
 from app.crud import teams as crud_teams
 from app.crud import users as crud_users
 from app.database import get_db
-from app.models import Team, User, UserToTeam
+from app.models import CLUSTER_RUNTIMES, Team, User, UserToTeam
 from app.schemas import TeamCreate, TeamResponse, TeamUpdate, TeamWithMembers
 from app.utils.capabilities import (
     can_view_deployment_owner,
@@ -59,6 +61,25 @@ def _is_member(db: Session, team_id: UUID, user: User) -> bool:
 
 def _may_read_team(db: Session, user: User, team: Team, deployment) -> bool:
     return can_view_deployment_owner(user, deployment, db) or _is_member(db, team.teamId, user)
+
+
+def _ensure_teams_open(deployment) -> None:
+    """409 ``teams_fixed`` for a pod or KubeVirt deployment.
+
+    Its job rendered the workloads and the access data from the teams it was
+    created with, and nothing renders them again: a member added later would
+    get no workload and no account, a removed one would keep the link and the
+    password they know, a renamed team would no longer match its accounts.
+    Different teams need a new deployment.
+    """
+    if deployment.runtime in CLUSTER_RUNTIMES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "teams_fixed",
+                "message": "The teams of this deployment were fixed when it was created; create a new deployment instead",
+            },
+        )
 
 
 def _ensure_new_members(db: Session, deployment_id: UUID, user_ids: list[UUID], *, except_team: UUID | None = None):
@@ -131,6 +152,7 @@ def create_team(
     """Create a team on a deployment the caller may operate."""
     deployment = _deployment_or_404(db, team.deploymentId)
     ensure_operate_deployment(current_user, deployment, db)
+    _ensure_teams_open(deployment)
     _ensure_new_members(db, deployment.deploymentId, team.userIds)
     return crud_teams.create_team(db, team)
 
@@ -148,6 +170,7 @@ def update_team(
     """Rename a team of a deployment the caller may operate."""
     _team, deployment = _team_and_deployment(db, team_id)
     ensure_operate_deployment(current_user, deployment, db)
+    _ensure_teams_open(deployment)
     return crud_teams.update_team(db, team_id, team_update)
 
 
@@ -163,6 +186,7 @@ def delete_team(
     """Delete a team of a deployment the caller may operate."""
     _team, deployment = _team_and_deployment(db, team_id)
     ensure_operate_deployment(current_user, deployment, db)
+    _ensure_teams_open(deployment)
     crud_teams.delete_team(db, team_id)
     return None
 
@@ -180,6 +204,7 @@ def add_user_to_team(
     """Add an existing user, who is in no other team of the deployment."""
     team, deployment = _team_and_deployment(db, team_id)
     ensure_operate_deployment(current_user, deployment, db)
+    _ensure_teams_open(deployment)
     _ensure_new_members(db, deployment.deploymentId, [user_id], except_team=team.teamId)
     if not crud_teams.add_user_to_team(db, team_id, user_id):
         raise HTTPException(
@@ -202,6 +227,7 @@ def remove_user_from_team(
     """Remove a user from a team of a deployment the caller may operate."""
     _team, deployment = _team_and_deployment(db, team_id)
     ensure_operate_deployment(current_user, deployment, db)
+    _ensure_teams_open(deployment)
     if not crud_teams.remove_user_from_team(db, team_id, user_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
