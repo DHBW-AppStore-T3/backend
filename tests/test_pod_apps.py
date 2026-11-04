@@ -1607,9 +1607,15 @@ def test_a_chosen_scope_reaches_the_job_as_a_fixed_spec(client, db, mock_user, p
     app = _app(db, mock_user)
     _submit_and_approve(client, db, app)
 
-    assert _deploy_with_scope(client, app, "team", [_team("T", alice)]).status_code == 201
+    response = _deploy_with_scope(client, app, "team", [_team("T", alice)])
+    assert response.status_code == 201
     spec = queued.last()[1]["spec"]
     assert (spec["scope"], spec["scopeChoice"]) == ("team", False)
+    # The deployment says what it runs, also later (the detail page shows it).
+    deployment_id = uuid.UUID(response.json()["deploymentId"])
+    assert response.json()["scope"] == "team"
+    assert db.get(Deployment, deployment_id).k8s_scope == "team"
+    assert client.get(f"/deployments/{deployment_id}").json()["scope"] == "team"
 
 
 def test_without_a_choice_the_authors_scope_is_used(client, db, mock_user, pod_repo, queued):
@@ -1618,7 +1624,24 @@ def test_without_a_choice_the_authors_scope_is_used(client, db, mock_user, pod_r
     app = _app(db, mock_user)
     _submit_and_approve(client, db, app)
 
-    assert _deploy_with_scope(client, app, None, [_team("T", alice)]).status_code == 201
+    response = _deploy_with_scope(client, app, None, [_team("T", alice)])
+    assert response.status_code == 201
+    assert queued.last()[1]["spec"]["scope"] == "user"
+    assert response.json()["scope"] == "user"
+
+
+def test_a_team_of_several_can_run_one_workload_per_member(client, db, mock_user, pod_repo, queued):
+    # Groups (e.g. for a file per team) and an environment per person: what the wizards send for that choice.
+    pod_repo(_scope_choice_spec(scope="team"))
+    alice, bob = _student(db, "alice"), _student(db, "bob")
+    app = _app(db, mock_user)
+    _submit_and_approve(client, db, app)
+
+    response = _deploy_with_scope(client, app, "user", [_team("T", alice, bob)])
+
+    assert response.status_code == 201, response.text
+    row = db.get(Deployment, uuid.UUID(response.json()["deploymentId"]))
+    assert (row.k8s_scope, row.k8s_workloads) == ("user", 2)
     assert queued.last()[1]["spec"]["scope"] == "user"
 
 

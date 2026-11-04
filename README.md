@@ -120,7 +120,7 @@ Gruppen mit Prefix (`main.py`). Den vollständigen Vertrag liefert `make openapi
 | `/auth` | `GET /health` |
 | `/users` | `GET /me`, Liste, `/search`, `/{id}`, `/{id}/statistics`, `PUT /{id}` (Rollenvergabe durch Admin) |
 | `/courses` | CRUD, Mitglieder (`/users`), Lehrende (`/teachers/{user_id}`) |
-| `/teams` | CRUD, Mitglieder (`/{id}/users/{user_id}`) |
+| `/teams` | Lesen; Anlegen, Umbenennen, Löschen und Mitglieder (`/{id}/users/{user_id}`) nur bei Zeilen des alten VM-Pfads, bei Pod- und KubeVirt-Deployments 409 `teams_fixed` (die Teams stehen mit dem Anlegen fest) |
 | `/apps` | Katalog, `/{id}/variables`, `/{id}/runtime`, `/{id}/versions`, Version einreichen/zurückziehen (`/versions/{tag}/submit`), Soft-Delete |
 | `/admin` | `GET /apps/versions/pending`, `approve` / `reject` / `revoke` je Version, `PUT /apps/{id}` (Deaktivieren), `/recommended`, `/deploy-version` |
 | `/deployments` | CRUD, `/cancel`, `/pause`, `/resume`, `/resources[/{address}[/redeploy]]`, `/workloads/{name}/restart` und `/reset`, `/files/{var}/{slot}`, `/my-access`, `/stream` (SSE) |

@@ -9,7 +9,11 @@ Every request is decided by the rights on the team's deployment
   filtered the same way;
 * creating, renaming, deleting a team and changing its members needs the
   operate right (owner or admin) — any other teacher gets 403;
-* members must exist and be in at most one team of the deployment.
+* members must exist and be in at most one team of the deployment;
+* the teams of a pod or KubeVirt deployment are fixed once it is created
+  (409 ``teams_fixed``): its job made the workloads and accounts from them.
+  The success paths of the writes are therefore tested on a row of the
+  removed VM path, which nothing renders.
 """
 
 from __future__ import annotations
@@ -32,11 +36,14 @@ from app.models import (
 from app.utils.keycloak_auth import get_current_user_keycloak
 from tests.conftest import TestingSessionLocal
 
-
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
-def _make_deployment(db, owner: User) -> Deployment:
+# A row of the removed OpenStack VM path: nothing renders its teams, so they may still change.
+LEGACY_RUNTIME = "openstack-vm"
+
+
+def _make_deployment(db, owner: User, *, runtime: str = "kubernetes") -> Deployment:
     """Persist ein App+Deployment-Paar für ``owner`` und gib das Deployment zurück.
 
     Wird gebraucht, weil ``Team.deploymentId`` NOT NULL ist.
@@ -57,6 +64,7 @@ def _make_deployment(db, owner: User) -> Deployment:
         name=f"Dep-{uuid.uuid4().hex[:6]}",
         userId=owner.userId,
         appId=app_row.appId,
+        runtime=runtime,
     )
     db.add(deployment)
     db.commit()
@@ -202,7 +210,7 @@ def test_get_team_non_member_403(db, mock_user, mock_student):
 # ---------------------------------------------------------------------------
 @pytest.mark.integration
 def test_create_team_owner_ok(db, mock_user, mock_student):
-    dep = _make_deployment(db, mock_user)
+    dep = _make_deployment(db, mock_user, runtime=LEGACY_RUNTIME)
     payload = {"name": "NewTeam", "deploymentId": str(dep.deploymentId), "userIds": [str(mock_student.userId)]}
 
     response = _call(mock_user, "post", "/teams/", json=payload)
@@ -223,7 +231,7 @@ def test_create_team_on_someone_elses_deployment_403(db, mock_user, mock_student
 
 @pytest.mark.integration
 def test_create_team_member_rules(db, mock_user, mock_student):
-    dep = _make_deployment(db, mock_user)
+    dep = _make_deployment(db, mock_user, runtime=LEGACY_RUNTIME)
     taken = _make_team(db, name="Taken", deployment=dep)
     _add_member(db, taken, mock_student)
 
@@ -245,7 +253,7 @@ def test_create_team_member_rules(db, mock_user, mock_student):
 # ---------------------------------------------------------------------------
 @pytest.mark.integration
 def test_rename_and_delete_by_owner_and_admin(db, mock_admin, mock_user):
-    dep = _make_deployment(db, mock_user)
+    dep = _make_deployment(db, mock_user, runtime=LEGACY_RUNTIME)
     team = _make_team(db, name="Before", deployment=dep)
 
     # Admins operate every deployment, like its owner.
@@ -273,7 +281,7 @@ def test_rename_and_delete_by_others_403(db, mock_user, mock_student):
 # ---------------------------------------------------------------------------
 @pytest.mark.integration
 def test_add_and_remove_member_owner_ok(db, mock_user, mock_student):
-    dep = _make_deployment(db, mock_user)
+    dep = _make_deployment(db, mock_user, runtime=LEGACY_RUNTIME)
     team = _make_team(db, name="T", deployment=dep)
 
     assert _call(mock_user, "post", f"/teams/{team.teamId}/users/{mock_student.userId}").status_code == 204
@@ -283,8 +291,36 @@ def test_add_and_remove_member_owner_ok(db, mock_user, mock_student):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("runtime", ["kubernetes", "kubevirt-vm"])
+def test_the_teams_of_a_cluster_deployment_are_fixed(db, mock_admin, mock_user, mock_student, runtime):
+    # The job made workloads and accounts from these teams; a change would reach nobody (or keep a removed
+    # member's password valid), so neither the owner nor an admin may make one.
+    dep = _make_deployment(db, mock_user, runtime=runtime)
+    team = _make_team(db, name="T", deployment=dep)
+    _add_member(db, team, mock_student)
+    newcomer = _other_teacher(db)
+    writes = [
+        ("post", "/teams/", {"json": {"name": "New", "deploymentId": str(dep.deploymentId), "userIds": []}}),
+        ("put", f"/teams/{team.teamId}", {"json": {"name": "Renamed"}}),
+        ("delete", f"/teams/{team.teamId}", {}),
+        ("post", f"/teams/{team.teamId}/users/{newcomer.userId}", {}),
+        ("delete", f"/teams/{team.teamId}/users/{mock_student.userId}", {}),
+    ]
+
+    for user in (mock_user, mock_admin):
+        for method, url, kwargs in writes:
+            response = _call(user, method, url, **kwargs)
+            assert response.status_code == 409, (method, url, response.text)
+            assert response.json()["detail"]["reason"] == "teams_fixed"
+
+    db.expire_all()
+    assert [t.name for t in db.query(Team).filter(Team.deploymentId == dep.deploymentId)] == ["T"]
+    assert {link.userId for link in db.query(UserToTeam).filter(UserToTeam.teamId == team.teamId)} == {mock_student.userId}
+
+
+@pytest.mark.integration
 def test_add_member_refuses_a_second_team_and_strangers(db, mock_user, mock_student):
-    dep = _make_deployment(db, mock_user)
+    dep = _make_deployment(db, mock_user, runtime=LEGACY_RUNTIME)
     first = _make_team(db, name="First", deployment=dep)
     second = _make_team(db, name="Second", deployment=dep)
     _add_member(db, first, mock_student)

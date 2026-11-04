@@ -490,6 +490,7 @@ def create_deployment(
     *,
     runtime: str = RUNTIME_K8S,
     k8s_workloads: int | None = None,
+    k8s_scope: str | None = None,
 ) -> Deployment:
     """Insert a deployment row in the current transaction.
 
@@ -497,7 +498,8 @@ def create_deployment(
     in the same TX and commit once at the end. This is necessary so the
     advisory lock acquired at the start of the request stays held across
     all related inserts. A pod deployment (``runtime`` ``kubernetes``) gets
-    its namespace and the number of its workloads.
+    its namespace, the number of its workloads and what one workload is
+    (``k8s_scope``: per team or per person).
     """
     # Convert userInputVar dict to JSON string for database storage
     user_input_var_json = None
@@ -515,6 +517,7 @@ def create_deployment(
         runtime=runtime,
         k8s_namespace=namespace,
         k8s_workloads=k8s_workloads,
+        k8s_scope=k8s_scope,
         userInputVar=user_input_var_json,
     )
     db.add(db_deployment)
